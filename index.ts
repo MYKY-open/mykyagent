@@ -97,52 +97,7 @@ async function distillWithSubagent(query: string, content: string, modelInfo?: a
 
   // Fallback if sub-call fails: return concise raw content
   return content.slice(0, 1000);
-}
-
-interface PlanStep {
-  text: string;
-  status: "pending" | "in_progress" | "done";
-}
-
-let currentPlan: PlanStep[] = [];
-
-function renderPlanUI(ctx?: any): string {
-  if (currentPlan.length === 0) {
-    if (ctx?.ui) {
-      ctx.ui.setWidget?.("myky-plan", undefined);
-      ctx.ui.setStatus?.("myky-plan", undefined);
-    }
-    return "No active plan.";
-  }
-
-  const doneCount = currentPlan.filter((s) => s.status === "done").length;
-  if (ctx?.ui) {
-    ctx.ui.setStatus?.("myky-plan", `📋 ${doneCount}/${currentPlan.length}`);
-    const widgetLines = currentPlan.map((s, i) => {
-      const icon = s.status === "done" ? "☑ " : s.status === "in_progress" ? "▶ " : "☐ ";
-      return `${icon}${i + 1}. ${s.text}`;
-    });
-    ctx.ui.setWidget?.("myky-plan", widgetLines);
-  }
-
-  return currentPlan
-    .map((s, i) => {
-      const tag = s.status === "done" ? "[x]" : s.status === "in_progress" ? "[>]" : "[ ]";
-      return `${tag} ${i + 1}. ${s.text}`;
-    })
-    .join("\n");
-}
-
 export default function (pi: any) {
-  // Clean up plan widget on session shutdown
-  pi.on("session_shutdown", (_event: any, ctx: any) => {
-    currentPlan = [];
-    if (ctx?.ui) {
-      ctx.ui.setWidget?.("myky-plan", undefined);
-      ctx.ui.setStatus?.("myky-plan", undefined);
-    }
-  });
-
   // 1. Caveman System Prompt + Memory Injection
   pi.on("before_agent_start", async (event: any, ctx: any) => {
     activeModelInfo = ctx?.getModel?.();
@@ -159,18 +114,15 @@ export default function (pi: any) {
       `Current Date: ${todayStr}.\n` +
       `Goal: do user task completely and efficiently.\n\n` +
       `Available Tools:\n` +
-      `- plan: manage task checklist. Plan before action!\n` +
       `- bash: run shell commands, check environment, download files, run scripts/tests.\n` +
       `- web_search: search internet for current facts, release versions, download URLs.\n` +
       `- web_fetch: read specific webpage or documentation URL.\n` +
       `- memory_save: remember a key fact across sessions.\n` +
       `- memory_list: list all remembered facts.\n` +
       `- read, write, edit: inspect and modify project files.\n\n` +
-      `Planning System Rules:\n` +
-      `- For tasks with >1 step, PLAN FIRST before taking actions.\n` +
-      `- Call plan tool on first turn: plan({ steps: ["1. Create folders", "2. Find latest version", "3. Download binary", "4. Configure files", "5. Verify"] })\n` +
-      `- Update progress as you advance: plan({ current: 2 })\n` +
-      `- Mark done when finished: plan({ done: true })\n\n` +
+      `Planning Rules (Internal):\n` +
+      `- For tasks with >1 step, state a simple 3-5 step plan at start before taking action (e.g. 1. Create folders, 2. Find version, 3. Download/configure, 4. Verify).\n` +
+      `- Follow steps sequentially. Do not wander or skip steps.\n\n` +
       `Efficiency & Execution Rules:\n` +
       `- Search smartly: Never guess version numbers or old years in search queries. Search for official manifests, release APIs, or version archives.\n` +
       `- Do not repeat: Never re-fetch a URL that already failed or yielded no direct links.\n` +
@@ -182,56 +134,7 @@ export default function (pi: any) {
     return { systemPrompt: cavemanPrompt };
   });
 
-  // 2. Plan Tool (Step-by-step checklist)
-  pi.registerTool({
-    name: "plan",
-    label: "Task Plan",
-    description:
-      "Manage step-by-step task plan. Call with `steps` at the beginning of a multi-step task to outline the steps. Call with `current` to mark progress (e.g. current: 2 marks step 1 done, step 2 in progress). Call with `done: true` when finished.",
-    parameters: Type.Object({
-      steps: Type.Optional(
-        Type.Array(Type.String(), {
-          description: "List of plan steps to set (e.g. ['Create folder', 'Find version', 'Download jar'])",
-        })
-      ),
-      current: Type.Optional(
-        Type.Number({
-          description: "Current step number in progress (1-indexed). Earlier steps will be marked done.",
-        })
-      ),
-      done: Type.Optional(
-        Type.Boolean({
-          description: "Set to true when all plan steps are completed.",
-        })
-      ),
-    }),
-    async execute(_id: string, params: any, _signal: any, _onUpdate: any, ctx: any) {
-      if (params.steps && Array.isArray(params.steps) && params.steps.length > 0) {
-        currentPlan = params.steps.map((text: string, idx: number) => ({
-          text: text.replace(/^(\[\s*[xX> ]\s*\]|\d+[\.\)]|\s*[-*])\s*/, "").trim(),
-          status: idx === 0 ? "in_progress" : "pending",
-        }));
-      }
-
-      if (params.done) {
-        for (const s of currentPlan) s.status = "done";
-      } else if (typeof params.current === "number" && currentPlan.length > 0) {
-        const curr = Math.max(1, Math.min(params.current, currentPlan.length + 1));
-        currentPlan.forEach((s, idx) => {
-          if (idx + 1 < curr) s.status = "done";
-          else if (idx + 1 === curr) s.status = "in_progress";
-          else s.status = "pending";
-        });
-      }
-
-      const formatted = renderPlanUI(ctx);
-      return {
-        content: [{ type: "text", text: `Current Plan:\n${formatted}` }],
-      };
-    },
-  });
-
-  // 3. Web Search Tool (Subagent isolated)
+  // 2. Web Search Tool (Subagent isolated)
   pi.registerTool({
     name: "web_search",
     label: "Web Search",
