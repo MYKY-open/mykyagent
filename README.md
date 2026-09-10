@@ -5,7 +5,7 @@ A lightweight, crash-proof agent overlay for small local reasoning models (like 
 ## Features
 - **Subagent Web Distillation**: Isolated subagent summaries (<80 words) for web search & fetch. Zero raw HTML dumped into context.
 - **Link Prioritization**: Automatically extracts direct `.jar`, `.tar.gz`, `.zip`, and binary download links to the top.
-- **Internal Planning System**: Built-in `plan` tool with live interactive terminal widget (`📋 2/5`) and step tracking.
+- **Internal Planning**: Structured multi-step task breakdown guided internally in system prompt without wasting turns or UI clutter.
 - **Persistent Memory**: `memory_save` & `memory_list` tools saved to `~/.config/mykyagent/memory.json`.
 - **Ultra Portable**: Entire agent is under 35 KB with no local `node_modules`.
 
