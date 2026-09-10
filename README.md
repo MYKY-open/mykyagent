@@ -13,8 +13,7 @@ A lightweight, crash-proof agent overlay for small local reasoning models (like 
 
 ### Option A: Using the Installer Script
 ```bash
-git clone <this-repo> ~/mykyagent
-# or copy the folder to ~/mykyagent
+git clone https://github.com/MYKY-open/mykyagent.git ~/mykyagent
 cd ~/mykyagent
 ./install.sh
 ```
