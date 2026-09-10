@@ -67,14 +67,14 @@ async function distillWithSubagent(query: string, content: string, modelInfo?: a
         {
           role: "system",
           content:
-            "You are a research summarizer. Given web content, extract exact facts, release version numbers, direct download URLs, or command syntax. Output strictly under 80 words in concise bullet points. No thoughts, no reasoning, no pleasantries. Just bullet points.",
+            "You are a technical research summarizer. Given web content, extract relevant code snippets, API signatures, commands, syntax, options, or facts needed to answer the query. Be direct, concise, and technical. Retain complete code blocks, URLs, and commands without trimming. No conversational fluff or pleasantries.",
         },
         {
           role: "user",
           content: `Query: ${query}\n\nSearch Content:\n${content}`,
         },
       ],
-      max_tokens: 500,
+      max_tokens: 4096,
       temperature: 0.1,
     });
 
@@ -96,7 +96,7 @@ async function distillWithSubagent(query: string, content: string, modelInfo?: a
   }
 
   // Fallback if sub-call fails: return concise raw content
-  return content.slice(0, 1000);
+  return content.slice(0, 50000);
 }
 
 export default function (pi: any) {
@@ -117,8 +117,8 @@ export default function (pi: any) {
       `Goal: do user task completely and efficiently.\n\n` +
       `Available Tools:\n` +
       `- bash: run shell commands, check environment, download files, run scripts/tests.\n` +
-      `- web_search: search internet for current facts, release versions, download URLs.\n` +
-      `- web_fetch: read specific webpage or documentation URL.\n` +
+      `- web_search: search internet for current facts, release versions, download URLs, docs.\n` +
+      `- web_fetch: read specific webpage or documentation URL (full text, code blocks, tables).\n` +
       `- memory_save: remember a key fact across sessions.\n` +
       `- memory_list: list all remembered facts.\n` +
       `- read, write, edit: inspect and modify project files.\n\n` +
@@ -136,12 +136,12 @@ export default function (pi: any) {
     return { systemPrompt: cavemanPrompt };
   });
 
-  // 2. Web Search Tool (Subagent isolated)
+  // 2. Web Search Tool (Returns direct titles, URLs, and snippets)
   pi.registerTool({
     name: "web_search",
     label: "Web Search",
     description:
-      "Search the internet for current facts, release versions, documentation, or download URLs. Results are distilled by an isolated subagent so context remains clean.",
+      "Search the internet for current facts, release versions, documentation, or links. Returns titles, URLs, and summaries.",
     parameters: Type.Object({
       query: Type.String({ description: "Search query" }),
     }),
@@ -149,7 +149,7 @@ export default function (pi: any) {
       try {
         const proc = spawnSync("uv", ["run", HELPER_SCRIPT, "search", query], {
           encoding: "utf-8",
-          timeout: 20000,
+          timeout: 30000,
         });
 
         if (proc.error || proc.status !== 0) {
@@ -165,12 +165,10 @@ export default function (pi: any) {
         }
 
         const formatted = raw
-          .map((r: any) => `• ${r.title}\n  URL: ${r.url}\n  ${r.snippet}`)
+          .map((r: any, idx: number) => `${idx + 1}. [${r.title}](${r.url})\n   ${r.snippet}`)
           .join("\n\n");
 
-        // Distill via isolated subagent call:
-        const summary = await distillWithSubagent(query, formatted, ctx?.model);
-        return { content: [{ type: "text", text: summary }] };
+        return { content: [{ type: "text", text: `Found ${raw.length} results for "${query}":\n\n${formatted}` }] };
       } catch (e: any) {
         return {
           content: [{ type: "text", text: `Search failed: ${e.message}` }],
@@ -180,19 +178,24 @@ export default function (pi: any) {
     },
   });
 
-  // 3. Web Fetch Tool (Clean extraction, no raw HTML)
+  // 3. Web Fetch Tool (Clean extraction, full code/table preservation, optional focus query)
   pi.registerTool({
     name: "web_fetch",
     label: "Web Fetch",
-    description: "Fetch a specific web page or documentation URL and return clean distilled text.",
+    description: "Fetch a specific web page or documentation URL. Returns clean markdown, code snippets, and tables.",
     parameters: Type.Object({
-      url: Type.String({ description: "Web page URL to fetch" }),
+      url: Type.String({ description: "Web page or documentation URL to fetch" }),
+      query: Type.Optional(
+        Type.String({
+          description: "Optional specific topic or question to distill from the page. If omitted, returns full text and code blocks.",
+        })
+      ),
     }),
-    async execute(_id: string, { url }: { url: string }, _signal: any, _onUpdate: any, ctx: any) {
+    async execute(_id: string, { url, query }: { url: string; query?: string }, _signal: any, _onUpdate: any, ctx: any) {
       try {
         const proc = spawnSync("uv", ["run", HELPER_SCRIPT, "fetch", url], {
           encoding: "utf-8",
-          timeout: 20000,
+          timeout: 35000,
         });
 
         if (proc.error || proc.status !== 0) {
@@ -207,8 +210,13 @@ export default function (pi: any) {
           return { content: [{ type: "text", text: `Error fetching URL: ${raw.error}` }], isError: true };
         }
 
-        const summary = await distillWithSubagent(url, raw.text || "", ctx?.model);
-        return { content: [{ type: "text", text: summary }] };
+        const text = raw.text || "";
+        if (query && query.trim().length > 0) {
+          const summary = await distillWithSubagent(query, text, ctx?.model);
+          return { content: [{ type: "text", text: summary }] };
+        }
+
+        return { content: [{ type: "text", text }] };
       } catch (e: any) {
         return {
           content: [{ type: "text", text: `Fetch failed: ${e.message}` }],
