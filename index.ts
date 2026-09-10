@@ -10,7 +10,60 @@ const here = dirname(fileURLToPath(import.meta.url));
 const HELPER_SCRIPT = join(here, "search_helper.py");
 const MEMORY_DIR = join(homedir(), ".config", "mykyagent");
 const MEMORY_FILE = join(MEMORY_DIR, "memory.json");
+const PERSONA_FILE = join(MEMORY_DIR, "persona.json");
 const LLAMA_URL = process.env.MYKYAGENT_BASE_URL || "http://127.0.0.1:8080/v1";
+
+export interface PersonaConfig {
+  current: string;
+  customPrompt?: string;
+}
+
+export const PERSONAS: Record<string, { label: string; desc: string; prompt: string }> = {
+  caveman: {
+    label: "Caveman (Default)",
+    desc: "Direct, ultra-terse, zero filler. Code and results first.",
+    prompt: "You are MykyAgent. Caveman engineer. Smart, direct, no chat filler. Talk like smart caveman. Code and results first, no fluff.",
+  },
+  senior: {
+    label: "Senior Staff Engineer",
+    desc: "Pragmatic, architectural mindset, concise, proactive about trade-offs and edge cases.",
+    prompt: "You are MykyAgent. Pragmatic Senior Staff Engineer. Deeply technical, architectural mindset, concise, proactive about trade-offs and edge cases. No corporate buzzwords.",
+  },
+  cyberpunk: {
+    label: "Cyberpunk Netrunner",
+    desc: "Sharp, witty, uses terminal tech slang (jacked in, flatlined, chrome), brutally effective hacker.",
+    prompt: "You are MykyAgent. Netrunner and street tech specialist. Sharp, witty, uses cyberpunk terminal slang (jacked in, flatlined, ice, chrome). Brutally effective programmer.",
+  },
+  pirate: {
+    label: "Pirate Sea Dog",
+    desc: "Scurvy sea dog engineer. Salty, nautical humor, loves grog and plunder.",
+    prompt: "You are MykyAgent. Scurvy sea dog engineer. Salty, nautical pirate humor, loves grog and plunder, calls user matey or captain. Still nails the code and commands perfectly.",
+  },
+  butler: {
+    label: "Refined Butler (Jarvis/Alfred)",
+    desc: "Impeccably polite, refined British gentleman butler.",
+    prompt: "You are MykyAgent. Impeccable British gentleman butler. Incredibly polite, refined, loyal, refers to user as sir/madam. Executes technical tasks with effortless perfection.",
+  },
+  academic: {
+    label: "Computer Science Professor",
+    desc: "Rigorous, analytical, methodical, references principles and data structures.",
+    prompt: "You are MykyAgent. Rigorous computer science professor. Precise, analytical, references core algorithmic principles and system architecture, highly methodical.",
+  },
+};
+
+function loadPersona(): PersonaConfig {
+  try {
+    if (existsSync(PERSONA_FILE)) {
+      return JSON.parse(readFileSync(PERSONA_FILE, "utf-8"));
+    }
+  } catch {}
+  return { current: "caveman" };
+}
+
+function savePersona(persona: PersonaConfig): void {
+  mkdirSync(MEMORY_DIR, { recursive: true });
+  writeFileSync(PERSONA_FILE, JSON.stringify(persona, null, 2), "utf-8");
+}
 
 function loadMemory(): Record<string, string> {
   try {
@@ -118,10 +171,16 @@ export default function (pi: any) {
       memBlock = "\n\n## Persistent Memory:\n" + memKeys.map((k) => `- ${k}: ${mem[k]}`).join("\n");
     }
 
+    const personaCfg = loadPersona();
+    const activePersonaKey = personaCfg.current || "caveman";
+    const personaInfo = PERSONAS[activePersonaKey] || PERSONAS.caveman;
+    const personaPrompt = personaCfg.customPrompt || personaInfo.prompt;
+
     const todayStr = new Date().toISOString().slice(0, 10);
-    const cavemanPrompt =
-      `You are MykyAgent. Caveman engineer. Smart, direct, no chat filler.\n` +
+    const systemPrompt =
+      `${personaPrompt}\n` +
       `Current Date: ${todayStr}.\n` +
+      `Active Persona: ${personaInfo.label}.\n` +
       `Goal: do user task completely and efficiently.\n\n` +
       `Available Tools:\n` +
       `- bash: run shell commands, check environment, download files, run scripts/tests.\n` +
@@ -129,6 +188,7 @@ export default function (pi: any) {
       `- web_fetch: read specific webpage or documentation URL (distills clean technical specs, code blocks, links without bloating context).\n` +
       `- memory_save: remember a key fact across sessions.\n` +
       `- memory_list: list all remembered facts.\n` +
+      `- persona_set: switch current agent persona or speaking style.\n` +
       `- read: inspect file chunks (safe default: 250 lines max per call; use offset & limit for large files).\n` +
       `- grep: fast search for regex patterns, function definitions, or errors across files without reading whole files.\n` +
       `- find: locate files and paths by glob or name pattern.\n` +
@@ -149,10 +209,9 @@ export default function (pi: any) {
       `- Do not repeat: Never re-fetch a URL that already failed or yielded no direct links.\n` +
       `- Combine commands: Chain related actions in bash (e.g. mkdir && curl && echo config) instead of taking separate turns.\n` +
       `- Factual verification: Verify actual downloaded versions/files from file contents or metadata before reporting. Do not invent version numbers.\n` +
-      `- Terse output: Talk like smart caveman. Code and results first, no fluff.` +
       memBlock;
 
-    return { systemPrompt: cavemanPrompt };
+    return { systemPrompt };
   });
 
   // 2. Web Search Tool (Autonomous deep research & multi-hop crawl)
@@ -359,6 +418,95 @@ export default function (pi: any) {
           content: [{ type: "text", text: `Error reading file "${path}": ${err.message}` }],
           isError: true,
         };
+      }
+    },
+  });
+
+  // 7. Persona Set Tool (Allows conversational switching)
+  pi.registerTool({
+    name: "persona_set",
+    label: "Set Persona",
+    description:
+      "Switch agent persona or tone. Available presets: caveman, senior, cyberpunk, pirate, butler, academic, or custom.",
+    parameters: Type.Object({
+      persona: Type.String({
+        description: "Persona preset name (caveman, senior, cyberpunk, pirate, butler, academic, or custom)",
+      }),
+      customPrompt: Type.Optional(
+        Type.String({ description: "Custom prompt description when persona is 'custom'" })
+      ),
+    }),
+    async execute(_id: string, { persona, customPrompt }: { persona: string; customPrompt?: string }) {
+      const key = persona.toLowerCase();
+      if (key === "custom" && customPrompt) {
+        savePersona({ current: "custom", customPrompt });
+        return { content: [{ type: "text", text: `Persona switched to custom.` }] };
+      }
+      if (PERSONAS[key]) {
+        savePersona({ current: key });
+        return { content: [{ type: "text", text: `Persona switched to ${PERSONAS[key].label}.` }] };
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Unknown persona "${persona}". Available: ${Object.keys(PERSONAS).join(", ")}`,
+          },
+        ],
+        isError: true,
+      };
+    },
+  });
+
+  // 8. Persona Slash Command (/persona [name | list | set <prompt>])
+  pi.registerCommand("persona", {
+    description: "Switch agent persona (e.g. /persona senior, /persona pirate, /persona list)",
+    handler: async (args: string, ctx: any) => {
+      const trimmed = args?.trim();
+
+      if (trimmed === "list") {
+        const lines = Object.entries(PERSONAS).map(([k, v]) => `• ${k}: ${v.desc}`);
+        ctx.ui?.notify?.(`Available personas:\n${lines.join("\n")}`, "info");
+        return;
+      }
+
+      if (trimmed?.startsWith("set ")) {
+        const customPrompt = trimmed.slice(4).trim();
+        if (!customPrompt) {
+          ctx.ui?.notify?.("Please provide a prompt description after 'set'.", "warning");
+          return;
+        }
+        savePersona({ current: "custom", customPrompt });
+        ctx.ui?.notify?.("Persona updated to custom prompt.", "info");
+        return;
+      }
+
+      if (trimmed && PERSONAS[trimmed.toLowerCase()]) {
+        const key = trimmed.toLowerCase();
+        savePersona({ current: key });
+        ctx.ui?.notify?.(`Persona switched to: ${PERSONAS[key].label}`, "info");
+        return;
+      }
+
+      if (trimmed && !PERSONAS[trimmed.toLowerCase()]) {
+        const available = Object.keys(PERSONAS).join(", ");
+        ctx.ui?.notify?.(`Unknown persona "${trimmed}". Available: ${available} (or /persona list)`, "error");
+        return;
+      }
+
+      // If no args provided, show interactive selector if UI available
+      if (ctx.ui?.select) {
+        const options = Object.entries(PERSONAS).map(([k, v]) => `${k} - ${v.desc}`);
+        const selected = await ctx.ui.select("Choose MykyAgent Persona:", options);
+        if (selected) {
+          const chosenKey = selected.split(" - ")[0].trim();
+          savePersona({ current: chosenKey });
+          ctx.ui?.notify?.(`Persona switched to: ${PERSONAS[chosenKey].label}`, "info");
+        }
+      } else {
+        const current = loadPersona().current;
+        const available = Object.keys(PERSONAS).join(", ");
+        ctx.ui?.notify?.(`Current persona: ${current}. Available: ${available}`, "info");
       }
     },
   });
