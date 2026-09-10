@@ -257,7 +257,7 @@ ${c_bold}${c_cyan}Usage:${c_reset} llm ${c_green}[OPTION]${c_reset} ${c_yellow}[
 (Running without arguments launches the interactive TUI)
 
 ${c_bold}${c_cyan}Standalone UIs & Agents:${c_reset}
-  ${c_green}-ma, --agent, agent${c_reset} [IP] Launch MykyAgent (auto-starts local server if needed, or connects to IP)
+  ${c_green}-ma, --run-mykyagent${c_reset} [IP] Launch MykyAgent (optionally connect to IP)
   ${c_green}-pi, --run-pi${c_reset} [IP]        Launch Pi coding agent (optionally connect to IP)
   ${c_green}-lc, --run-littlecoder${c_reset} [IP] Launch little-coder (optionally connect to IP)
   ${c_green}-he, --run-hermes${c_reset} [IP]    Launch Hermes AI agent (optionally connect to IP)
@@ -1274,22 +1274,7 @@ run_mykyagent_standalone() {
         return 1
     fi
 
-    local remote_host=""
-    local client_args=()
-
-    while [[ $# -gt 0 ]]; do
-        if [[ "$1" == -* ]]; then
-            client_args+=("$1")
-            shift
-        elif [ -z "$remote_host" ] && [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?$ || "$1" =~ ^[a-zA-Z0-9.-]+:[0-9]+$ ]]; then
-            remote_host="$1"
-            shift
-        else
-            client_args+=("$1")
-            shift
-        fi
-    done
-
+    local remote_host="$1"
     local base_url
     if [ -n "$remote_host" ]; then
         if [[ "$remote_host" == *:* ]]; then
@@ -1300,15 +1285,6 @@ run_mykyagent_standalone() {
         echo "[MykyAgent] Connecting to remote server at $base_url"
     else
         base_url="http://localhost:8080/v1"
-        # If local llama-server is not running on 8080, launch server with model selection
-        if ! curl -s "http://localhost:8080/health" 2>/dev/null | grep -q '{"status":"ok"}'; then
-            echo "[MykyAgent] Local llama-server is not running on port 8080."
-            echo "[MykyAgent] Launching llama-server with selected model..."
-            select_model || return 1
-            EXTRA_ARGS=("${client_args[@]}" "${EXTRA_ARGS[@]}")
-            launch_mykyagent
-            return $?
-        fi
     fi
 
     export MYKYAGENT_BASE_URL="$base_url"
@@ -1402,13 +1378,12 @@ run_mykyagent_standalone() {
     ' 2>/dev/null || echo "Warning: Failed to update pi models.json."
 
     local AGENT_BIN="$MYKYAGENT_DIR/bin/mykyagent"
-    local combined_args=("${client_args[@]}" "${EXTRA_ARGS[@]}")
 
     if [ -n "$SELECTED_ALIAS" ]; then
         echo "Starting MykyAgent with model: $SELECTED_ALIAS"
-        "$AGENT_BIN" --model "llama-local/$SELECTED_ALIAS" "${combined_args[@]}"
+        "$AGENT_BIN" --model "llama-local/$SELECTED_ALIAS" "${EXTRA_ARGS[@]}"
     else
-        "$AGENT_BIN" "${combined_args[@]}"
+        "$AGENT_BIN" "${EXTRA_ARGS[@]}"
     fi
 }
 
@@ -1737,7 +1712,7 @@ case "$1" in
     -hs|--hermes-setup) EXTRA_ARGS=("${@:2}"); run_hermes_setup ;;
     -pi|--run-pi)     EXTRA_ARGS=("${@:3}"); run_pi_standalone "$2" ;;
     -lc|--run-littlecoder) EXTRA_ARGS=("${@:3}"); run_littlecoder_standalone "$2" ;;
-    -ma|--run-mykyagent|--mykyagent|--agent|agent|mykyagent) shift; run_mykyagent_standalone "$@" ;;
+    -ma|--run-mykyagent) EXTRA_ARGS=("${@:3}"); run_mykyagent_standalone "$2" ;;
     -o|--run-ooba)    EXTRA_ARGS=("${@:2}"); run_oobabooga ;;
     -O|--run-odys)    EXTRA_ARGS=("${@:2}"); run_odysseus_standalone ;;
     -h|--help)        EXTRA_ARGS=("${@:2}"); print_help ;;

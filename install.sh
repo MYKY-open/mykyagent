@@ -68,7 +68,9 @@ if [ "$MISSING_DEPS" -gt 0 ]; then
     exit 1
 else
     echo "=== Status: Ready ==="
-    echo "Start MykyAgent with:"
-    echo "  llm agent        (Auto-starts llama-server if needed and connects)"
-    echo "  mykyagent        (Direct agent CLI)"
+    echo "To run MykyAgent:"
+    echo "  1. Run 'llm' to launch the interactive model manager"
+    echo "  2. Select your model, then choose '12) MykyAgent'"
+    echo ""
+    echo "Or run 'mykyagent' directly if llama-server is already running."
 fi

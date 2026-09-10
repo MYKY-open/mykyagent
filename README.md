@@ -19,21 +19,21 @@ cd ~/mykyagent
 ./install.sh
 ```
 
-### Launch MykyAgent
-The `llm` script is the **default all-in-one runner**. It automatically starts `llama-server` with your model if it is not already running, configures reasoning effort, and launches the agent:
+### Launch via `llm` (Recommended)
+The `llm` script is the all-in-one orchestrator: it manages models, backends, hardware offload (`-ngl`), starts `llama-server`, dynamically configures `~/.pi/agent/models.json`, and launches the agent:
 
 ```bash
-# Start MykyAgent (auto-boots local llama-server if needed)
-./llm agent
-
-# Headless / one-shot prompt
-./llm agent -p "create a python script to test local disk IO speeds"
-
-# Connect to a remote llama-server host
-./llm agent 192.168.1.50
+# Launch interactive TUI:
+llm
+# 1. Select your model
+# 2. Select mode: 12) MykyAgent
 ```
 
-You can also run `./llm` with no arguments to access the interactive model manager, backend switcher, and sampling settings.
+Or connect directly to an existing server:
+```bash
+# Connect to a remote llama-server host
+llm -ma 192.168.1.50
+```
 
 ---
 
