@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -e
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+MYKYAGENT_DIR="$(cd -P "$SCRIPT_DIR/.." && pwd)"
+PI_DIR="${PI_DIR:-$HOME/mykysw/pi}"
+
+if command -v pi &>/dev/null; then
+    PI_BIN="$(command -v pi)"
+elif [ -x "$PI_DIR/node_modules/.bin/pi" ]; then
+    PI_BIN="$PI_DIR/node_modules/.bin/pi"
+elif [ -x "$MYKYAGENT_DIR/node_modules/.bin/pi" ]; then
+    PI_BIN="$MYKYAGENT_DIR/node_modules/.bin/pi"
+else
+    echo "Error: pi executable not found in PATH or $PI_DIR." >&2
+    echo "Install it with: npm install -g @earendil-works/pi-coding-agent" >&2
+    exit 1
+fi
+
+# Check if --model was explicitly passed in arguments
+HAS_MODEL=0
+for arg in "$@"; do
+    if [[ "$arg" == "--model" || "$arg" == --model=* ]]; then
+        HAS_MODEL=1
+        break
+    fi
+done
+
+CMD=("$PI_BIN" "--no-extensions" "--extension" "$MYKYAGENT_DIR/index.ts")
+
+if [ "$HAS_MODEL" -eq 0 ]; then
+    CMD+=("--model" "llama-local/ling-3.0-tiny-Q4_K_M")
+fi
+
+exec "${CMD[@]}" "$@"
