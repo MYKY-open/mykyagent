@@ -74,7 +74,7 @@ async function distillWithSubagent(query: string, content: string, modelInfo?: a
           content: `Query: ${query}\n\nSearch Content:\n${content}`,
         },
       ],
-      max_tokens: 4096,
+      max_tokens: 1500,
       temperature: 0.1,
     });
 
@@ -95,8 +95,8 @@ async function distillWithSubagent(query: string, content: string, modelInfo?: a
     // sub-call fallback
   }
 
-  // Fallback if sub-call fails: return concise raw content
-  return content.slice(0, 50000);
+  // Fallback if sub-call fails: return concise slice (safe size, no context blowout)
+  return content.slice(0, 3000);
 }
 
 export default function (pi: any) {
@@ -117,9 +117,8 @@ export default function (pi: any) {
       `Goal: do user task completely and efficiently.\n\n` +
       `Available Tools:\n` +
       `- bash: run shell commands, check environment, download files, run scripts/tests.\n` +
-      `- web_research: deep multi-page autonomous research for finding verified download links, real versions, API specs, or code across multiple sites.\n` +
-      `- web_search: search internet for current facts, release versions, download URLs, docs.\n` +
-      `- web_fetch: read specific webpage or documentation URL (full text, code blocks, tables).\n` +
+      `- web_search: deep internet search (autonomously crawls top candidate pages, extracts verified download links, real versions, API specs).\n` +
+      `- web_fetch: read specific webpage or documentation URL (distills clean technical specs, code blocks, links without bloating context).\n` +
       `- memory_save: remember a key fact across sessions.\n` +
       `- memory_list: list all remembered facts.\n` +
       `- read, write, edit: inspect and modify project files.\n\n` +
@@ -127,8 +126,8 @@ export default function (pi: any) {
       `- For tasks with >1 step, state a simple 3-5 step plan at start before taking action (e.g. 1. Create folders, 2. Find version, 3. Download/configure, 4. Verify).\n` +
       `- Follow steps sequentially. Do not wander or skip steps.\n\n` +
       `Efficiency & Execution Rules:\n` +
-      `- Use web_research when you need verified download links, real versions, official APIs, or complex documentation across multiple pages.\n` +
-      `- Never invent or guess hashes, version numbers, or download URLs. Only use verified data from web_research/web_fetch.\n` +
+      `- Always use web_search when finding release downloads, versions, or library APIs. It crawls candidate pages and returns verified links.\n` +
+      `- Never invent or guess hashes, version numbers, or download URLs. Only use verified data from web_search/web_fetch.\n` +
       `- Search smartly: Never guess version numbers or old years in search queries. Search for official manifests, release APIs, or version archives.\n` +
       `- Do not repeat: Never re-fetch a URL that already failed or yielded no direct links.\n` +
       `- Combine commands: Chain related actions in bash (e.g. mkdir && curl && echo config) instead of taking separate turns.\n` +
@@ -139,14 +138,14 @@ export default function (pi: any) {
     return { systemPrompt: cavemanPrompt };
   });
 
-  // 2. Web Deep Research Tool (Autonomous multi-hop crawl and factual verification)
+  // 2. Web Search Tool (Autonomous deep research & multi-hop crawl)
   pi.registerTool({
-    name: "web_research",
-    label: "Web Deep Research",
+    name: "web_search",
+    label: "Web Search",
     description:
-      "Perform deep, autonomous web research. Searches the web, crawls candidate pages in parallel, extracts direct download links, API specs, and code snippets, and returns a verified technical synthesis.",
+      "Search the internet for current facts, release versions, documentation, or direct download links. Autonomously crawls top candidate pages and extracts verified links.",
     parameters: Type.Object({
-      query: Type.String({ description: "Research query or goal (e.g. download links, API usage, library documentation)" }),
+      query: Type.String({ description: "Search query or goal" }),
     }),
     async execute(_id: string, { query }: { query: string }, _signal: any, _onUpdate: any, ctx: any) {
       try {
@@ -157,14 +156,14 @@ export default function (pi: any) {
 
         if (proc.error || proc.status !== 0) {
           return {
-            content: [{ type: "text", text: `Research error: ${proc.stderr || proc.error?.message}` }],
+            content: [{ type: "text", text: `Search error: ${proc.stderr || proc.error?.message}` }],
             isError: true,
           };
         }
 
         const raw = JSON.parse(proc.stdout || "{}");
         if (raw.error) {
-          return { content: [{ type: "text", text: `Error during research: ${raw.error}` }], isError: true };
+          return { content: [{ type: "text", text: `Search failed: ${raw.error}` }], isError: true };
         }
 
         let bundle = `Query: ${query}\n\n`;
@@ -178,51 +177,8 @@ export default function (pi: any) {
           bundle += `## Search Snippets:\n` + raw.search_snippets.map((s: any) => `• ${s.title} (${s.url}): ${s.snippet}`).join("\n");
         }
 
-        // Distill via isolated subagent call:
         const summary = await distillWithSubagent(query, bundle, ctx?.model);
         return { content: [{ type: "text", text: summary }] };
-      } catch (e: any) {
-        return {
-          content: [{ type: "text", text: `Research failed: ${e.message}` }],
-          isError: true,
-        };
-      }
-    },
-  });
-
-  // 3. Web Search Tool (Returns direct titles, URLs, and snippets)
-  pi.registerTool({
-    name: "web_search",
-    label: "Web Search",
-    description:
-      "Search the internet for current facts, release versions, documentation, or links. Returns titles, URLs, and summaries.",
-    parameters: Type.Object({
-      query: Type.String({ description: "Search query" }),
-    }),
-    async execute(_id: string, { query }: { query: string }, _signal: any, _onUpdate: any, ctx: any) {
-      try {
-        const proc = spawnSync("uv", ["run", HELPER_SCRIPT, "search", query], {
-          encoding: "utf-8",
-          timeout: 30000,
-        });
-
-        if (proc.error || proc.status !== 0) {
-          return {
-            content: [{ type: "text", text: `Search error: ${proc.stderr || proc.error?.message}` }],
-            isError: true,
-          };
-        }
-
-        const raw = JSON.parse(proc.stdout || "[]");
-        if (!Array.isArray(raw) || raw.length === 0) {
-          return { content: [{ type: "text", text: `No results found for: ${query}` }] };
-        }
-
-        const formatted = raw
-          .map((r: any, idx: number) => `${idx + 1}. [${r.title}](${r.url})\n   ${r.snippet}`)
-          .join("\n\n");
-
-        return { content: [{ type: "text", text: `Found ${raw.length} results for "${query}":\n\n${formatted}` }] };
       } catch (e: any) {
         return {
           content: [{ type: "text", text: `Search failed: ${e.message}` }],
@@ -232,16 +188,16 @@ export default function (pi: any) {
     },
   });
 
-  // 3. Web Fetch Tool (Clean extraction, full code/table preservation, optional focus query)
+  // 3. Web Fetch Tool (Clean technical extraction, always distilled)
   pi.registerTool({
     name: "web_fetch",
     label: "Web Fetch",
-    description: "Fetch a specific web page or documentation URL. Returns clean markdown, code snippets, and tables.",
+    description: "Fetch a specific web page or documentation URL. Distills clean technical content, code snippets, and download links without bloating context.",
     parameters: Type.Object({
       url: Type.String({ description: "Web page or documentation URL to fetch" }),
       query: Type.Optional(
         Type.String({
-          description: "Optional specific topic or question to distill from the page. If omitted, returns full text and code blocks.",
+          description: "Optional specific topic or question to distill from the page.",
         })
       ),
     }),
@@ -265,12 +221,12 @@ export default function (pi: any) {
         }
 
         const text = raw.text || "";
-        if (query && query.trim().length > 0) {
-          const summary = await distillWithSubagent(query, text, ctx?.model);
-          return { content: [{ type: "text", text: summary }] };
-        }
+        const extractionFocus = query && query.trim().length > 0 
+          ? query 
+          : "extract all code blocks, installation commands, API specifications, and download links from this page";
 
-        return { content: [{ type: "text", text }] };
+        const summary = await distillWithSubagent(extractionFocus, text, ctx?.model);
+        return { content: [{ type: "text", text: summary }] };
       } catch (e: any) {
         return {
           content: [{ type: "text", text: `Fetch failed: ${e.message}` }],
