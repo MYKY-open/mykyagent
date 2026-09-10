@@ -27,10 +27,42 @@ function saveMemory(key: string, val: string): void {
   writeFileSync(MEMORY_FILE, JSON.stringify(mem, null, 2), "utf-8");
 }
 
-async function distillWithSubagent(query: string, content: string): Promise<string> {
+let activeModelInfo: any = null;
+
+function getOpenRouterKey(): string | undefined {
+  if (process.env.OPENROUTER_API_KEY) return process.env.OPENROUTER_API_KEY;
+  try {
+    const authPath = join(homedir(), ".pi", "agent", "auth.json");
+    if (existsSync(authPath)) {
+      const auth = JSON.parse(readFileSync(authPath, "utf-8"));
+      return auth?.openrouter?.key;
+    }
+  } catch {}
+  return undefined;
+}
+
+async function distillWithSubagent(query: string, content: string, modelInfo?: any): Promise<string> {
+  const active = modelInfo || activeModelInfo;
+  const isCloudOpenRouter =
+    active?.provider === "openrouter" ||
+    active?.id?.includes("deepseek") ||
+    active?.id?.includes("/");
+
+  const openrouterKey = getOpenRouterKey();
+
+  let endpoint = `${LLAMA_URL}/chat/completions`;
+  let modelName = "ling-3.0-tiny-Q4_K_M";
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+
+  if (isCloudOpenRouter && openrouterKey) {
+    endpoint = "https://openrouter.ai/api/v1/chat/completions";
+    modelName = active?.id || "deepseek/deepseek-v4-flash-0731";
+    headers["Authorization"] = `Bearer ${openrouterKey}`;
+  }
+
   try {
     const payload = JSON.stringify({
-      model: "ling-3.0-tiny-Q4_K_M",
+      model: modelName,
       messages: [
         {
           role: "system",
@@ -46,9 +78,9 @@ async function distillWithSubagent(query: string, content: string): Promise<stri
       temperature: 0.1,
     });
 
-    const res = await fetch(`${LLAMA_URL}/chat/completions`, {
+    const res = await fetch(endpoint, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: payload,
     });
 
@@ -63,7 +95,7 @@ async function distillWithSubagent(query: string, content: string): Promise<stri
     // sub-call fallback
   }
 
-  // Fallback if llama sub-call fails: return concise raw content
+  // Fallback if sub-call fails: return concise raw content
   return content.slice(0, 1000);
 }
 
@@ -112,7 +144,8 @@ export default function (pi: any) {
   });
 
   // 1. Caveman System Prompt + Memory Injection
-  pi.on("before_agent_start", async (event: any) => {
+  pi.on("before_agent_start", async (event: any, ctx: any) => {
+    activeModelInfo = ctx?.getModel?.();
     const mem = loadMemory();
     const memKeys = Object.keys(mem);
     let memBlock = "";
@@ -207,7 +240,7 @@ export default function (pi: any) {
     parameters: Type.Object({
       query: Type.String({ description: "Search query" }),
     }),
-    async execute(_id: string, { query }: { query: string }) {
+    async execute(_id: string, { query }: { query: string }, _signal: any, _onUpdate: any, ctx: any) {
       try {
         const proc = spawnSync("uv", ["run", HELPER_SCRIPT, "search", query], {
           encoding: "utf-8",
@@ -231,7 +264,7 @@ export default function (pi: any) {
           .join("\n\n");
 
         // Distill via isolated subagent call:
-        const summary = await distillWithSubagent(query, formatted);
+        const summary = await distillWithSubagent(query, formatted, ctx?.model);
         return { content: [{ type: "text", text: summary }] };
       } catch (e: any) {
         return {
@@ -250,7 +283,7 @@ export default function (pi: any) {
     parameters: Type.Object({
       url: Type.String({ description: "Web page URL to fetch" }),
     }),
-    async execute(_id: string, { url }: { url: string }) {
+    async execute(_id: string, { url }: { url: string }, _signal: any, _onUpdate: any, ctx: any) {
       try {
         const proc = spawnSync("uv", ["run", HELPER_SCRIPT, "fetch", url], {
           encoding: "utf-8",
@@ -269,7 +302,7 @@ export default function (pi: any) {
           return { content: [{ type: "text", text: `Error fetching URL: ${raw.error}` }], isError: true };
         }
 
-        const summary = await distillWithSubagent(url, raw.text || "");
+        const summary = await distillWithSubagent(url, raw.text || "", ctx?.model);
         return { content: [{ type: "text", text: summary }] };
       } catch (e: any) {
         return {

@@ -23,19 +23,4 @@ else
     exit 1
 fi
 
-# Check if --model was explicitly passed in arguments
-HAS_MODEL=0
-for arg in "$@"; do
-    if [[ "$arg" == "--model" || "$arg" == --model=* ]]; then
-        HAS_MODEL=1
-        break
-    fi
-done
-
-CMD=("$PI_BIN" "--no-extensions" "--extension" "$MYKYAGENT_DIR/index.ts")
-
-if [ "$HAS_MODEL" -eq 0 ]; then
-    CMD+=("--model" "llama-local/ling-3.0-tiny-Q4_K_M")
-fi
-
-exec "${CMD[@]}" "$@"
+exec "$PI_BIN" "--no-extensions" "--extension" "$MYKYAGENT_DIR/index.ts" "$@"
