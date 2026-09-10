@@ -54,14 +54,21 @@ else
     echo "Found existing ~/.pi/agent/models.json."
 fi
 
-# 5. Symlink launcher into ~/.local/bin
+# 5. Symlink launchers into ~/.local/bin
 INSTALL_BIN="$HOME/.local/bin"
 mkdir -p "$INSTALL_BIN"
 chmod +x "$SCRIPT_DIR/bin/mykyagent"
 ln -sf "$SCRIPT_DIR/bin/mykyagent" "$INSTALL_BIN/mykyagent"
 
+if [ -f "$SCRIPT_DIR/llm" ]; then
+    chmod +x "$SCRIPT_DIR/llm"
+    ln -sf "$SCRIPT_DIR/llm" "$INSTALL_BIN/llm"
+fi
+
 echo "=== MykyAgent Installed Successfully ==="
-echo "Launcher symlinked to: $INSTALL_BIN/mykyagent"
+echo "Launchers symlinked to:"
+echo "  - $INSTALL_BIN/llm (Default all-in-one runner: server + agent)"
+echo "  - $INSTALL_BIN/mykyagent (Direct agent CLI)"
 echo "Make sure $INSTALL_BIN is in your PATH."
 echo ""
-echo "Test with: mykyagent --help"
+echo "Start MykyAgent with: llm agent (or ./llm agent)"

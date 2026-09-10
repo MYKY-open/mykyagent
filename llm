@@ -1,0 +1,1752 @@
+#!/bin/bash
+# =============================================================================
+# llm - A management script for llama.cpp
+# =============================================================================
+
+SCRIPT_PATH="$(readlink -f "$BASH_SOURCE")"
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+
+# Main installation directory
+BASE_DIR="${MYKYSW_DIR:-$HOME/mykysw}"
+
+# Lists / Config Directory
+CONFIG_DIR="$BASE_DIR/config"
+mkdir -p "$CONFIG_DIR"
+ACTIVE_BACKEND_FILE="$CONFIG_DIR/active_backend.txt"
+if [ -f "$ACTIVE_BACKEND_FILE" ]; then
+    ACTIVE_BACKEND=$(cat "$ACTIVE_BACKEND_FILE")
+else
+    ACTIVE_BACKEND="mainline"
+fi
+
+# Base directories
+LLAMA_DIR="$BASE_DIR/llama.cpp-$ACTIVE_BACKEND"
+modelstorage="$BASE_DIR/modelstorage"
+PROMPTS_DIR="$BASE_DIR/prompts"
+
+# UI Repositories
+SILLYTAVERN_DIR="$BASE_DIR/sillytavern"
+SILLYTAVERN_REPO="https://github.com/SillyTavern/SillyTavern.git"
+DEEPSEEK_DIR="$BASE_DIR/deepseek-harness"
+DEEPSEEK_REPO="https://github.com/deepseek-ai/deepseek-harness.git"
+OOBABOOGA_DIR="$BASE_DIR/text-generation-webui"
+OOBABOOGA_REPO="https://github.com/oobabooga/text-generation-webui.git"
+ODYSSEUS_DIR="$BASE_DIR/odysseus"
+ODYSSEUS_REPO="https://github.com/pewdiepie-archdaemon/odysseus.git"
+HERMES_DIR="$BASE_DIR/hermes"
+HERMES_REPO="https://github.com/NousResearch/hermes-agent.git"
+PI_DIR="$BASE_DIR/pi"
+LITTLECODER_DIR="$BASE_DIR/little-coder"
+if [ -f "$SCRIPT_DIR/index.ts" ] && [ -d "$SCRIPT_DIR/bin" ]; then
+    MYKYAGENT_DIR="$SCRIPT_DIR"
+else
+    MYKYAGENT_DIR="${MYKYAGENT_DIR:-$BASE_DIR/mykyagent}"
+fi
+OPENCODE_DIR="$BASE_DIR/opencode"
+CODEHAMR_DIR="$BASE_DIR/codehamr"
+
+# System Resources
+if command -v lscpu &> /dev/null; then
+    PHYSICAL_CORES=$(lscpu -b -p=Core,Socket | grep -v '^#' | sort -u | wc -l)
+else
+    PHYSICAL_CORES=$(nproc 2>/dev/null || echo 4)
+fi
+BUILD_THREADS=$(nproc 2>/dev/null || echo "$PHYSICAL_CORES")  # all logical cores for compilation
+export BLIS_NUM_THREADS=$PHYSICAL_CORES
+export OMP_NUM_THREADS=$PHYSICAL_CORES
+
+# Configuration
+EDITOR=kate
+SUDO=sudo
+API_KEY="cannotguess"
+CMAKE_COMPILER_ARGS=()
+BUILDOPT=()
+
+FORCE_RESET=0
+for arg in "$@"; do
+    if [[ "$arg" == "-f" || "$arg" == "--force" ]]; then
+        FORCE_RESET=1
+    fi
+done
+
+# Optimized defaults with dynamic speculative decoding cache
+mkdir -p "$BASE_DIR/cache"
+
+SETTINGS_FILE="$CONFIG_DIR/llm_settings.conf"
+if [ -f "$SETTINGS_FILE" ]; then
+    source "$SETTINGS_FILE"
+else
+    S_TEMP="0.6"
+    S_TOP_P="0.95"
+    S_TOP_K="20"
+    S_MIN_P="0.0"
+    S_TFS="1.0"
+    S_TYPICAL="1.0"
+    S_MIROSTAT="0"
+    S_MIROSTAT_LR="0.1"
+    S_MIROSTAT_ENT="5.0"
+    S_PRESENCE="0.0"
+    S_FREQUENCY="0.0"
+    S_PENALTY_REPEAT="1.0"
+    S_PENALTY_LAST_N="64"
+    S_SPEC_TYPE="none"
+    S_SPEC_N_MAX="0"
+    S_SPEC_N_MIN="0"
+    S_SPEC_DM="off"
+    S_CTX_SIZE="0"
+    S_DRAFT_MODEL=""
+    
+    cat > "$SETTINGS_FILE" <<EOF
+S_TEMP="$S_TEMP"
+S_TOP_P="$S_TOP_P"
+S_TOP_K="$S_TOP_K"
+S_MIN_P="$S_MIN_P"
+S_TFS="$S_TFS"
+S_TYPICAL="$S_TYPICAL"
+S_MIROSTAT="$S_MIROSTAT"
+S_MIROSTAT_LR="$S_MIROSTAT_LR"
+S_MIROSTAT_ENT="$S_MIROSTAT_ENT"
+S_PRESENCE="$S_PRESENCE"
+S_FREQUENCY="$S_FREQUENCY"
+S_PENALTY_REPEAT="$S_PENALTY_REPEAT"
+S_PENALTY_LAST_N="$S_PENALTY_LAST_N"
+S_SPEC_TYPE="$S_SPEC_TYPE"
+S_SPEC_N_MAX="$S_SPEC_N_MAX"
+S_SPEC_N_MIN="$S_SPEC_N_MIN"
+S_SPEC_DM="$S_SPEC_DM"
+S_CTX_SIZE="$S_CTX_SIZE"
+S_DRAFT_MODEL="$S_DRAFT_MODEL"
+EOF
+fi
+
+if [ "$S_MIROSTAT" != "0" ]; then
+    LLM_DEFAULTS="--temp 1.0 "
+else
+    LLM_DEFAULTS="--temp $S_TEMP "
+fi
+LLM_DEFAULTS+="--top-p $S_TOP_P --top-k $S_TOP_K --min-p $S_MIN_P "
+LLM_DEFAULTS+="--typical $S_TYPICAL --mirostat $S_MIROSTAT --mirostat-lr $S_MIROSTAT_LR --mirostat-ent $S_MIROSTAT_ENT "
+LLM_DEFAULTS+="--presence-penalty $S_PRESENCE --frequency-penalty $S_FREQUENCY --repeat-penalty $S_PENALTY_REPEAT --repeat-last-n $S_PENALTY_LAST_N "
+[ "$S_SPEC_TYPE" != "none" ] && LLM_DEFAULTS+="--spec-type $S_SPEC_TYPE "
+[ "$S_SPEC_N_MAX" != "0" ] && LLM_DEFAULTS+="--spec-draft-n-max $S_SPEC_N_MAX --spec-draft-n-min $S_SPEC_N_MIN "
+[ "$S_SPEC_DM" != "off" ] && LLM_DEFAULTS+="--spec-dm-controller $S_SPEC_DM "
+if [ "$S_CTX_SIZE" != "0" ] && [ -n "$S_CTX_SIZE" ]; then
+    LLM_DEFAULTS+="-c $S_CTX_SIZE "
+fi
+if [ -n "$S_DRAFT_MODEL" ] && [ "$S_DRAFT_MODEL" != '""' ]; then
+    LLM_DEFAULTS+="-md $S_DRAFT_MODEL "
+fi
+
+
+case "$ACTIVE_BACKEND" in
+    ikllamacpp)
+        LLAMA_REPO="https://github.com/ikawrakow/ik_llama.cpp.git"
+        # ikllamacpp is highly optimized for CPU inference with its own FlashMLA implementation.
+        # --device none: ikllamacpp Vulkan lacks the large-tensor fallback that mainline/beellama have;
+        # output.weight is 1940 MiB which always exceeds Vulkan's 1GB buffer limit and hard-crashes.
+        DEFAULT_MODEL_ARGS="-rtr --no-warmup -fa on -ctk q8_0 -ctv q8_0 --device none -t $PHYSICAL_CORES -tb $PHYSICAL_CORES -ub 1024 $LLM_DEFAULTS"
+        ;;
+    beellamacpp)
+        LLAMA_REPO="https://github.com/Anbeeld/beellama.cpp.git"
+        # beellamacpp-specific extras:
+        #   --reasoning-loop-guard : auto force-closes infinite thinking loops on reasoning models
+        #   -ub 2048               : beellama handles larger ubatch well, helps PP throughput
+        DEFAULT_MODEL_ARGS="--poll 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --reasoning-loop-guard force-close -t $PHYSICAL_CORES -tb $PHYSICAL_CORES --cpu-strict 1 -ub 2048 $LLM_DEFAULTS"
+        ;;
+    *)
+        LLAMA_REPO="https://github.com/ggerganov/llama.cpp.git"
+        # Mainline llama.cpp defaults.
+        DEFAULT_MODEL_ARGS="--poll 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 -t $PHYSICAL_CORES -tb $PHYSICAL_CORES --cpu-strict 1 -ub 1024 $LLM_DEFAULTS"
+        ;;
+esac
+
+# Server-mode extra flags (applied on top of defaults for server modes)
+SERVER_ARGS="--slot-save-path $BASE_DIR/cache --jinja"
+
+# Lists / Config Directory
+CONFIG_DIR="$BASE_DIR/config"
+mkdir -p "$CONFIG_DIR"
+MODEL_LIST_FILE="$CONFIG_DIR/llm_models.txt"
+PROMPT_LIST_FILE="$CONFIG_DIR/llm_prompts.txt"
+
+# Migrate old lists if they exist
+[ -f "$BASE_DIR/.llm_models" ] && mv "$BASE_DIR/.llm_models" "$MODEL_LIST_FILE"
+[ -f "$BASE_DIR/.llm_prompts" ] && mv "$BASE_DIR/.llm_prompts" "$PROMPT_LIST_FILE"
+
+export FZF_DEFAULT_OPTS="--color=dark,bg+:-1,fg:gray,fg+:white,prompt:blue,pointer:red,marker:yellow"
+
+# Auto-Offload VRAM Limit (in Megabytes). Set to 0 to disable.
+MAX_VRAM_MB="0"
+
+# Base compiler flags (-O3 already comes from CMAKE_BUILD_TYPE=Release)
+# -fno-plt             : skip PLT trampolines (faster shared-lib calls)
+# -fipa-pta            : inter-procedural points-to analysis (GCC-only)
+# -fno-stack-protector : drop stack canary overhead (inference server, no user input)
+# -funroll-loops       : unroll hot loops (helps GGML kernels)
+BASE_CFLAGS="-fno-plt -fipa-pta -fno-stack-protector -funroll-loops"
+LLAMA_CFLAGS=""
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+run_cmake() {
+    if ! cmake "$@"; then
+        echo -e "\n[CMake] Configuration failed! This often happens if the project directory was moved."
+        echo "[CMake] Cleaning CMake cache and retrying..."
+        rm -rf build/CMakeCache.txt build/CMakeFiles
+        cmake "$@"
+    fi
+}
+
+fzf_with_usage() {
+    local menu_id="$1"
+    shift
+    local usage_file="$CONFIG_DIR/usage_${menu_id}.txt"
+    
+    local tmp_input=$(mktemp)
+    cat > "$tmp_input"
+    
+    local selected=$(
+        if [ -f "$usage_file" ]; then
+            awk -F'\t' '
+                NR==FNR { usage[$2] = $1; next }
+                {
+                    key = $0
+                    sub(/^[ \t]*[0-9]+\)[ \t]+/, "", key)
+                    count = (key in usage) ? usage[key] : 0
+                    print count "\t" FNR "\t" $0
+                }
+            ' "$usage_file" "$tmp_input" | sort -k1,1nr -k2,2n | cut -f3-
+        else
+            cat "$tmp_input"
+        fi | fzf "$@"
+    )
+    
+    rm -f "$tmp_input"
+    
+    if [ -n "$selected" ]; then
+        local key="$selected"
+        key=$(echo "$key" | sed -E 's/^[ \t]*[0-9]+\)[ \t]+//')
+        
+        export KEY="$key"
+        if [ -f "$usage_file" ]; then
+            awk -F'\t' '
+                BEGIN { k = ENVIRON["KEY"] }
+                $2 == k { print ($1 + 1) "\t" $2; found=1; next }
+                { print $0 }
+                END { if (!found) print "1\t" k }
+            ' "$usage_file" > "${usage_file}.tmp" && mv "${usage_file}.tmp" "$usage_file"
+        else
+            echo -e "1\t$key" > "$usage_file"
+        fi
+        echo "$selected"
+    fi
+}
+
+print_help() {
+    local c_reset="\033[0m"
+    local c_bold="\033[1m"
+    local c_cyan="\033[36m"
+    local c_green="\033[32m"
+    local c_yellow="\033[33m"
+    local c_magenta="\033[35m"
+
+    echo -e "
+${c_bold}${c_cyan}Usage:${c_reset} llm ${c_green}[OPTION]${c_reset} ${c_yellow}[ARGS...]${c_reset}
+(Running without arguments launches the interactive TUI)
+
+${c_bold}${c_cyan}Standalone UIs & Agents:${c_reset}
+  ${c_green}-ma, --agent, agent${c_reset} [IP] Launch MykyAgent (auto-starts local server if needed, or connects to IP)
+  ${c_green}-pi, --run-pi${c_reset} [IP]        Launch Pi coding agent (optionally connect to IP)
+  ${c_green}-lc, --run-littlecoder${c_reset} [IP] Launch little-coder (optionally connect to IP)
+  ${c_green}-he, --run-hermes${c_reset} [IP]    Launch Hermes AI agent (optionally connect to IP)
+  ${c_green}-hs, --hermes-setup${c_reset}       Run the Hermes provider setup wizard
+  ${c_green}-oc, --run-opencode${c_reset}       Launch OpenCode AI TUI
+  ${c_green}-ch, --run-codehamr${c_reset}       Launch Codehamr editor
+  ${c_green}-r,  --run-silly${c_reset}          Launch SillyTavern interface
+  ${c_green}-dh, --run-deepseek${c_reset} [IP]  Launch deepseek-harness (optionally connect to IP)
+  ${c_green}-o,  --run-ooba${c_reset}           Launch text-generation-webui
+  ${c_green}-O,  --run-odys${c_reset}           Launch Odysseus standalone
+
+${c_bold}${c_cyan}Model & Prompt Management:${c_reset}
+  ${c_green}-s,  --settings${c_reset}           Launch interactive sampling settings menu
+  ${c_green}-sm, --scan-models${c_reset}        Scan for models in the current directory
+  ${c_green}-d,  --delete${c_reset}             Delete a model entry from the saved list
+  ${c_green}-m,  --modellistedit${c_reset}      Manually edit the model list file
+  ${c_green}-ps, --scan-prompts${c_reset}       Scan for .txt prompt files
+  ${c_green}-pd, --delete-prompt${c_reset}      Delete a saved prompt entry
+  ${c_green}-pe, --edit-prompts${c_reset}       Manually edit the prompt list file
+
+${c_bold}${c_cyan}Configuration & Engine Maintenance:${c_reset}
+  ${c_green}-b,  --backend${c_reset}            Swap the active llama.cpp backend
+  ${c_green}-vram, --vram <MB>${c_reset}        Temporarily override the MAX_VRAM_MB auto-offload limit
+  ${c_green}-p,  --patch <file>${c_reset}       Apply a .patch file to the active llama.cpp backend
+  ${c_green}-i,  --install${c_reset}            Clone, build, and install llama.cpp & backends
+  ${c_green}-u,  --upgrade${c_reset}            Upgrade all components and engines
+  ${c_green}-f,  --force${c_reset}              Forcefully discard local changes during update/install
+  ${c_green}-c,  --compile${c_reset}            Only compile native kernels
+  ${c_green}-C,  --configure${c_reset}          Run ccmake for configuration
+  ${c_green}-Re, --reset${c_reset}              Reset build folders for full recompilation
+
+${c_bold}${c_cyan}Script Options:${c_reset}
+  ${c_green}-is, --install-script${c_reset}     Update or install this script system-wide
+  ${c_green}-e,  --edit${c_reset}               Edit this script using \$EDITOR
+  ${c_green}-h,  --help${c_reset}               Display this help message
+
+${c_bold}${c_cyan}Examples:${c_reset}
+  llm ${c_green}-he 192.168.1.100${c_reset}     Launch Hermes connected to a remote remote server
+  llm ${c_green}-vram 8192${c_reset}            Launch interactive menu, capping VRAM at 8GB
+  llm                       Launch the interactive model picker menu
+"
+}
+
+cleanup() {
+    if [ -n "$llama_pid" ]; then
+        echo -e "\n[LLM] Cleaning up server (PID: $llama_pid)..."
+        kill -TERM -"$llama_pid" 2>/dev/null || kill "$llama_pid" 2>/dev/null || true
+        for i in {1..10}; do
+            if ! kill -0 "$llama_pid" 2>/dev/null; then break; fi
+            sleep 0.5
+        done
+        kill -9 "$llama_pid" 2>/dev/null || true
+    fi
+}
+
+trap cleanup EXIT SIGINT SIGTERM
+
+ensure_repo() {
+    local dir=$1
+    local repo=$2
+    if [ ! -d "$dir" ]; then
+        echo "Cloning $repo into $dir..."
+        git clone --depth 1 "$repo" "$dir"
+    fi
+}
+
+run_pinned() {
+    # Hard-pin the process to the first physical cores to prevent thread hopping
+    if command -v taskset &> /dev/null; then
+        local TASKSET_CMD=(taskset -c 0-$((PHYSICAL_CORES-1)))
+        exec "${TASKSET_CMD[@]}" "$@"
+    else
+        exec "$@"
+    fi
+}
+
+probe_remote_ctx() {
+    local url="$1"
+    local key="$2"
+    local props_url="${url%/v1}/props"
+    local server_ctx=$(curl -s --max-time 2 -H "Authorization: Bearer $key" "$props_url" | sed -n 's/.*"n_ctx"[[:space:]]*:[[:space:]]*\([0-9]\+\).*/\1/p' | head -n 1)
+    if [ -n "$server_ctx" ] && [ "$server_ctx" -gt 0 ]; then
+        export SELECTED_CTX="$server_ctx"
+    fi
+}
+
+start_llama_server() {
+    local port=${1:-8080}
+    echo "Starting llama-server on port $port..."
+    
+    if [ ! -x "$LLAMA_DIR/build/bin/llama-server" ]; then
+        echo "Error: llama-server binary not found!"
+        echo "Please compile it first by running: llm -cl"
+        exit 1
+    fi
+    
+    local extra_args=()
+    [ -n "$selected_alias" ] && extra_args=("--alias" "$selected_alias")
+    
+    run_pinned "$LLAMA_DIR/build/bin/llama-server" -m "$selected_path" "${extra_args[@]}" $SERVER_ARGS $final_args --port "$port" > llama-server.log 2>&1 &
+    llama_pid=$!
+    
+    echo -n "Waiting for server to be ready..."
+    for i in {1..60}; do
+        if curl -s "http://localhost:$port/health" | grep -q '{"status":"ok"}'; then
+            echo " Ready!"
+            break
+        fi
+        if ! kill -0 "$llama_pid" 2>/dev/null; then
+            echo -e "\nServer crashed! Check llama-server.log"
+            exit 1
+        fi
+        echo -n "."
+        sleep 1
+    done
+    
+    # Export common AI environment variables for downstream clients
+    export OPENAI_API_BASE_URL="http://localhost:$port/v1"
+    export OPENAI_API_BASE="http://localhost:$port/v1"
+    export OPENAI_API_KEY="$API_KEY"
+    
+    probe_remote_ctx "http://localhost:$port/v1" "$API_KEY"
+}
+
+# =============================================================================
+# Compiler & Build
+# =============================================================================
+
+setup_compiler() {
+    export CC=gcc
+    export CXX=g++
+
+    OMP_FLAG="-fopenmp"
+
+    CMAKE_COMPILER_ARGS=(
+        -DCMAKE_C_COMPILER=gcc
+        -DCMAKE_CXX_COMPILER=g++
+        -DCMAKE_BUILD_TYPE=Release
+    )
+
+    if command -v ccache &> /dev/null; then
+        echo "[COMPILER] ccache detected, enabling..."
+        CMAKE_COMPILER_ARGS+=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
+    fi
+
+    LLAMA_CFLAGS="$BASE_CFLAGS $OMP_FLAG"
+}
+
+install_llm_core() {
+    echo "Installing llama.cpp ($ACTIVE_BACKEND)..."
+    ensure_repo "$LLAMA_DIR" "$LLAMA_REPO"
+    cd "$LLAMA_DIR" || exit
+    if [ "$FORCE_RESET" == "1" ]; then
+        git reset --hard HEAD
+        git clean -fd
+    fi
+    git pull
+    git submodule update --init --recursive --depth 1
+    setup_compiler
+    run_cmake -B build "${CMAKE_COMPILER_ARGS[@]}" -DCMAKE_C_FLAGS="$LLAMA_CFLAGS" -DCMAKE_CXX_FLAGS="$LLAMA_CFLAGS" "${BUILDOPT[@]}"
+    cmake --build build --config Release -j "$BUILD_THREADS"
+    mkdir -p "$PROMPTS_DIR"
+}
+
+install_all() {
+    install_llm_core
+    install_script
+    echo "Installation complete."
+}
+
+install_codehamr() {
+    echo "Installing codehamr locally..."
+    mkdir -p "$CODEHAMR_DIR"
+    curl -sL "https://github.com/codehamr/codehamr/releases/latest/download/codehamr-linux-amd64" -o "$CODEHAMR_DIR/codehamr"
+    chmod +x "$CODEHAMR_DIR/codehamr"
+    echo "codehamr installed to $CODEHAMR_DIR/codehamr"
+}
+
+install_opencode() {
+    echo "Installing OpenCode locally..."
+    curl -fsSL https://opencode.ai/install | bash
+}
+
+compile_llm_core() {
+    echo "Compiling llama.cpp ($ACTIVE_BACKEND)..."
+    cd "$LLAMA_DIR" || exit
+    git submodule update --init --recursive --depth 1
+    setup_compiler
+    run_cmake -B build "${CMAKE_COMPILER_ARGS[@]}" -DCMAKE_C_FLAGS="$LLAMA_CFLAGS" -DCMAKE_CXX_FLAGS="$LLAMA_CFLAGS" "${BUILDOPT[@]}"
+    cmake --build build -j "$BUILD_THREADS"
+}
+
+compile_all() {
+    compile_llm_core
+    echo "Recompilation complete."
+}
+
+upgrade_llm_core() {
+    echo "Upgrading llama.cpp ($ACTIVE_BACKEND)..."
+    [ ! -d "$LLAMA_DIR" ] && { echo "llama.cpp not installed!"; exit 1; }
+    cd "$LLAMA_DIR" || exit
+    if [ "$FORCE_RESET" == "1" ]; then
+        git reset --hard HEAD
+        git clean -fd
+        git pull
+    else
+        git pull --rebase --autostash
+    fi
+    git submodule update --init --recursive --depth 1
+    compile_llm_core
+    
+    [ -d "$SILLYTAVERN_DIR" ] && (cd "$SILLYTAVERN_DIR" && git pull)
+    [ -d "$DEEPSEEK_DIR" ] && (cd "$DEEPSEEK_DIR" && git pull)
+    [ -d "$OOBABOOGA_DIR" ] && (cd "$OOBABOOGA_DIR" && git pull)
+    [ -d "$ODYSSEUS_DIR" ] && (cd "$ODYSSEUS_DIR" && git pull)
+    [ -x "$CODEHAMR_DIR/codehamr" ] && install_codehamr
+    [ -x "$HOME/.opencode/bin/opencode" ] && install_opencode
+    [ -d "$PI_DIR" ] && install_pi
+    [ -d "$LITTLECODER_DIR" ] && install_littlecoder
+}
+
+upgrade_all() {
+    upgrade_llm_core
+}
+
+configure_llm() {
+    echo "Preparing llama.cpp ($ACTIVE_BACKEND) for configuration..."
+    ensure_repo "$LLAMA_DIR" "$LLAMA_REPO"
+    cd "$LLAMA_DIR" || exit
+    git submodule update --init --recursive --depth 1
+    setup_compiler
+    if [ ! -f "build/CMakeCache.txt" ]; then
+        run_cmake -B build "${CMAKE_COMPILER_ARGS[@]}" -DCMAKE_C_FLAGS="$LLAMA_CFLAGS" -DCMAKE_CXX_FLAGS="$LLAMA_CFLAGS" "${BUILDOPT[@]}"
+    fi
+    ccmake build
+}
+
+switch_backend() {
+    local backend_menu="1) mainline (fastest model support, universal, slowest)\n2) ikllamacpp (slowest model support, fastest for cuda only)\n3) beellamacpp (good model support, universal, fast)"
+    local selected=$(echo -e "$backend_menu" | fzf_with_usage backends --prompt="Select Backend > " | awk '{print $2}')
+    [ -z "$selected" ] && return
+    
+    if [[ "$selected" =~ ^(mainline|ikllamacpp|beellamacpp)$ ]]; then
+        echo "$selected" > "$ACTIVE_BACKEND_FILE"
+        echo "Active backend set to: $selected"
+    else
+        echo "Invalid backend selected."
+        return 1
+    fi
+}
+
+reset_llm() {
+    echo "Resetting LLM build directory..."
+    rm -rf "$LLAMA_DIR/build"
+}
+
+reset_all() {
+    reset_llm
+    echo "Full reset complete."
+}
+
+edit_script() { $EDITOR "$SCRIPT_PATH"; }
+
+configure_settings() {
+    while true; do
+        local w_desc="\e[97m"
+        local w_res="\e[0m"
+        local options=$(
+            if [ "$S_MIROSTAT" == "0" ]; then
+            printf "%-3s %-25s %-22s %b%s%b\n" "1)" "Temperature" "[$S_TEMP]" "$w_desc" "- Controls randomness (0 = greedy, higher = creative)" "$w_res"
+            fi
+            if [ "$S_MIROSTAT" == "0" ]; then
+        printf "%-3s %-25s %-22s %b%s%b\n" "2)" "Top-P" "[$S_TOP_P]" "$w_desc" "- Nucleus sampling (1.0 = off, lower = stricter)" "$w_res"
+        printf "%-3s %-25s %-22s %b%s%b\n" "3)" "Top-K" "[$S_TOP_K]" "$w_desc" "- Limits to top K most likely tokens (0 = off)" "$w_res"
+        printf "%-3s %-25s %-22s %b%s%b\n" "4)" "Min-P" "[$S_MIN_P]" "$w_desc" "- Drops tokens below fraction of top prob (0.0 = off)" "$w_res"
+        printf "%-3s %-25s %-22s %b%s%b\n" "5)" "Typical" "[$S_TYPICAL]" "$w_desc" "- Locally typical sampling (1.0 = off, lower = strict)" "$w_res"
+            fi
+        printf "%-3s %-25s %-22s %b%s%b\n" "6)" "Mirostat" "[$S_MIROSTAT]" "$w_desc" "- Actively maintains a target entropy (0=off, 1/2=on)" "$w_res"
+            if [ "$S_MIROSTAT" != "0" ]; then
+        printf "%-3s %-25s %-22s %b%s%b\n" "7)" "Mirostat LR" "[$S_MIROSTAT_LR]" "$w_desc" "- Learning rate for Mirostat (default 0.1)" "$w_res"
+        printf "%-3s %-25s %-22s %b%s%b\n" "8)" "Mirostat ENT" "[$S_MIROSTAT_ENT]" "$w_desc" "- Target entropy (perplexity) for Mirostat (default 5.0)" "$w_res"
+            fi
+            if [ "$S_MIROSTAT" == "0" ]; then
+        printf "%-3s %-25s %-22s %b%s%b\n" "9)" "Presence Penalty" "[$S_PRESENCE]" "$w_desc" "- Penalizes based on presence (0.0 = off, higher = more)" "$w_res"
+        printf "%-3s %-25s %-22s %b%s%b\n" "10)" "Frequency Penalty" "[$S_FREQUENCY]" "$w_desc" "- Penalizes based on frequency (0.0 = off, higher = more)" "$w_res"
+        printf "%-3s %-25s %-22s %b%s%b\n" "11)" "Repeat Penalty" "[$S_PENALTY_REPEAT]" "$w_desc" "- Penalizes exact sequences (1.0 = off, higher = more)" "$w_res"
+        printf "%-3s %-25s %-22s %b%s%b\n" "12)" "Penalty Last N" "[$S_PENALTY_LAST_N]" "$w_desc" "- Number of prev tokens to consider (-1 = ctx, 0 = off)" "$w_res"
+            fi
+        printf "%-3s %-25s %-22s %b%s%b\n" "13)" "Speculative Type" "[$S_SPEC_TYPE]" "$w_desc" "- Mechanism to guess future tokens (ngram, eagle)" "$w_res"
+        printf "%-3s %-25s %-22s %b%s%b\n" "14)" "Speculative Draft Max" "[$S_SPEC_N_MAX]" "$w_desc" "- Maximum tokens to guess per step" "$w_res"
+        printf "%-3s %-25s %-22s %b%s%b\n" "15)" "Speculative Draft Min" "[$S_SPEC_N_MIN]" "$w_desc" "- Minimum tokens to guess per step" "$w_res"
+        printf "%-3s %-25s %-22s %b%s%b\n" "16)" "Speculative DM Control" "[$S_SPEC_DM]" "$w_desc" "- Adaptive control (e.g. 'profit') to optimize speed" "$w_res"
+        printf "%-3s %-25s %-22s %b%s%b\n" "17)" "Context Size (0=auto)" "[$S_CTX_SIZE]" "$w_desc" "- Maximum number of tokens the model can remember" "$w_res"
+        printf "%-3s %-25s %-22s %b%s%b\n" "18)" "Draft Model Path" "[$S_DRAFT_MODEL]" "$w_desc" "- External draft model file for speculation" "$w_res"
+        printf "%-3s %-25s %-22s %b%s%b\n" "S)" "Save & Exit" "" "" "" ""
+        printf "%-3s %-25s %-22s %b%s%b\n" "R)" "Save & Run Model" "" "" "" ""
+        )
+
+        local choice=$(echo -e "$options" | fzf --ansi --prompt="Settings > " | awk '{print $1}' | tr -d ')')
+        [ -z "$choice" ] && break
+
+        case "$choice" in
+            1) read -p "Enter new Temperature (current: $S_TEMP): " val; [ -n "$val" ] && S_TEMP="$val" ;;
+            2) read -p "Enter new Top-P (current: $S_TOP_P): " val; [ -n "$val" ] && S_TOP_P="$val" ;;
+            3) read -p "Enter new Top-K (current: $S_TOP_K): " val; [ -n "$val" ] && S_TOP_K="$val" ;;
+            4) read -p "Enter new Min-P (current: $S_MIN_P): " val; [ -n "$val" ] && S_MIN_P="$val" ;;
+            5) read -p "Enter new Typical (current: $S_TYPICAL): " val; [ -n "$val" ] && S_TYPICAL="$val" ;;
+            6) 
+                local val=$(echo -e "0\n1\n2" | fzf --prompt="Mirostat > ")
+                [ -n "$val" ] && S_MIROSTAT="$val"
+                ;;
+            7) read -p "Enter new Mirostat LR (current: $S_MIROSTAT_LR): " val; [ -n "$val" ] && S_MIROSTAT_LR="$val" ;;
+            8) read -p "Enter new Mirostat ENT (current: $S_MIROSTAT_ENT): " val; [ -n "$val" ] && S_MIROSTAT_ENT="$val" ;;
+            9) read -p "Enter new Presence Penalty (current: $S_PRESENCE): " val; [ -n "$val" ] && S_PRESENCE="$val" ;;
+            10) read -p "Enter new Frequency Penalty (current: $S_FREQUENCY): " val; [ -n "$val" ] && S_FREQUENCY="$val" ;;
+            11) read -p "Enter new Repeat Penalty (current: $S_PENALTY_REPEAT): " val; [ -n "$val" ] && S_PENALTY_REPEAT="$val" ;;
+            12) read -p "Enter new Penalty Last N (current: $S_PENALTY_LAST_N): " val; [ -n "$val" ] && S_PENALTY_LAST_N="$val" ;;
+            13) 
+                local val=$(echo -e "none\ndraft-simple\ndraft-eagle3\ndraft-dflash\ndraft-dspark\ndraft-mtp\nngram-cache\nngram-simple\nngram-map-k\nngram-map-k4v\nngram-mod" | fzf --prompt="Spec Type > ")
+                [ -n "$val" ] && S_SPEC_TYPE="$val"
+                ;;
+            14) read -p "Enter new Speculative Draft Max (current: $S_SPEC_N_MAX): " val; [ -n "$val" ] && S_SPEC_N_MAX="$val" ;;
+            15) read -p "Enter new Speculative Draft Min (current: $S_SPEC_N_MIN): " val; [ -n "$val" ] && S_SPEC_N_MIN="$val" ;;
+            16) 
+                local val=$(echo -e "off\nprofit" | fzf --prompt="DM Controller > ")
+                [ -n "$val" ] && S_SPEC_DM="$val"
+                ;;
+            17) read -p "Enter new Context Size (current: $S_CTX_SIZE): " val; [ -n "$val" ] && S_CTX_SIZE="$val" ;;
+            18) 
+                local dm_src=$(echo -e "From Model List\nEnter Path\nDisable" | fzf --prompt="Draft Model Source > ")
+                if [ "$dm_src" == "From Model List" ]; then
+                    if [ ! -f "$MODEL_LIST_FILE" ]; then
+                        echo "No models in list!"
+                        sleep 1
+                    else
+                        local selected=$(cat "$MODEL_LIST_FILE" | awk -F'|' '{printf "%2d) %-20s [%s]\n", NR, $1, $3}' | fzf_with_usage draftmodels --prompt="Select Draft Model > ")
+                        if [ -n "$selected" ]; then
+                            local index=$(echo "$selected" | awk '{print $1}' | tr -d ')')
+                            IFS='|' read -r _ selected_path _ <<< "$(sed "${index}q;d" "$MODEL_LIST_FILE")"
+                            S_DRAFT_MODEL="$selected_path"
+                        fi
+                    fi
+                elif [ "$dm_src" == "Enter Path" ]; then
+                    read -e -p "Enter path to draft model file: " val
+                    [ -n "$val" ] && S_DRAFT_MODEL="$val"
+                elif [ "$dm_src" == "Disable" ]; then
+                    S_DRAFT_MODEL=""
+                fi
+                ;;
+            S) 
+                cat > "$SETTINGS_FILE" <<EOF
+S_TEMP="$S_TEMP"
+S_TOP_P="$S_TOP_P"
+S_TOP_K="$S_TOP_K"
+S_MIN_P="$S_MIN_P"
+S_TFS="$S_TFS"
+S_TYPICAL="$S_TYPICAL"
+S_MIROSTAT="$S_MIROSTAT"
+S_MIROSTAT_LR="$S_MIROSTAT_LR"
+S_MIROSTAT_ENT="$S_MIROSTAT_ENT"
+S_PRESENCE="$S_PRESENCE"
+S_FREQUENCY="$S_FREQUENCY"
+S_PENALTY_REPEAT="$S_PENALTY_REPEAT"
+S_PENALTY_LAST_N="$S_PENALTY_LAST_N"
+S_SPEC_TYPE="$S_SPEC_TYPE"
+S_SPEC_N_MAX="$S_SPEC_N_MAX"
+S_SPEC_N_MIN="$S_SPEC_N_MIN"
+S_SPEC_DM="$S_SPEC_DM"
+S_CTX_SIZE="$S_CTX_SIZE"
+S_DRAFT_MODEL="$S_DRAFT_MODEL"
+EOF
+                echo "Settings saved to $SETTINGS_FILE"
+                break
+                ;;
+            R)
+                cat > "$SETTINGS_FILE" <<EOF
+S_TEMP="$S_TEMP"
+S_TOP_P="$S_TOP_P"
+S_TOP_K="$S_TOP_K"
+S_MIN_P="$S_MIN_P"
+S_TFS="$S_TFS"
+S_TYPICAL="$S_TYPICAL"
+S_MIROSTAT="$S_MIROSTAT"
+S_MIROSTAT_LR="$S_MIROSTAT_LR"
+S_MIROSTAT_ENT="$S_MIROSTAT_ENT"
+S_PRESENCE="$S_PRESENCE"
+S_FREQUENCY="$S_FREQUENCY"
+S_PENALTY_REPEAT="$S_PENALTY_REPEAT"
+S_PENALTY_LAST_N="$S_PENALTY_LAST_N"
+S_SPEC_TYPE="$S_SPEC_TYPE"
+S_SPEC_N_MAX="$S_SPEC_N_MAX"
+S_SPEC_N_MIN="$S_SPEC_N_MIN"
+S_SPEC_DM="$S_SPEC_DM"
+S_CTX_SIZE="$S_CTX_SIZE"
+S_DRAFT_MODEL="$S_DRAFT_MODEL"
+EOF
+                echo "Settings saved. Launching model picker..."
+                # Rebuild LLM_DEFAULTS dynamically before running
+                if [ "$S_MIROSTAT" != "0" ]; then
+                    LLM_DEFAULTS="--temp 1.0 "
+                else
+                    LLM_DEFAULTS="--temp $S_TEMP "
+                fi
+                LLM_DEFAULTS+="--top-p $S_TOP_P --top-k $S_TOP_K --min-p $S_MIN_P "
+                LLM_DEFAULTS+="--typical $S_TYPICAL --mirostat $S_MIROSTAT --mirostat-lr $S_MIROSTAT_LR --mirostat-ent $S_MIROSTAT_ENT "
+                LLM_DEFAULTS+="--presence-penalty $S_PRESENCE --frequency-penalty $S_FREQUENCY --repeat-penalty $S_PENALTY_REPEAT --repeat-last-n $S_PENALTY_LAST_N "
+                [ "$S_SPEC_TYPE" != "none" ] && LLM_DEFAULTS+="--spec-type $S_SPEC_TYPE "
+                [ "$S_SPEC_N_MAX" != "0" ] && LLM_DEFAULTS+="--spec-draft-n-max $S_SPEC_N_MAX --spec-draft-n-min $S_SPEC_N_MIN "
+                [ "$S_SPEC_DM" != "off" ] && LLM_DEFAULTS+="--spec-dm-controller $S_SPEC_DM "
+                if [ "$S_CTX_SIZE" != "0" ] && [ -n "$S_CTX_SIZE" ]; then
+                    LLM_DEFAULTS+="-c $S_CTX_SIZE "
+                fi
+                if [ -n "$S_DRAFT_MODEL" ] && [ "$S_DRAFT_MODEL" != '""' ]; then
+                    LLM_DEFAULTS+="-md $S_DRAFT_MODEL "
+                fi
+                # We need to re-apply it to the active backend args
+                case "$ACTIVE_BACKEND" in
+                    ikllamacpp) DEFAULT_MODEL_ARGS="-rtr --no-warmup -fa on -ctk q8_0 -ctv q8_0 --device none -t $PHYSICAL_CORES -tb $PHYSICAL_CORES -ub 1024 $LLM_DEFAULTS" ;;
+                    beellamacpp) DEFAULT_MODEL_ARGS="--poll 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 --reasoning-loop-guard force-close -t $PHYSICAL_CORES -tb $PHYSICAL_CORES --cpu-strict 1 -ub 2048 $LLM_DEFAULTS" ;;
+                    *) DEFAULT_MODEL_ARGS="--poll 0 --no-warmup -fa on -ctk q8_0 -ctv q8_0 -t $PHYSICAL_CORES -tb $PHYSICAL_CORES --cpu-strict 1 -ub 1024 $LLM_DEFAULTS" ;;
+                esac
+                run_model
+                break
+                ;;
+        esac
+    done
+}
+
+
+
+
+install_script() {
+    if [ -n "$TERMUX_VERSION" ]; then
+        cp "$SCRIPT_PATH" "$PREFIX/bin/llm"
+        chmod +x "$PREFIX/bin/llm"
+        echo "Script installed to $PREFIX/bin/llm"
+    else
+        $SUDO cp "$SCRIPT_PATH" /usr/local/bin/llm
+        $SUDO chmod +x /usr/local/bin/llm
+        echo "Script installed to /usr/local/bin/llm"
+    fi
+}
+
+# =============================================================================
+# Model & Prompt Management
+# =============================================================================
+
+scan_models() {
+    echo "Scanning $PWD for .gguf models..."
+    shopt -s nullglob
+    mkdir -p "$modelstorage"
+    for file in *.gguf; do
+        [ ! -f "$file" ] && continue
+        echo -e "\nFound model: $file"
+        read -rp "Add this model? [Y/n] " choice
+        if [[ "${choice:-Y}" =~ ^[Yy]$ ]]; then
+            default_alias="${file%.*}"
+            read -rp "Enter alias [$default_alias]: " alias
+            alias="${alias:-$default_alias}"
+            read -rp "Custom args: " custom_args
+            
+            read -rp "Does this model have a built-in MTP head? [y/N] " mtp_builtin
+            if [[ "$mtp_builtin" =~ ^[Yy]$ ]]; then
+                custom_args="--spec-type draft-mtp $custom_args"
+            else
+                read -rp "Does this model use a dedicated external draft file (Eagle3, MTP, DFlash, Simple)? [y/N] " mtp_dedicated
+                if [[ "$mtp_dedicated" =~ ^[Yy]$ ]]; then
+                    read -e -p "Path to draft file: " mtp_file
+                    if [ -n "$mtp_file" ] && [ -f "$mtp_file" ]; then
+                        read -rp "Action for draft file: [M]ove to storage, [K]eep in place? [M/k] " mtp_action
+                        if [[ "${mtp_action:-M}" =~ ^[Mm]$ ]]; then
+                            mv "$mtp_file" "$modelstorage/"
+                            mtp_file="$modelstorage/$(basename "$mtp_file")"
+                            echo "Moved draft file to storage."
+                        else
+                            mtp_file="$(readlink -f "$mtp_file")"
+                        fi
+                        
+                        local d_type=$(echo -e "draft-simple\ndraft-eagle3\ndraft-mtp\ndraft-dflash\ndraft-dspark" | fzf --prompt="Select Draft Type > ")
+                        [ -z "$d_type" ] && d_type="draft-simple"
+                        
+                        custom_args="-md $mtp_file --spec-type $d_type $custom_args"
+                    else
+                        echo "Warning: Draft file not found or not specified. Skipping."
+                    fi
+                fi
+            fi
+
+            read -rp "Action for main model: [M]ove to storage, [K]eep in place? [M/k] " action
+            if [[ "${action:-M}" =~ ^[Mm]$ ]]; then
+                mv "$file" "$modelstorage/"
+                echo "${alias}|$modelstorage/$file|$custom_args" >> "$MODEL_LIST_FILE"
+                echo "Moved and added: $alias"
+            else
+                local abs_path="$PWD/$file"
+                echo "${alias}|$abs_path|$custom_args" >> "$MODEL_LIST_FILE"
+                echo "Kept in place and added: $alias"
+            fi
+        fi
+    done
+}
+
+
+
+scan_prompts() {
+    echo "Scanning $PWD for .txt prompt files..."
+    shopt -s nullglob
+    mkdir -p "$PROMPTS_DIR"
+    for file in *.txt; do
+        echo -e "\nFound prompt file: $file"
+        read -rp "Add this prompt? [Y/n] " choice
+        if [[ "${choice:-Y}" =~ ^[Yy]$ ]]; then
+            default_alias="${file%.*}"
+            read -rp "Enter prompt alias [$default_alias]: " alias
+            alias="${alias:-$default_alias}"
+            cp "$file" "$PROMPTS_DIR/"
+            echo "${alias}|$PROMPTS_DIR/$file|" >> "$PROMPT_LIST_FILE"
+            echo "Added prompt: $alias"
+        fi
+    done
+}
+
+delete_model() {
+    [ ! -f "$MODEL_LIST_FILE" ] && exit 1
+    local selected=$(cat "$MODEL_LIST_FILE" | awk -F'|' '{printf "%2d) %-20s %s [%s]\n", NR, $1, $2, $3}' | fzf --prompt="Select model to delete > ")
+    [ -z "$selected" ] && return
+    
+    local index=$(echo "$selected" | awk '{print $1}' | tr -d ')')
+    IFS='|' read -r alias mpath _ <<< "$(sed "${index}q;d" "$MODEL_LIST_FILE")"
+    read -rp "Delete file $mpath? [y/N] " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] && rm -f "$mpath"
+    sed -i "${index}d" "$MODEL_LIST_FILE"
+}
+
+delete_prompt() {
+    [ ! -f "$PROMPT_LIST_FILE" ] && exit 1
+    local selected=$(cat "$PROMPT_LIST_FILE" | awk -F'|' '{printf "%2d) %-20s %s\n", NR, $1, $2}' | fzf --prompt="Select prompt to delete > ")
+    [ -z "$selected" ] && return
+    
+    local index=$(echo "$selected" | awk '{print $1}' | tr -d ')')
+    sed -i "${index}d" "$PROMPT_LIST_FILE"
+}
+
+select_prompt() {
+    [ ! -f "$PROMPT_LIST_FILE" ] && selected_prompt="" && return 0
+    local options="0) None\n$(cat "$PROMPT_LIST_FILE" | awk -F'|' '{printf "%2d) %s\n", NR, $1}')"
+    local selected=$(echo -e "$options" | fzf_with_usage prompts --prompt="Select Prompt > ")
+    [ -z "$selected" ] && selected_prompt="" && return 0
+    
+    local index=$(echo "$selected" | awk '{print $1}' | tr -d ')')
+    if [ "$index" -eq 0 ]; then
+        selected_prompt=""
+    else
+        IFS='|' read -r _ selected_prompt _ <<< "$(sed "${index}q;d" "$PROMPT_LIST_FILE")"
+    fi
+}
+
+# =============================================================================
+# Launchers
+# =============================================================================
+apply_patch() {
+    local patch_file="$1"
+    if [ ! -f "$patch_file" ]; then
+        echo "Error: Patch file '$patch_file' not found."
+        exit 1
+    fi
+    echo "[Patch] Applying $patch_file..."
+    
+    cd "$LLAMA_DIR" || exit 1
+    patch -p0 --forward < "$patch_file" || patch --forward < "$patch_file"
+    
+    echo -e "\n${c_green}Patch applied successfully.${c_reset}"
+    echo "You can now run './llm_perf -c' to recompile the active backend."
+    exit 0
+}
+
+run_deepseek_standalone() {
+    local remote_host="$1"
+    local base_url
+    if [ -n "$remote_host" ]; then
+        if [[ "$remote_host" == *:* ]]; then
+            base_url="http://$remote_host/v1"
+        else
+            base_url="http://$remote_host:8080/v1"
+        fi
+        echo "[DeepSeek Harness] Connecting to remote server at $base_url"
+    else
+        base_url="http://localhost:8080/v1"
+    fi
+
+    ensure_repo "$DEEPSEEK_DIR" "$DEEPSEEK_REPO"
+    cd "$DEEPSEEK_DIR" || exit
+    
+    if ! command -v pnpm &> /dev/null; then
+        echo "[DeepSeek Harness] Error: pnpm is required but not installed."
+        echo "Please install it using 'npm install -g pnpm'"
+        exit 1
+    fi
+    
+    echo "Setting up DeepSeek Harness Node environment..."
+    pnpm install
+    pnpm run build
+    
+    export BASE_URL="$base_url"
+    export SELECTED_ALIAS="${selected_alias:-llama-local}"
+    
+    mkdir -p "$HOME/.dsh"
+    
+    node -e '
+    const fs = require("fs");
+    const yaml = require("js-yaml");
+    const path = require("path");
+    const settingsPath = path.join(process.env.HOME, ".dsh", "settings.yaml");
+    const baseUrl = process.env.BASE_URL;
+    const modelId = process.env.SELECTED_ALIAS;
+    
+    let settings = {};
+    try {
+        if (fs.existsSync(settingsPath)) {
+            settings = yaml.load(fs.readFileSync(settingsPath, "utf8")) || {};
+        }
+    } catch (e) {
+        console.warn("Notice: Could not parse existing settings.yaml, starting fresh.");
+    }
+    
+    settings["llm-pi-ai"] = settings["llm-pi-ai"] || {};
+    settings["llm-pi-ai"].providers = settings["llm-pi-ai"].providers || {};
+    settings["llm-pi-ai"].providers["llama-local"] = {
+        api: "openai-completions",
+        baseURL: baseUrl,
+        apiKeyEnv: "DUMMY_API_KEY",
+        models: [{ id: modelId }]
+    };
+    
+    fs.writeFileSync(settingsPath, yaml.dump(settings));
+    '
+    
+    echo "[DeepSeek Harness] Auto-added model ${selected_alias:-llama-local} at $base_url"
+    export DUMMY_API_KEY="${API_KEY:-dummy}"
+    
+    echo "[DeepSeek Harness] Starting Web UI on http://127.0.0.1:3080..."
+    pnpm dsh web
+}
+
+launch_deepseek() {
+    start_llama_server 8080
+    run_deepseek_standalone "localhost"
+    kill "$llama_pid" 2>/dev/null
+}
+
+run_sillytavern_standalone() {
+    ensure_repo "$SILLYTAVERN_DIR" "$SILLYTAVERN_REPO"
+    (cd "$SILLYTAVERN_DIR" && ./start.sh)
+}
+
+launch_sillytavern() {
+    start_llama_server 8080
+    run_sillytavern_standalone
+    kill "$llama_pid" 2>/dev/null
+}
+
+run_opencode_standalone() {
+    local remote_host="$1"
+    local base_url
+    if [ -n "$remote_host" ]; then
+        if [[ "$remote_host" == *:* ]]; then
+            base_url="http://$remote_host/v1"
+        else
+            base_url="http://$remote_host:8080/v1"
+        fi
+        echo "[OpenCode] Connecting to remote server at $base_url"
+    else
+        base_url="http://127.0.0.1:8080/v1"
+    fi
+
+    local OC_BIN="${HOME}/.opencode/bin/opencode"
+    if [ ! -x "$OC_BIN" ]; then
+        echo "OpenCode is not installed locally!"
+        install_opencode || exit 1
+    fi
+
+    # opencode reads config from ~/.config/opencode/opencode.jsonc
+    local OC_CFG="${HOME}/.config/opencode/opencode.jsonc"
+    mkdir -p "$(dirname "$OC_CFG")"
+
+    if [ -n "$selected_alias" ]; then
+        export SELECTED_ALIAS="$selected_alias"
+    elif [ -n "$remote_host" ]; then
+        export SELECTED_ALIAS="remote"
+    else
+        export SELECTED_ALIAS=""
+    fi
+    export BASE_URL="$base_url"
+    export API_KEY
+
+    if [ -z "$SELECTED_CTX" ] && [ -n "$SELECTED_ALIAS" ]; then
+        probe_remote_ctx "$BASE_URL" "$API_KEY"
+    fi
+
+    # Inject the llm-perf provider into the real opencode config
+    # Fetch models from the server so they always appear in the picker
+    local server_models
+    server_models=$(curl -sf "$base_url/models" | node -e '
+        let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>{
+            try {
+                const j=JSON.parse(d);
+                const ids=(j.data||j.models||[]).map(m=>m.id||m.name||m.model).filter(Boolean);
+                console.log(ids.join("\n"));
+            } catch(e) { process.exit(1); }
+        });
+    ' 2>/dev/null) || true
+
+    OPENCODE_CFG="$OC_CFG" \
+    SERVER_MODELS="$server_models" \
+    node -e '
+    const fs = require("fs");
+    const path = process.env.OPENCODE_CFG;
+    const alias = process.env.SELECTED_ALIAS;
+    const baseUrl = process.env.BASE_URL;
+    const apiKey = process.env.API_KEY || "dummy";
+    const serverModels = (process.env.SERVER_MODELS || "").split("\n").filter(Boolean);
+
+    let cfg = { "$schema": "https://opencode.ai/config.json" };
+    try {
+        if (fs.existsSync(path)) {
+            const content = fs.readFileSync(path, "utf8");
+            cfg = JSON.parse(content.replace(/\/\*[\s\S]*?\*\/|\/\/.*/g, "").replace(/,\s*([\}\]])/g, "$1"));
+        }
+    } catch (e) {
+        console.warn("Notice: Could not parse existing config, starting fresh.");
+    }
+
+    cfg.provider = cfg.provider || {};
+    const models = {};
+
+    // Add all models reported by the server
+    for (const id of serverModels) {
+        const shortId = id.split("/").pop().split("\\\\").pop().replace(/\.gguf$/i, ""); // strip path + extension
+        models[shortId] = { name: shortId };
+    }
+    // Always include the selected alias if set
+    if (alias && !models[alias]) {
+        models[alias] = { name: alias };
+    }
+    // Fallback: at least one entry so picker shows the provider
+    if (Object.keys(models).length === 0) {
+        models["default"] = { name: "default" };
+    }
+
+    cfg.provider["llm-perf"] = {
+        npm: "@ai-sdk/openai-compatible",
+        name: "llm-perf",
+        options: { baseURL: baseUrl, apiKey: apiKey },
+        models
+    };
+    fs.writeFileSync(path, JSON.stringify(cfg, null, 2));
+    console.log("[OpenCode] Registered models:", Object.keys(models).join(", "));
+    ' 2>/dev/null || echo "Warning: Failed to auto-update OpenCode config."
+
+    # Launch OpenCode
+    if [ -n "$SELECTED_ALIAS" ]; then
+        echo "Starting OpenCode with local model: $SELECTED_ALIAS"
+        "$OC_BIN" --model "llm-perf/$SELECTED_ALIAS"
+    else
+        "$OC_BIN"
+    fi
+}
+
+launch_opencode() {
+    start_llama_server 8080
+    run_opencode_standalone
+    kill "$llama_pid" 2>/dev/null
+}
+
+run_codehamr_standalone() {
+    local remote_host="$1"
+    local base_url
+    if [ -n "$remote_host" ]; then
+        if [[ "$remote_host" == *:* ]]; then
+            base_url="http://$remote_host"
+        else
+            base_url="http://$remote_host:8080"
+        fi
+        echo "[CodeHamr] Connecting to remote server at $base_url"
+    else
+        base_url="http://localhost:8080"
+    fi
+
+    local CH_BIN="$CODEHAMR_DIR/codehamr"
+    if [ ! -x "$CH_BIN" ]; then
+        echo "codehamr is not installed locally. Installing now..."
+        install_codehamr || exit 1
+    fi
+
+    local ch_alias="${selected_alias:-remote}"
+    
+    if [ -n "$selected_alias" ] || [ -n "$remote_host" ]; then
+        if [ -z "$SELECTED_CTX" ]; then
+            probe_remote_ctx "$base_url" "$API_KEY"
+        fi
+
+        mkdir -p .codehamr
+        cat > .codehamr/config.yaml <<EOF
+active: local
+models:
+    local:
+        llm: $ch_alias
+        url: $base_url
+        key: "$API_KEY"
+        context_size: ${SELECTED_CTX:-8192}
+EOF
+    fi
+    
+    "$CH_BIN"
+}
+
+launch_codehamr() {
+    start_llama_server 8080
+    run_codehamr_standalone
+    kill "$llama_pid" 2>/dev/null
+}
+
+run_hermes_standalone() {
+    local remote_host="$1"
+
+    ensure_repo "$HERMES_DIR" "$HERMES_REPO"
+    cd "$HERMES_DIR" || exit
+    
+    if [ ! -d ".venv" ]; then
+        if ! command -v uv &> /dev/null; then
+            echo "Error: uv is not installed. Please install it first."
+            exit 1
+        fi
+        echo "Setting up Hermes Python environment..."
+        uv venv
+        uv pip install -e .
+    fi
+
+    if [ -n "$remote_host" ]; then
+        if [[ "$remote_host" == *:* ]]; then
+            echo "[Hermes] Remote server: http://$remote_host/v1"
+        else
+            echo "[Hermes] Remote server: http://$remote_host:8080/v1"
+        fi
+        echo "[Hermes] If not yet configured, run: ./llm_perf -hs"
+    fi
+
+    uv run hermes skills opt-out
+    uv run hermes
+}
+
+run_hermes_setup() {
+    ensure_repo "$HERMES_DIR" "$HERMES_REPO"
+    cd "$HERMES_DIR" || exit
+
+    if [ ! -d ".venv" ]; then
+        echo "Setting up Hermes Python environment..."
+        uv venv
+        uv pip install -e .
+    fi
+
+    uv run hermes model
+}
+
+launch_hermes() {
+    start_llama_server 8080
+    run_hermes_standalone "localhost"
+    kill "$llama_pid" 2>/dev/null
+}
+
+
+install_pi() {
+    echo "Installing Pi coding agent locally..."
+    if ! command -v npm &> /dev/null; then
+        echo "Error: npm is not installed. Please install Node.js first."
+        return 1
+    fi
+    mkdir -p "$PI_DIR"
+    cd "$PI_DIR" || return 1
+    if [ ! -f package.json ]; then
+        npm init -y
+    fi
+    npm install @earendil-works/pi-coding-agent@latest
+}
+
+run_pi_standalone() {
+    if [ ! -x "$PI_DIR/node_modules/.bin/pi" ]; then
+        echo "Pi is not installed locally."
+        install_pi || exit 1
+    fi
+
+    local remote_host="$1"
+    local base_url
+    if [ -n "$remote_host" ]; then
+        # Allow host:port or bare IP/hostname (defaults to port 8080)
+        if [[ "$remote_host" == *:* ]]; then
+            base_url="http://$remote_host/v1"
+        else
+            base_url="http://$remote_host:8080/v1"
+        fi
+        echo "[Pi] Connecting to remote server at $base_url"
+    else
+        base_url="http://localhost:8080/v1"
+    fi
+    
+    export MODELS_FILE="$HOME/.pi/agent/models.json"
+    if [ -n "$selected_alias" ]; then
+        export SELECTED_ALIAS="$selected_alias"
+    elif [ -n "$remote_host" ]; then
+        export SELECTED_ALIAS="remote"
+    else
+        export SELECTED_ALIAS=""
+    fi
+    export BASE_URL="$base_url"
+    export API_KEY
+
+    mkdir -p "$HOME/.pi/agent"
+
+    if [ -z "$SELECTED_CTX" ] && [ -n "$SELECTED_ALIAS" ]; then
+        probe_remote_ctx "$BASE_URL" "$API_KEY"
+    fi
+
+    node -e '
+    const fs = require("fs");
+    const path = process.env.MODELS_FILE;
+    const alias = process.env.SELECTED_ALIAS || "default";
+    const ctx = parseInt(process.env.SELECTED_CTX) || 128000;
+    const baseUrl = process.env.BASE_URL;
+    const apiKey = process.env.API_KEY || "dummy";
+
+    let cfg = { providers: {} };
+    try {
+        if (fs.existsSync(path)) {
+            cfg = JSON.parse(fs.readFileSync(path, "utf8"));
+        }
+    } catch (e) {
+        console.warn("Notice: Could not parse existing models.json, starting fresh.");
+    }
+
+    cfg.providers = cfg.providers || {};
+    cfg.providers["llama-local"] = {
+        baseUrl: baseUrl,
+        api: "openai-completions",
+        apiKey: apiKey,
+        models: cfg.providers["llama-local"]?.models || []
+    };
+
+    const models = cfg.providers["llama-local"].models;
+    const maxOut = Math.floor(ctx * 0.5);
+    const isQwen = /qwen/i.test(alias);
+    const thinkingLevelMap = isQwen ? {
+        off: "none",
+        minimal: "low",
+        low: "low",
+        medium: "medium",
+        high: "xhigh",
+        xhigh: "xhigh",
+        max: "xhigh"
+    } : {
+        off: "none",
+        minimal: "low",
+        low: "low",
+        medium: "medium",
+        high: "high",
+        xhigh: "xhigh",
+        max: "max"
+    };
+
+    if (alias) {
+        const existing = models.find(m => m.id === alias);
+        const modelEntry = {
+            contextWindow: ctx,
+            maxTokens: maxOut,
+            reasoning: true,
+            compat: {
+                supportsReasoningEffort: true,
+                requiresThinkingAsText: true
+            },
+            thinkingLevelMap: thinkingLevelMap
+        };
+        if (existing) {
+            Object.assign(existing, modelEntry);
+        } else {
+            models.push({
+                id: alias,
+                name: "Local: " + alias,
+                ...modelEntry
+            });
+        }
+    }
+
+    fs.writeFileSync(path, JSON.stringify(cfg, null, 2));
+    ' 2>/dev/null || echo "Warning: Failed to update pi models.json."
+    
+    local PI_BIN="$PI_DIR/node_modules/.bin/pi"
+
+    if [ -n "$SELECTED_ALIAS" ]; then
+        echo "Starting Pi with local model: $SELECTED_ALIAS"
+        "$PI_BIN" --model "llama-local/$SELECTED_ALIAS"
+    else
+        "$PI_BIN"
+    fi
+}
+
+launch_pi() {
+    start_llama_server 8080
+    run_pi_standalone
+    kill "$llama_pid" 2>/dev/null
+}
+
+run_mykyagent_standalone() {
+    if [ ! -x "$MYKYAGENT_DIR/bin/mykyagent" ]; then
+        echo "MykyAgent launcher not found at $MYKYAGENT_DIR/bin/mykyagent."
+        return 1
+    fi
+
+    local remote_host=""
+    local client_args=()
+
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == -* ]]; then
+            client_args+=("$1")
+            shift
+        elif [ -z "$remote_host" ] && [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?$ || "$1" =~ ^[a-zA-Z0-9.-]+:[0-9]+$ ]]; then
+            remote_host="$1"
+            shift
+        else
+            client_args+=("$1")
+            shift
+        fi
+    done
+
+    local base_url
+    if [ -n "$remote_host" ]; then
+        if [[ "$remote_host" == *:* ]]; then
+            base_url="http://$remote_host/v1"
+        else
+            base_url="http://$remote_host:8080/v1"
+        fi
+        echo "[MykyAgent] Connecting to remote server at $base_url"
+    else
+        base_url="http://localhost:8080/v1"
+        # If local llama-server is not running on 8080, launch server with model selection
+        if ! curl -s "http://localhost:8080/health" 2>/dev/null | grep -q '{"status":"ok"}'; then
+            echo "[MykyAgent] Local llama-server is not running on port 8080."
+            echo "[MykyAgent] Launching llama-server with selected model..."
+            select_model || return 1
+            EXTRA_ARGS=("${client_args[@]}" "${EXTRA_ARGS[@]}")
+            launch_mykyagent
+            return $?
+        fi
+    fi
+
+    export MYKYAGENT_BASE_URL="$base_url"
+    export MODELS_FILE="$HOME/.pi/agent/models.json"
+    if [ -n "$selected_alias" ]; then
+        export SELECTED_ALIAS="$selected_alias"
+    elif [ -n "$remote_host" ]; then
+        export SELECTED_ALIAS="remote"
+    else
+        export SELECTED_ALIAS=""
+    fi
+    export BASE_URL="$base_url"
+    export API_KEY
+
+    mkdir -p "$HOME/.pi/agent"
+
+    if [ -z "$SELECTED_CTX" ] && [ -n "$SELECTED_ALIAS" ]; then
+        probe_remote_ctx "$BASE_URL" "$API_KEY"
+    fi
+
+    node -e '
+    const fs = require("fs");
+    const path = process.env.MODELS_FILE;
+    const alias = process.env.SELECTED_ALIAS || "default";
+    const ctx = parseInt(process.env.SELECTED_CTX) || 128000;
+    const baseUrl = process.env.BASE_URL;
+    const apiKey = process.env.API_KEY || "dummy";
+
+    let cfg = { providers: {} };
+    try {
+        if (fs.existsSync(path)) {
+            cfg = JSON.parse(fs.readFileSync(path, "utf8"));
+        }
+    } catch (e) {
+        console.warn("Notice: Could not parse existing models.json, starting fresh.");
+    }
+
+    cfg.providers = cfg.providers || {};
+    cfg.providers["llama-local"] = {
+        baseUrl: baseUrl,
+        api: "openai-completions",
+        apiKey: apiKey,
+        models: cfg.providers["llama-local"]?.models || []
+    };
+
+    const models = cfg.providers["llama-local"].models;
+    const maxOut = Math.floor(ctx * 0.5);
+    const isQwen = /qwen/i.test(alias);
+    const thinkingLevelMap = isQwen ? {
+        off: "none",
+        minimal: "low",
+        low: "low",
+        medium: "medium",
+        high: "xhigh",
+        xhigh: "xhigh",
+        max: "xhigh"
+    } : {
+        off: "none",
+        minimal: "low",
+        low: "low",
+        medium: "medium",
+        high: "high",
+        xhigh: "xhigh",
+        max: "max"
+    };
+
+    if (alias) {
+        const existing = models.find(m => m.id === alias);
+        const modelEntry = {
+            contextWindow: ctx,
+            maxTokens: maxOut,
+            reasoning: true,
+            compat: {
+                supportsReasoningEffort: true,
+                requiresThinkingAsText: true
+            },
+            thinkingLevelMap: thinkingLevelMap
+        };
+        if (existing) {
+            Object.assign(existing, modelEntry);
+        } else {
+            models.push({
+                id: alias,
+                name: "Local: " + alias,
+                ...modelEntry
+            });
+        }
+    }
+
+    fs.writeFileSync(path, JSON.stringify(cfg, null, 2));
+    ' 2>/dev/null || echo "Warning: Failed to update pi models.json."
+
+    local AGENT_BIN="$MYKYAGENT_DIR/bin/mykyagent"
+    local combined_args=("${client_args[@]}" "${EXTRA_ARGS[@]}")
+
+    if [ -n "$SELECTED_ALIAS" ]; then
+        echo "Starting MykyAgent with model: $SELECTED_ALIAS"
+        "$AGENT_BIN" --model "llama-local/$SELECTED_ALIAS" "${combined_args[@]}"
+    else
+        "$AGENT_BIN" "${combined_args[@]}"
+    fi
+}
+
+launch_mykyagent() {
+    start_llama_server 8080
+    run_mykyagent_standalone
+    kill "$llama_pid" 2>/dev/null
+}
+
+install_littlecoder() {
+    echo "Installing little-coder locally..."
+    if ! command -v npm &> /dev/null; then
+        echo "Error: npm is not installed. Please install Node.js first."
+        return 1
+    fi
+    if [ -d "$LITTLECODER_DIR/.git" ]; then
+        (cd "$LITTLECODER_DIR" && git pull --rebase --autostash)
+    else
+        rm -rf "$LITTLECODER_DIR"
+        git clone --depth 1 "https://github.com/itayinbarr/little-coder.git" "$LITTLECODER_DIR"
+    fi
+    cd "$LITTLECODER_DIR" || return 1
+    npm install
+}
+
+run_littlecoder_standalone() {
+    if [ ! -x "$LITTLECODER_DIR/bin/little-coder.mjs" ]; then
+        echo "little-coder is not installed locally."
+        install_littlecoder || exit 1
+    fi
+
+    local remote_host="$1"
+    local base_url
+    if [ -n "$remote_host" ]; then
+        if [[ "$remote_host" == *:* ]]; then
+            base_url="http://$remote_host/v1"
+        else
+            base_url="http://$remote_host:8080/v1"
+        fi
+        echo "[LittleCoder] Connecting to remote server at $base_url"
+    else
+        base_url="http://localhost:8080/v1"
+    fi
+
+    export LLAMACPP_BASE_URL="$base_url"
+    export LLAMACPP_API_KEY="${OPENAI_API_KEY:-$API_KEY}"
+    if [ -n "$selected_alias" ]; then
+        export SELECTED_ALIAS="$selected_alias"
+    elif [ -n "$remote_host" ]; then
+        export SELECTED_ALIAS="remote"
+    else
+        export SELECTED_ALIAS=""
+    fi
+    export LITTLE_CODER_PERMISSION_MODE="accept-all"
+    
+    export MODELS_FILE="$HOME/.pi/agent/models.json"
+    export LITTLE_CODER_MODELS_FILE="$HOME/.pi/agent/models.json"
+    mkdir -p "$HOME/.pi/agent"
+
+    if [ -z "$SELECTED_CTX" ] && [ -n "$SELECTED_ALIAS" ]; then
+        probe_remote_ctx "$LLAMACPP_BASE_URL" "$LLAMACPP_API_KEY"
+    fi
+
+    node -e '
+    const fs = require("fs");
+    const path = process.env.MODELS_FILE;
+    const alias = process.env.SELECTED_ALIAS || "default";
+    const ctx = parseInt(process.env.SELECTED_CTX) || 128000;
+    const baseUrl = process.env.LLAMACPP_BASE_URL;
+    const apiKey = process.env.LLAMACPP_API_KEY || "dummy";
+
+    let cfg = { providers: {} };
+    try {
+        if (fs.existsSync(path)) {
+            cfg = JSON.parse(fs.readFileSync(path, "utf8"));
+        }
+    } catch (e) {
+        console.warn("Notice: Could not parse existing models.json, starting fresh.");
+    }
+
+    cfg.providers = cfg.providers || {};
+    cfg.providers["llamacpp"] = {
+        baseUrl: baseUrl,
+        api: "openai-completions",
+        apiKey: apiKey,
+        models: cfg.providers["llamacpp"]?.models || []
+    };
+
+    const models = cfg.providers["llamacpp"].models;
+    const maxOut = Math.floor(ctx * 0.5);
+    const isQwen = /qwen/i.test(alias);
+    const thinkingLevelMap = isQwen ? {
+        off: "none",
+        minimal: "low",
+        low: "low",
+        medium: "medium",
+        high: "xhigh",
+        xhigh: "xhigh",
+        max: "xhigh"
+    } : {
+        off: "none",
+        minimal: "low",
+        low: "low",
+        medium: "medium",
+        high: "high",
+        xhigh: "xhigh",
+        max: "max"
+    };
+
+    if (alias) {
+        const existing = models.find(m => m.id === alias);
+        const modelEntry = {
+            contextWindow: ctx,
+            maxTokens: maxOut,
+            reasoning: true,
+            compat: {
+                supportsReasoningEffort: true,
+                requiresThinkingAsText: true
+            },
+            thinkingLevelMap: thinkingLevelMap
+        };
+        if (existing) {
+            Object.assign(existing, modelEntry);
+        } else {
+            models.push({
+                id: alias,
+                name: "Local: " + alias,
+                ...modelEntry
+            });
+        }
+    }
+
+    fs.writeFileSync(path, JSON.stringify(cfg, null, 2));
+    ' 2>/dev/null || echo "Warning: Failed to update little-coder models.json."
+
+    local LC_BIN="$LITTLECODER_DIR/bin/little-coder.mjs"
+
+    if [ -n "$SELECTED_ALIAS" ]; then
+        echo "Starting little-coder with local model: $SELECTED_ALIAS"
+        "$LC_BIN" --model "llamacpp/$SELECTED_ALIAS" --api-key "$LLAMACPP_API_KEY"
+    else
+        "$LC_BIN"
+    fi
+}
+
+launch_littlecoder() {
+    start_llama_server 8080
+    run_littlecoder_standalone
+    kill "$llama_pid" 2>/dev/null
+}
+
+run_oobabooga() {
+    ensure_repo "$OOBABOOGA_DIR" "$OOBABOOGA_REPO"
+    ln -sfn "$modelstorage" "$OOBABOOGA_DIR/models"
+    (cd "$OOBABOOGA_DIR" && ./start_linux.sh --model-dir "$modelstorage")
+}
+
+
+launch_odysseus() {
+    start_llama_server 8080
+    ensure_repo "$ODYSSEUS_DIR" "$ODYSSEUS_REPO"
+    cd "$ODYSSEUS_DIR" || exit
+    if [ ! -d "venv" ] && [ ! -d ".venv" ]; then
+        uv venv
+        uv pip install -r requirements.txt
+        uv run python setup.py
+    fi
+    uv run uvicorn app:app --host 127.0.0.1 --port 7000
+    kill "$llama_pid" 2>/dev/null
+}
+
+run_odysseus_standalone() {
+    ensure_repo "$ODYSSEUS_DIR" "$ODYSSEUS_REPO"
+    cd "$ODYSSEUS_DIR" || exit
+    if [ ! -d "venv" ] && [ ! -d ".venv" ]; then
+        uv venv
+        uv pip install -r requirements.txt
+        uv run python setup.py
+    fi
+    uv run uvicorn app:app --host 127.0.0.1 --port 7000
+}
+
+
+run_model() {
+
+    [ ! -f "$MODEL_LIST_FILE" ] && { echo "No models!"; exit 1; }
+    local selected=$(cat "$MODEL_LIST_FILE" | awk -F'|' '{printf "%2d) %-20s [%s]\n", NR, $1, $3}' | fzf_with_usage models --prompt="Select model > ")
+    [ -z "$selected" ] && return
+    
+    local index=$(echo "$selected" | awk '{print $1}' | tr -d ')')
+    IFS='|' read -r selected_alias selected_path selected_custom <<< "$(sed "${index}q;d" "$MODEL_LIST_FILE")"
+    final_args="$DEFAULT_MODEL_ARGS $selected_custom ${EXTRA_ARGS[*]}"
+
+    # Setup model-specific speculative decoding lookup cache
+    local safe_alias=$(echo "$selected_alias" | tr -dc 'a-zA-Z0-9_-')
+    local model_cache="$BASE_DIR/cache/${safe_alias}.cache"
+    touch "$model_cache"
+    SERVER_ARGS="$SERVER_ARGS -lcd $model_cache"
+
+    if [ "$MAX_VRAM_MB" -gt 0 ] && [ -f "$selected_path" ]; then
+        echo -e "\n[Auto-NGL] Calculating optimal VRAM offload..."
+        
+        local NGL_CACHE_FILE="$CONFIG_DIR/ngl_cache.txt"
+        [ ! -f "$NGL_CACHE_FILE" ] && touch "$NGL_CACHE_FILE"
+        
+        # Cache format: path|layers|avg_block_mb|non_block_mb
+        local cache_hit=$(awk -F'|' -v path="$selected_path" '$1 == path {print $2"|"$3"|"$4; exit}' "$NGL_CACHE_FILE")
+        local layers avg_block_mb non_block_mb
+
+        if [ -n "$cache_hit" ]; then
+            echo "[Auto-NGL] Fast-loaded layer sizes from cache!"
+            IFS='|' read -r layers avg_block_mb non_block_mb <<< "$cache_hit"
+        else
+            local gguf_out
+            gguf_out=$(uv run -q --with gguf python -c "
+import gguf, re
+r = gguf.GGUFReader('$selected_path')
+block_count = next(v for k,v in r.fields.items() if 'block_count' in k).parts[-1].tolist()[0]
+non_block = 0
+blocks = {}
+for t in r.tensors:
+    m = re.match(r'blk\.(\d+)\.', t.name)
+    if m:
+        l = int(m.group(1))
+        blocks[l] = blocks.get(l, 0) + t.n_bytes
+    else:
+        non_block += t.n_bytes
+avg = sum(blocks.values()) / len(blocks) if blocks else 0
+print(f'{int(block_count)}|{avg/1024/1024:.2f}|{non_block/1024/1024:.2f}')
+" 2>/dev/null)
+            if [ -n "$gguf_out" ]; then
+                IFS='|' read -r layers avg_block_mb non_block_mb <<< "$gguf_out"
+                sed -i "\|^$selected_path|d" "$NGL_CACHE_FILE" 2>/dev/null || true
+                echo "$selected_path|$layers|$avg_block_mb|$non_block_mb" >> "$NGL_CACHE_FILE"
+            fi
+        fi
+
+        if [ -n "$layers" ] && [ "$layers" -gt 0 ]; then
+            # Reserve ~512 MB for KV cache and compute scratch buffers
+            local compute_reserve_mb=512
+            local avg_block_int=$(echo "$avg_block_mb" | cut -d. -f1)
+            local non_block_int=$(echo "$non_block_mb" | cut -d. -f1)
+
+            local available_vram=$((MAX_VRAM_MB - non_block_int - compute_reserve_mb))
+            [ "$available_vram" -lt 0 ] && available_vram=0
+
+            if [ "$avg_block_int" -gt 0 ]; then
+                local calculated_ngl=$((available_vram / avg_block_int))
+                [ "$calculated_ngl" -gt "$layers" ] && calculated_ngl=$layers
+                echo "[Auto-NGL] Model: ${layers} layers, ~${avg_block_mb}MB/layer, ${non_block_mb}MB overhead"
+                echo "[Auto-NGL] Budget: ${MAX_VRAM_MB}MB VRAM - ${non_block_int}MB overhead - ${compute_reserve_mb}MB reserve = ${available_vram}MB for layers"
+                echo "[Auto-NGL] Setting -ngl to $calculated_ngl"
+
+                final_args=$(echo "$final_args" | sed -E 's/-ngl [0-9]+//g')
+                final_args="-ngl $calculated_ngl $final_args"
+            fi
+        else
+            echo "[Auto-NGL] Failed to read layer count from GGUF. Falling back to default."
+        fi
+    fi
+
+    local mode_menu="1) CLI\n2) Server\n3) Public\n4) Silly\n5) OpenCode\n6) Odysseus\n7) Codehamr\n8) Hermes\n9) Pi\n10) Little-coder\n11) Deepseek-harness\n12) MykyAgent"
+    local mode=$(echo -e "$mode_menu" | fzf_with_usage modes --prompt="Mode > " | awk '{print $1}' | tr -d ')')
+    [ -z "$mode" ] && return
+    
+    case $mode in
+        1) select_prompt
+           [ ! -x "$LLAMA_DIR/build/bin/llama-cli" ] && { echo "Error: llama-cli not compiled!"; return; }
+           run_pinned "$LLAMA_DIR/build/bin/llama-cli" -m "$selected_path" ${selected_prompt:+--system-prompt-file "$selected_prompt"} --no-display-prompt -cnv $final_args ;;
+        2) [ ! -x "$LLAMA_DIR/build/bin/llama-server" ] && { echo "Error: llama-server not compiled!"; return; }
+           # Prepend server-mode flags now that we know the mode
+           final_args="$SERVER_ARGS $final_args"
+           run_pinned "$LLAMA_DIR/build/bin/llama-server" -m "$selected_path" $final_args ;;
+        3) [ ! -x "$LLAMA_DIR/build/bin/llama-server" ] && { echo "Error: llama-server not compiled!"; return; }
+           # Prepend server-mode flags now that we know the mode
+           final_args="$SERVER_ARGS --api-key $API_KEY $final_args"
+           local ips=$(ip -br addr show | awk '$1 != "lo" && $2 == "UP" {gsub(/\/[0-9]+/, "", $0); out="[" $1 "]"; for(i=3;i<=NF;i++) if($i !~ /^fe80:/) out=out " " $i; print out}' | paste -sd " | " -)
+           echo "[Server] Public IPs: $ips"
+           run_pinned "$LLAMA_DIR/build/bin/llama-server" -m "$selected_path" $final_args --host 0.0.0.0 ;;
+        4) launch_sillytavern ;;
+        5) launch_opencode ;;
+        6) launch_odysseus ;;
+        7) launch_codehamr ;;
+        8) launch_hermes ;;
+        9) launch_pi ;;
+        10) launch_littlecoder ;;
+        11) launch_deepseek ;;
+        12) launch_mykyagent ;;
+        *) ;;
+    esac
+}
+
+# =============================================================================
+# Main Entry Point
+# =============================================================================
+
+# Extract -vram if present so we can override MAX_VRAM_MB dynamically
+NEW_ARGS=()
+while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "-vram" || "$1" == "--vram" ]]; then
+        MAX_VRAM_MB="$2"
+        shift 2
+    else
+        NEW_ARGS+=("$1")
+        shift
+    fi
+done
+set -- "${NEW_ARGS[@]}"
+
+# Set EXTRA_ARGS depending on whether the first argument was a script flag
+case "$1" in
+    -is|--installscr) EXTRA_ARGS=("${@:2}"); install_script ;;
+    -b|--backend)     EXTRA_ARGS=("${@:2}"); switch_backend ;;
+    -p|--patch)       EXTRA_ARGS=("${@:3}"); apply_patch "$2" ;;
+    -i|--install)     EXTRA_ARGS=("${@:2}"); install_llm_core ;;
+    -u|--upgrade)     EXTRA_ARGS=("${@:2}"); upgrade_llm_core ;;
+    -e|--edit)        EXTRA_ARGS=("${@:2}"); edit_script ;;
+    -sm|--scan-models) EXTRA_ARGS=("${@:2}"); scan_models ;;
+    -s|--settings)    EXTRA_ARGS=("${@:2}"); configure_settings ;;
+    -d|--delete)      EXTRA_ARGS=("${@:2}"); delete_model ;;
+    -r|--run-silly)   EXTRA_ARGS=("${@:2}"); run_sillytavern_standalone ;;
+    -dh|--run-deepseek) EXTRA_ARGS=("${@:3}"); run_deepseek_standalone "$2" ;;
+    -oc|--run-opencode) EXTRA_ARGS=("${@:2}"); run_opencode_standalone ;;
+    -ch|--run-codehamr) EXTRA_ARGS=("${@:2}"); run_codehamr_standalone ;;
+    -he|--run-hermes) EXTRA_ARGS=("${@:3}"); run_hermes_standalone "$2" ;;
+    -hs|--hermes-setup) EXTRA_ARGS=("${@:2}"); run_hermes_setup ;;
+    -pi|--run-pi)     EXTRA_ARGS=("${@:3}"); run_pi_standalone "$2" ;;
+    -lc|--run-littlecoder) EXTRA_ARGS=("${@:3}"); run_littlecoder_standalone "$2" ;;
+    -ma|--run-mykyagent|--mykyagent|--agent|agent|mykyagent) shift; run_mykyagent_standalone "$@" ;;
+    -o|--run-ooba)    EXTRA_ARGS=("${@:2}"); run_oobabooga ;;
+    -O|--run-odys)    EXTRA_ARGS=("${@:2}"); run_odysseus_standalone ;;
+    -h|--help)        EXTRA_ARGS=("${@:2}"); print_help ;;
+    -Re|--reset)      EXTRA_ARGS=("${@:2}"); reset_llm ;;
+    -C|--configure)   EXTRA_ARGS=("${@:2}"); configure_llm ;;
+    -m|--modellistedit) EXTRA_ARGS=("${@:2}"); $EDITOR "$MODEL_LIST_FILE" ;;
+    -ps|--scan-prompts) EXTRA_ARGS=("${@:2}"); scan_prompts ;;
+    -pd|--delete-prompt) EXTRA_ARGS=("${@:2}"); delete_prompt ;;
+    -pe|--edit-prompts) EXTRA_ARGS=("${@:2}"); $EDITOR "$PROMPT_LIST_FILE" ;;
+    -c|--compile)     EXTRA_ARGS=("${@:2}"); compile_llm_core ;;
+    *)                EXTRA_ARGS=("$@"); run_model ;;
+esac
