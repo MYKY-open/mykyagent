@@ -48,12 +48,6 @@ chmod +x "$SCRIPT_DIR/bin/mykyagent"
 ln -sf "$SCRIPT_DIR/bin/mykyagent" "$INSTALL_BIN/mykyagent"
 echo "  [LINK] $INSTALL_BIN/mykyagent -> $SCRIPT_DIR/bin/mykyagent"
 
-if [ -f "$SCRIPT_DIR/llm" ]; then
-    chmod +x "$SCRIPT_DIR/llm"
-    ln -sf "$SCRIPT_DIR/llm" "$INSTALL_BIN/llm"
-    echo "  [LINK] $INSTALL_BIN/llm -> $SCRIPT_DIR/llm"
-fi
-
 echo ""
 if [[ ":$PATH:" != *":$INSTALL_BIN:"* ]]; then
     echo "Warning: $INSTALL_BIN is not in your PATH."
@@ -68,9 +62,6 @@ if [ "$MISSING_DEPS" -gt 0 ]; then
     exit 1
 else
     echo "=== Status: Ready ==="
-    echo "To run MykyAgent:"
-    echo "  1. Run 'llm' to launch the interactive model manager"
-    echo "  2. Select your model, then choose '12) MykyAgent'"
-    echo ""
-    echo "Or run 'mykyagent' directly if llama-server is already running."
+    echo "Start MykyAgent with: mykyagent"
+    echo "Or launch via the 'llm' orchestrator menu (Mode 12: MykyAgent)."
 fi
