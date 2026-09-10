@@ -74,7 +74,7 @@ async function distillWithSubagent(query: string, content: string, modelInfo?: a
           content: `Query: ${query}\n\nSearch Content:\n${content}`,
         },
       ],
-      max_tokens: 1500,
+      max_tokens: 4096,
       temperature: 0.1,
     });
 
@@ -95,8 +95,8 @@ async function distillWithSubagent(query: string, content: string, modelInfo?: a
     // sub-call fallback
   }
 
-  // Fallback if sub-call fails: return concise slice (safe size, no context blowout)
-  return content.slice(0, 3000);
+  // Fallback if sub-call fails: return clean slice (up to 20,000 chars)
+  return content.slice(0, 20000);
 }
 
 export default function (pi: any) {
