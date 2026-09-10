@@ -97,6 +97,8 @@ async function distillWithSubagent(query: string, content: string, modelInfo?: a
 
   // Fallback if sub-call fails: return concise raw content
   return content.slice(0, 1000);
+}
+
 export default function (pi: any) {
   // 1. Caveman System Prompt + Memory Injection
   pi.on("before_agent_start", async (event: any, ctx: any) => {
