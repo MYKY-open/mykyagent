@@ -23,6 +23,22 @@ def search(query):
     except Exception as e:
         return [{"error": str(e)}]
 
+def split_blocks(text):
+    # Split text into paragraphs while preserving fenced code blocks intact
+    pattern = r"(```[\s\S]*?```)"
+    parts = re.split(pattern, text)
+    blocks = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if part.startswith("```") and part.endswith("```"):
+            blocks.append(part)
+        else:
+            sub = [s.strip() for s in re.split(r"\n{2,}", part) if s.strip()]
+            blocks.extend(sub)
+    return blocks
+
 def extract_relevant_chunks(text, query, max_total_chars=1800):
     if not query or not text:
         return text[:max_total_chars]
@@ -32,40 +48,54 @@ def extract_relevant_chunks(text, query, max_total_chars=1800):
     if not keywords:
         keywords = query_terms
 
-    blocks = re.split(r"\n{2,}", text)
-    scored_blocks = []
+    blocks = split_blocks(text)
+    scored = []
 
-    for block in blocks:
-        block_clean = block.strip()
-        if not block_clean:
+    for idx, blk in enumerate(blocks):
+        blk_clean = blk.strip()
+        if not blk_clean:
             continue
-        # Skip UI noise / nav boilerplate
-        if any(skip in block_clean for skip in ["Sign in", "Sign up", "Clone via HTTPS", "Dismiss alert", "Skip to content", "You signed in with another"]):
+        is_code = blk_clean.startswith("```") and blk_clean.endswith("```")
+        is_table = "|" in blk_clean and ("http" in blk_clean or "-" in blk_clean)
+
+        # Skip UI noise / session alerts (never skip code blocks or tables)
+        if not is_code and any(skip in blk_clean for skip in [
+            "You signed in with another tab or window",
+            "Reload to refresh your session",
+            "You signed out in another tab or window",
+            "Clone via HTTPS",
+            "Dismiss alert",
+            "Skip to content"
+        ]):
             continue
-        is_code = block_clean.startswith("```") or "```" in block_clean
-        is_table = "|" in block_clean and ("http" in block_clean or "-" in block_clean)
-        block_lower = block_clean.lower()
-        
-        hits = sum(1 for kw in keywords if kw in block_lower)
+
+        blk_lower = blk_clean.lower()
+        hits = sum(1 for kw in keywords if kw in blk_lower)
         if hits > 0 or is_code or is_table:
-            # Massive priority for code blocks and data tables containing links
-            score = hits * 2 + (10 if (is_code or is_table) else 0)
-            scored_blocks.append((score, block_clean))
+            # Massive priority for code blocks and data tables
+            score = hits * 3 + (15 if is_code else (8 if is_table else 0))
+            scored.append({"index": idx, "score": score, "block": blk_clean})
 
-    scored_blocks.sort(key=lambda x: x[0], reverse=True)
+    # Sort by score to prioritize highest value chunks
+    scored.sort(key=lambda x: x["score"], reverse=True)
 
-    result = []
+    # Greedily select top chunks up to max_total_chars
+    selected = []
     total_len = 0
-    for _, blk in scored_blocks:
-        if total_len + len(blk) > max_total_chars:
-            remaining = max_total_chars - total_len
-            if remaining > 150:
-                result.append(blk[:remaining] + "\n...")
+    for item in scored:
+        b_len = len(item["block"])
+        if total_len + b_len > max_total_chars:
+            if not selected and max_total_chars > 200:
+                item["block"] = item["block"][:max_total_chars] + "\n..."
+                selected.append(item)
             break
-        result.append(blk)
-        total_len += len(blk)
+        selected.append(item)
+        total_len += b_len
 
-    return "\n\n".join(result) if result else text[:max_total_chars]
+    # Restore natural document order for readability
+    selected.sort(key=lambda x: x["index"])
+
+    return "\n\n".join(x["block"] for x in selected) if selected else text[:max_total_chars]
 
 def fetch(url, query=None):
     try:
@@ -81,9 +111,10 @@ def fetch(url, query=None):
                 important_links.append(f"- [{text}]({href})")
         important_links = list(dict.fromkeys(important_links))[:15]
 
-        # Decompose non-content tags
-        for tag in soup(["script", "style", "noscript", "nav", "header", "footer", "aside", "svg"]):
-            tag.decompose()
+        # Format code blocks FIRST so code snippets (including HTML, SVGs, scripts) are preserved
+        for pre in soup.find_all("pre"):
+            code_text = pre.get_text()
+            pre.replace_with(f"\n\n```\n{code_text}\n```\n\n")
 
         # Format markdown tables
         for table in soup.find_all("table"):
@@ -99,10 +130,9 @@ def fetch(url, query=None):
                 table_md = "\n\n" + rows[0] + "\n" + sep + "\n" + "\n".join(rows[1:]) + "\n\n"
                 table.replace_with(table_md)
 
-        # Format code blocks so markdown retains code structure
-        for pre in soup.find_all("pre"):
-            code_text = pre.get_text()
-            pre.replace_with(f"\n\n```\n{code_text}\n```\n\n")
+        # Decompose non-content layout tags of the host website
+        for tag in soup(["script", "style", "noscript", "nav", "header", "footer", "aside", "svg"]):
+            tag.decompose()
 
         # Format headings
         for h in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
