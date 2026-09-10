@@ -117,6 +117,7 @@ export default function (pi: any) {
       `Goal: do user task completely and efficiently.\n\n` +
       `Available Tools:\n` +
       `- bash: run shell commands, check environment, download files, run scripts/tests.\n` +
+      `- web_research: deep multi-page autonomous research for finding verified download links, real versions, API specs, or code across multiple sites.\n` +
       `- web_search: search internet for current facts, release versions, download URLs, docs.\n` +
       `- web_fetch: read specific webpage or documentation URL (full text, code blocks, tables).\n` +
       `- memory_save: remember a key fact across sessions.\n` +
@@ -126,6 +127,8 @@ export default function (pi: any) {
       `- For tasks with >1 step, state a simple 3-5 step plan at start before taking action (e.g. 1. Create folders, 2. Find version, 3. Download/configure, 4. Verify).\n` +
       `- Follow steps sequentially. Do not wander or skip steps.\n\n` +
       `Efficiency & Execution Rules:\n` +
+      `- Use web_research when you need verified download links, real versions, official APIs, or complex documentation across multiple pages.\n` +
+      `- Never invent or guess hashes, version numbers, or download URLs. Only use verified data from web_research/web_fetch.\n` +
       `- Search smartly: Never guess version numbers or old years in search queries. Search for official manifests, release APIs, or version archives.\n` +
       `- Do not repeat: Never re-fetch a URL that already failed or yielded no direct links.\n` +
       `- Combine commands: Chain related actions in bash (e.g. mkdir && curl && echo config) instead of taking separate turns.\n` +
@@ -136,7 +139,58 @@ export default function (pi: any) {
     return { systemPrompt: cavemanPrompt };
   });
 
-  // 2. Web Search Tool (Returns direct titles, URLs, and snippets)
+  // 2. Web Deep Research Tool (Autonomous multi-hop crawl and factual verification)
+  pi.registerTool({
+    name: "web_research",
+    label: "Web Deep Research",
+    description:
+      "Perform deep, autonomous web research. Searches the web, crawls candidate pages in parallel, extracts direct download links, API specs, and code snippets, and returns a verified technical synthesis.",
+    parameters: Type.Object({
+      query: Type.String({ description: "Research query or goal (e.g. download links, API usage, library documentation)" }),
+    }),
+    async execute(_id: string, { query }: { query: string }, _signal: any, _onUpdate: any, ctx: any) {
+      try {
+        const proc = spawnSync("uv", ["run", HELPER_SCRIPT, "research", query], {
+          encoding: "utf-8",
+          timeout: 45000,
+        });
+
+        if (proc.error || proc.status !== 0) {
+          return {
+            content: [{ type: "text", text: `Research error: ${proc.stderr || proc.error?.message}` }],
+            isError: true,
+          };
+        }
+
+        const raw = JSON.parse(proc.stdout || "{}");
+        if (raw.error) {
+          return { content: [{ type: "text", text: `Error during research: ${raw.error}` }], isError: true };
+        }
+
+        let bundle = `Query: ${query}\n\n`;
+        if (Array.isArray(raw.direct_links) && raw.direct_links.length > 0) {
+          bundle += `## Discovered Direct Download / Resource Links:\n${raw.direct_links.join("\n")}\n\n`;
+        }
+
+        if (Array.isArray(raw.pages) && raw.pages.length > 0) {
+          bundle += `## Crawled Web Pages:\n` + raw.pages.map((p: any) => `### Source: ${p.url}\n${p.content}`).join("\n\n---\n\n");
+        } else if (Array.isArray(raw.search_snippets) && raw.search_snippets.length > 0) {
+          bundle += `## Search Snippets:\n` + raw.search_snippets.map((s: any) => `• ${s.title} (${s.url}): ${s.snippet}`).join("\n");
+        }
+
+        // Distill via isolated subagent call:
+        const summary = await distillWithSubagent(query, bundle, ctx?.model);
+        return { content: [{ type: "text", text: summary }] };
+      } catch (e: any) {
+        return {
+          content: [{ type: "text", text: `Research failed: ${e.message}` }],
+          isError: true,
+        };
+      }
+    },
+  });
+
+  // 3. Web Search Tool (Returns direct titles, URLs, and snippets)
   pi.registerTool({
     name: "web_search",
     label: "Web Search",
