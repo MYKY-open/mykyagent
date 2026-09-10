@@ -1,8 +1,9 @@
 import { Type } from "@sinclair/typebox";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { constants, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { access, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -103,6 +104,13 @@ export default function (pi: any) {
   // 1. Caveman System Prompt + Memory Injection
   pi.on("before_agent_start", async (event: any, ctx: any) => {
     activeModelInfo = ctx?.getModel?.();
+    try {
+      const currentTools = pi.getActiveTools?.() || [];
+      const desired = ["read", "write", "edit", "bash", "grep", "find", "ls", "web_search", "web_fetch", "memory_save", "memory_list"];
+      const merged = Array.from(new Set([...currentTools, ...desired]));
+      pi.setActiveTools?.(merged);
+    } catch {}
+
     const mem = loadMemory();
     const memKeys = Object.keys(mem);
     let memBlock = "";
@@ -121,10 +129,19 @@ export default function (pi: any) {
       `- web_fetch: read specific webpage or documentation URL (distills clean technical specs, code blocks, links without bloating context).\n` +
       `- memory_save: remember a key fact across sessions.\n` +
       `- memory_list: list all remembered facts.\n` +
-      `- read, write, edit: inspect and modify project files.\n\n` +
+      `- read: inspect file chunks (safe default: 250 lines max per call; use offset & limit for large files).\n` +
+      `- grep: fast search for regex patterns, function definitions, or errors across files without reading whole files.\n` +
+      `- find: locate files and paths by glob or name pattern.\n` +
+      `- ls: list directory entries and structure.\n` +
+      `- write, edit: create and modify project files.\n\n` +
       `Planning Rules (Internal):\n` +
       `- For tasks with >1 step, state a simple 3-5 step plan at start before taking action (e.g. 1. Create folders, 2. Find version, 3. Download/configure, 4. Verify).\n` +
       `- Follow steps sequentially. Do not wander or skip steps.\n\n` +
+      `Code & Log Inspection Rules (Context Protection):\n` +
+      `- NEVER cat entire large files, logs, or dependency bundles into context.\n` +
+      `- For logs and debug output: always use 'tail -n 50 <log>' or grep for errors ('grep -inE "error|exception|fail" <log>') instead of cat.\n` +
+      `- For code exploration: locate functions/classes first using grep or find, then read only target lines with offset and limit.\n` +
+      `- Do not read more than 250 lines at a time unless strictly needed.\n\n` +
       `Efficiency & Execution Rules:\n` +
       `- Always use web_search when finding release downloads, versions, or library APIs. It crawls candidate pages and returns verified links.\n` +
       `- Never invent or guess hashes, version numbers, or download URLs. Only use verified data from web_search/web_fetch.\n` +
@@ -267,6 +284,82 @@ export default function (pi: any) {
       }
       const out = keys.map((k) => `• ${k}: ${mem[k]}`).join("\n");
       return { content: [{ type: "text", text: out }] };
+    },
+  });
+
+  // 6. Safe Read Tool (Protected chunk reading: default 250 lines, max 500 lines or 15KB per call)
+  pi.registerTool({
+    name: "read",
+    label: "read",
+    description:
+      "Read the contents of a file in safe chunks. Defaults to 250 lines max (capped at 500 lines or 15KB) to prevent context flooding. Use offset and limit for large files.",
+    parameters: Type.Object({
+      path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
+      offset: Type.Optional(Type.Number({ description: "Line number to start reading from (1-indexed, default: 1)" })),
+      limit: Type.Optional(Type.Number({ description: "Maximum number of lines to read (default: 250, capped at 500)" })),
+    }),
+    async execute(_id: string, { path, offset, limit }: { path: string; offset?: number; limit?: number }, _signal: any, _onUpdate: any, ctx: any) {
+      try {
+        const absPath = resolve(ctx?.cwd || process.cwd(), path);
+        await access(absPath, constants.R_OK);
+
+        const ext = path.split(".").pop()?.toLowerCase();
+        if (["png", "jpg", "jpeg", "gif", "webp", "bmp"].includes(ext || "")) {
+          const mimeType = ext === "jpg" ? "image/jpeg" : `image/${ext}`;
+          const buf = await readFile(absPath);
+          return {
+            content: [
+              { type: "text", text: `Read image file [${mimeType}] (${Math.round(buf.length / 1024)}KB)` },
+              { type: "image", data: buf.toString("base64"), mimeType },
+            ],
+          };
+        }
+
+        const raw = await readFile(absPath, "utf-8");
+        const allLines = raw.split("\n");
+        const totalLines = allLines.length;
+
+        const effectiveLimit = Math.min(Math.max(1, limit ?? 250), 500);
+        const startLine = offset ? Math.max(0, offset - 1) : 0;
+
+        if (startLine >= totalLines) {
+          return {
+            content: [{ type: "text", text: `Offset ${offset} is beyond end of file (${totalLines} lines total).` }],
+            isError: true,
+          };
+        }
+
+        const endLine = Math.min(startLine + effectiveLimit, totalLines);
+        const chunkLines = allLines.slice(startLine, endLine);
+        let chunkText = chunkLines.join("\n");
+
+        // Byte protection: max 15KB (~3500 tokens)
+        const maxBytes = 15 * 1024;
+        let byteTruncated = false;
+        if (Buffer.byteLength(chunkText, "utf-8") > maxBytes) {
+          chunkText = chunkText.slice(0, maxBytes);
+          byteTruncated = true;
+        }
+
+        const remaining = totalLines - endLine;
+        let footer = "";
+        if (remaining > 0 || byteTruncated) {
+          const nextOffset = endLine + 1;
+          footer = `\n\n[Showing lines ${startLine + 1}-${endLine} of ${totalLines} (${remaining} more lines). Use offset=${nextOffset} limit=${effectiveLimit} to read next chunk, or grep to search.]`;
+        } else if (startLine > 0) {
+          footer = `\n\n[Showing lines ${startLine + 1}-${endLine} of ${totalLines}. End of file reached.]`;
+        }
+
+        return {
+          content: [{ type: "text", text: chunkText + footer }],
+          details: { totalLines, startLine: startLine + 1, endLine },
+        };
+      } catch (err: any) {
+        return {
+          content: [{ type: "text", text: `Error reading file "${path}": ${err.message}` }],
+          isError: true,
+        };
+      }
     },
   });
 }
