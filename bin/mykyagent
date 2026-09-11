@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -e
 
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
     DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"

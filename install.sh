@@ -4,6 +4,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_BIN="${INSTALL_BIN:-$HOME/.local/bin}"
 PI_DIR="${PI_DIR:-$HOME/mykysw/pi}"
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 
 echo "=== Checking MykyAgent Prerequisites ==="
 MISSING_DEPS=0
@@ -28,16 +29,17 @@ elif [ -x "$SCRIPT_DIR/node_modules/.bin/pi" ]; then
 else
     echo "  [MISSING] @earendil-works/pi-coding-agent is not found."
     echo "            Install with: npm install -g @earendil-works/pi-coding-agent"
+    echo "            Or locally in $PI_DIR: (mkdir -p \"$PI_DIR\" && cd \"$PI_DIR\" && npm init -y && npm install @earendil-works/pi-coding-agent@latest)"
     MISSING_DEPS=$((MISSING_DEPS + 1))
 fi
 
-# 3. Check uv (optional / recommended for web search helper)
+# 3. Check uv (for web search/fetch tools)
 if command -v uv &>/dev/null; then
     UV_VER="$(uv --version 2>/dev/null | head -n1)"
     echo "  [OK] uv is installed ($UV_VER)"
 else
-    echo "  [OPTIONAL] uv is recommended for web search distillation & GGUF probing."
-    echo "             Install via: https://docs.astral.sh/uv/getting-started/installation/"
+    echo "  [WARN] 'uv' is not installed. Web search, web fetch, and research tools require uv."
+    echo "         Install via: curl -LsSf https://astral.sh/uv/install.sh | sh"
 fi
 
 # 4. Pre-install Playwright Chromium browser (for JS-rendered page support in web_search/web_fetch)
