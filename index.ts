@@ -370,41 +370,84 @@ function collapseProgressItems(items: string[]): string[] {
   return result;
 }
 
-export function cleanCommandOutput(text: string): string {
-  if (!text || typeof text !== "string") return text;
+const MAX_BASH_OUTPUT_BYTES = Number(process.env.MYKYAGENT_MAX_BASH_BYTES) || 10 * 1024; // Default: 10KB (~2500 tokens max)
 
-  // Quick check: if text has no carriage return, no percent sign, no frame indicator, and no ANSI codes,
-  // then it is standard output (e.g. ls, cat, diff) and can be returned as-is immediately.
-  if (!text.includes("\r") && !text.includes("%") && !text.includes("frame=") && !text.includes("objects:") && !text.includes("\x1b")) {
-    return text;
+export function truncateTailToBytes(
+  text: string,
+  maxBytes: number = MAX_BASH_OUTPUT_BYTES
+): { text: string; truncated: boolean } {
+  const buf = Buffer.from(text, "utf-8");
+  if (buf.length <= maxBytes) return { text, truncated: false };
+
+  let sliceStart = buf.length - maxBytes;
+  while (sliceStart < buf.length && (buf[sliceStart] & 0xc0) === 0x80) {
+    sliceStart++;
   }
+  let truncated = buf.subarray(sliceStart).toString("utf-8");
+
+  const firstNewline = truncated.indexOf("\n");
+  if (firstNewline !== -1 && firstNewline < 300) {
+    truncated = truncated.slice(firstNewline + 1);
+  }
+  return { text: truncated, truncated: true };
+}
+
+export function cleanCommandOutput(text: string, fullOutputPath?: string): string {
+  if (!text || typeof text !== "string") return text;
 
   // 1. Normalize CRLF to LF
   const normalized = text.replace(/\r\n/g, "\n");
-  const rawLines = normalized.split("\n");
-  const unpackedLines: string[] = [];
+  let cleaned = normalized;
 
-  for (const rawLine of rawLines) {
-    if (!rawLine.includes("\r")) {
-      unpackedLines.push(rawLine);
-      continue;
+  // 2. If text contains carriage return, percent sign, frame indicator, or ANSI codes,
+  // collapse progress updates & tickers.
+  if (
+    normalized.includes("\r") ||
+    normalized.includes("%") ||
+    normalized.includes("frame=") ||
+    normalized.includes("objects:") ||
+    normalized.includes("\x1b")
+  ) {
+    const rawLines = normalized.split("\n");
+    const unpackedLines: string[] = [];
+
+    for (const rawLine of rawLines) {
+      if (!rawLine.includes("\r")) {
+        unpackedLines.push(rawLine);
+        continue;
+      }
+
+      // Split by \r: in terminal output, each \r indicates an in-place update/overwrite.
+      const parts = rawLine.split("\r").map((p) => p.trimEnd()).filter((p) => p.length > 0);
+      if (parts.length === 0) {
+        unpackedLines.push("");
+        continue;
+      }
+
+      // Collapse progress updates within this line
+      const collapsedParts = collapseProgressItems(parts);
+      unpackedLines.push(...collapsedParts);
     }
 
-    // Split by \r: in terminal output, each \r indicates an in-place update/overwrite.
-    const parts = rawLine.split("\r").map((p) => p.trimEnd()).filter((p) => p.length > 0);
-    if (parts.length === 0) {
-      unpackedLines.push("");
-      continue;
-    }
-
-    // Collapse progress updates within this line
-    const collapsedParts = collapseProgressItems(parts);
-    unpackedLines.push(...collapsedParts);
+    // Also collapse consecutive progress lines across \n boundaries
+    const finalLines = collapseProgressItems(unpackedLines);
+    cleaned = finalLines.join("\n").replace(ANSI_REGEX, "");
   }
 
-  // Also collapse consecutive progress lines across \n boundaries
-  const finalLines = collapseProgressItems(unpackedLines);
-  return finalLines.join("\n").replace(ANSI_REGEX, "");
+  // 3. Enforce context window protection limit (default: 10KB max per bash tool result)
+  const { text: truncatedText, truncated } = truncateTailToBytes(cleaned, MAX_BASH_OUTPUT_BYTES);
+  if (truncated) {
+    const lines = truncatedText.split("\n").length;
+    const logNotice =
+      fullOutputPath && !truncatedText.includes(fullOutputPath)
+        ? ` Full output preserved at: ${fullOutputPath}`
+        : "";
+    cleaned =
+      `[... earlier command output truncated to preserve context (~10KB / last ${lines} lines shown).${logNotice}]\n\n` +
+      truncatedText;
+  }
+
+  return cleaned;
 }
 
 export default function (pi: any) {
@@ -486,10 +529,11 @@ export default function (pi: any) {
       return;
     }
 
+    const fullOutputPath = (event.details as any)?.fullOutputPath;
     let modified = false;
     const newContent = event.content.map((item: any) => {
       if (item && item.type === "text" && typeof item.text === "string") {
-        const cleaned = cleanCommandOutput(item.text);
+        const cleaned = cleanCommandOutput(item.text, fullOutputPath);
         if (cleaned !== item.text) {
           modified = true;
           return { ...item, text: cleaned };
