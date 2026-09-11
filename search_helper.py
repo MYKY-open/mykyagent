@@ -35,7 +35,11 @@ def _ensure_browsers():
     cache_base = Path.home() / ".cache" / "ms-playwright"
     has_chromium = False
     if cache_base.exists():
-        for pattern in ["chromium-*/chrome-linux/chrome", "chromium-*/chrome"]:
+        for pattern in [
+            "chromium-*/chrome-linux*/chrome",
+            "chromium-*/chrome",
+            "chromium_headless_shell-*/chrome-headless-shell-linux*/chrome-headless-shell",
+        ]:
             if any(cache_base.glob(pattern)):
                 has_chromium = True
                 break

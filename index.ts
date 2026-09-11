@@ -133,7 +133,7 @@ function getLocalApiKey(): string {
   return "cannotguess";
 }
 
-async function resolveLocalModelName(): Promise<string> {
+async function resolveLocalModelName(baseUrl: string = LLAMA_URL): Promise<string> {
   if (cachedLocalModelName) return cachedLocalModelName;
   const apiKey = getLocalApiKey();
   const headers: Record<string, string> = {};
@@ -141,7 +141,7 @@ async function resolveLocalModelName(): Promise<string> {
     headers["Authorization"] = `Bearer ${apiKey}`;
   }
   try {
-    const res = await fetch(`${LLAMA_URL}/models`, {
+    const res = await fetch(`${baseUrl}/models`, {
       headers,
       signal: AbortSignal.timeout(5000),
     });
@@ -206,11 +206,19 @@ async function distillWithSubagent(query: string, content: string, ctxOrModel?: 
         }
       );
 
-      const text = response?.content
+      let text = response?.content
         ?.filter((c: any) => c.type === "text")
         ?.map((c: any) => c.text)
         ?.join("\n")
         ?.trim();
+
+      if (!text) {
+        text = response?.content
+          ?.filter((c: any) => c.type === "thinking")
+          ?.map((c: any) => c.thinking)
+          ?.join("\n")
+          ?.trim();
+      }
 
       if (text) return { text, usage: response?.usage };
     } catch (err: any) {
@@ -218,7 +226,7 @@ async function distillWithSubagent(query: string, content: string, ctxOrModel?: 
     }
   }
 
-  // 2. Direct HTTP fallback path (OpenRouter or local llama.cpp endpoint)
+  // 2. Direct HTTP fallback path (OpenRouter or local/remote llama.cpp endpoint)
   const isCloudOpenRouter =
     model?.provider === "openrouter" ||
     model?.id?.includes("deepseek") ||
@@ -227,7 +235,8 @@ async function distillWithSubagent(query: string, content: string, ctxOrModel?: 
   const openrouterKey = getOpenRouterKey();
   const localKey = getLocalApiKey();
 
-  let endpoint = `${LLAMA_URL}/chat/completions`;
+  const baseUrl = model?.baseUrl || LLAMA_URL;
+  let endpoint = `${baseUrl}/chat/completions`;
   let modelName: string;
 
   if (isCloudOpenRouter && openrouterKey) {
@@ -237,7 +246,7 @@ async function distillWithSubagent(query: string, content: string, ctxOrModel?: 
     if (model?.id && model.id !== "remote" && model.id !== "default") {
       modelName = model.id;
     } else {
-      modelName = await resolveLocalModelName();
+      modelName = await resolveLocalModelName(baseUrl);
     }
   }
 
@@ -271,7 +280,7 @@ async function distillWithSubagent(query: string, content: string, ctxOrModel?: 
       method: "POST",
       headers,
       body: payload,
-      signal: AbortSignal.timeout(60000),
+      signal: AbortSignal.timeout(120000),
     });
 
     if (res.ok) {
@@ -389,7 +398,7 @@ export default function (pi: any) {
       try {
         const proc = spawnSync("uv", ["run", HELPER_SCRIPT, "research", query], {
           encoding: "utf-8",
-          timeout: 45000,
+          timeout: 90000,
         });
 
         if (proc.error || proc.status !== 0) {
@@ -447,7 +456,7 @@ export default function (pi: any) {
         const args = ["run", HELPER_SCRIPT, "fetch", url, ...(query ? [query] : [])];
         const proc = spawnSync("uv", args, {
           encoding: "utf-8",
-          timeout: 35000,
+          timeout: 60000,
         });
 
         if (proc.error || proc.status !== 0) {
