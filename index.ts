@@ -118,10 +118,33 @@ function saveMemory(key: string, val: string): void {
 let activeModelInfo: any = null;
 let cachedLocalModelName: string | null = null;
 
+function getLocalApiKey(): string {
+  if (process.env.MYKYAGENT_API_KEY) return process.env.MYKYAGENT_API_KEY;
+  if (process.env.API_KEY) return process.env.API_KEY;
+  if (process.env.OPENAI_API_KEY) return process.env.OPENAI_API_KEY;
+  try {
+    const modelsPath = join(homedir(), ".pi", "agent", "models.json");
+    if (existsSync(modelsPath)) {
+      const cfg = JSON.parse(readFileSync(modelsPath, "utf-8"));
+      const key = cfg?.providers?.["llama-local"]?.apiKey;
+      if (key) return key;
+    }
+  } catch {}
+  return "cannotguess";
+}
+
 async function resolveLocalModelName(): Promise<string> {
   if (cachedLocalModelName) return cachedLocalModelName;
+  const apiKey = getLocalApiKey();
+  const headers: Record<string, string> = {};
+  if (apiKey) {
+    headers["Authorization"] = `Bearer ${apiKey}`;
+  }
   try {
-    const res = await fetch(`${LLAMA_URL}/models`);
+    const res = await fetch(`${LLAMA_URL}/models`, {
+      headers,
+      signal: AbortSignal.timeout(5000),
+    });
     if (res.ok) {
       const data: any = await res.json();
       const id = data?.data?.[0]?.id || data?.models?.[0]?.model;
@@ -147,24 +170,84 @@ function getOpenRouterKey(): string | undefined {
   return undefined;
 }
 
-async function distillWithSubagent(query: string, content: string, modelInfo?: any): Promise<string> {
-  const active = modelInfo || activeModelInfo;
+interface DistillationResult {
+  text: string;
+  usage?: any;
+}
+
+async function distillWithSubagent(query: string, content: string, ctxOrModel?: any): Promise<DistillationResult> {
+  const model = ctxOrModel?.model || ctxOrModel || activeModelInfo;
+  const modelRegistry = ctxOrModel?.modelRegistry;
+
+  const systemPrompt =
+    "You are a precise technical research summarizer. From the provided web content, extract exactly what is needed to answer the query: code snippets, API signatures, CLI commands, configuration options, version numbers, or URLs. " +
+    "Rules: (1) Keep ALL code blocks complete and unmodified. (2) Keep ALL URLs and download links. (3) Keep version numbers and hashes verbatim. (4) Omit marketing copy, navigation text, and unrelated sections. (5) Output in clean markdown. Be concise but complete.";
+
+  const userContent = `Query: ${query}\n\nWeb Content:\n${content}`;
+
+  // 1. Native Pi ModelRegistry path: seamlessly supports ANY cloud model (OpenAI, Anthropic, Gemini, Groq, OpenRouter, etc.) or local models
+  if (modelRegistry && model) {
+    try {
+      const response = await modelRegistry.complete(
+        model,
+        {
+          systemPrompt,
+          messages: [
+            {
+              role: "user",
+              content: [{ type: "text", text: userContent }],
+              timestamp: Date.now(),
+            },
+          ],
+        },
+        {
+          maxTokens: 4096,
+          cacheRetention: "none",
+        }
+      );
+
+      const text = response?.content
+        ?.filter((c: any) => c.type === "text")
+        ?.map((c: any) => c.text)
+        ?.join("\n")
+        ?.trim();
+
+      if (text) return { text, usage: response?.usage };
+    } catch (err: any) {
+      console.warn(`[MykyAgent] Native model completion failed, falling back to direct HTTP: ${err?.message || err}`);
+    }
+  }
+
+  // 2. Direct HTTP fallback path (OpenRouter or local llama.cpp endpoint)
   const isCloudOpenRouter =
-    active?.provider === "openrouter" ||
-    active?.id?.includes("deepseek") ||
-    active?.id?.includes("/");
+    model?.provider === "openrouter" ||
+    model?.id?.includes("deepseek") ||
+    model?.id?.includes("/");
 
   const openrouterKey = getOpenRouterKey();
+  const localKey = getLocalApiKey();
 
   let endpoint = `${LLAMA_URL}/chat/completions`;
-  let modelName = isCloudOpenRouter && openrouterKey
-    ? (active?.id || "deepseek/deepseek-v4-flash-0731")
-    : await resolveLocalModelName();
+  let modelName: string;
+
+  if (isCloudOpenRouter && openrouterKey) {
+    modelName = model?.id || "deepseek/deepseek-v4-flash-0731";
+  } else {
+    // If active id is generic ("remote" or "default") or missing, query server's loaded model
+    if (model?.id && model.id !== "remote" && model.id !== "default") {
+      modelName = model.id;
+    } else {
+      modelName = await resolveLocalModelName();
+    }
+  }
+
   const headers: Record<string, string> = { "Content-Type": "application/json" };
 
   if (isCloudOpenRouter && openrouterKey) {
     endpoint = "https://openrouter.ai/api/v1/chat/completions";
     headers["Authorization"] = `Bearer ${openrouterKey}`;
+  } else if (localKey) {
+    headers["Authorization"] = `Bearer ${localKey}`;
   }
 
   try {
@@ -173,13 +256,11 @@ async function distillWithSubagent(query: string, content: string, modelInfo?: a
       messages: [
         {
           role: "system",
-          content:
-            "You are a precise technical research summarizer. From the provided web content, extract exactly what is needed to answer the query: code snippets, API signatures, CLI commands, configuration options, version numbers, or URLs. " +
-            "Rules: (1) Keep ALL code blocks complete and unmodified. (2) Keep ALL URLs and download links. (3) Keep version numbers and hashes verbatim. (4) Omit marketing copy, navigation text, and unrelated sections. (5) Output in clean markdown. Be concise but complete.",
+          content: systemPrompt,
         },
         {
           role: "user",
-          content: `Query: ${query}\n\nWeb Content:\n${content}`,
+          content: userContent,
         },
       ],
       max_tokens: 4096,
@@ -190,6 +271,7 @@ async function distillWithSubagent(query: string, content: string, modelInfo?: a
       method: "POST",
       headers,
       body: payload,
+      signal: AbortSignal.timeout(60000),
     });
 
     if (res.ok) {
@@ -197,14 +279,32 @@ async function distillWithSubagent(query: string, content: string, modelInfo?: a
       const text =
         data?.choices?.[0]?.message?.content?.trim() ||
         data?.choices?.[0]?.message?.reasoning_content?.trim();
-      if (text) return text;
+      if (text) {
+        let usage: any;
+        if (data?.usage) {
+          const input = data.usage.prompt_tokens || 0;
+          const output = data.usage.completion_tokens || 0;
+          usage = {
+            input,
+            output,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: data.usage.total_tokens || (input + output),
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          };
+        }
+        return { text, usage };
+      }
+    } else {
+      const errText = await res.text().catch(() => "");
+      console.warn(`[MykyAgent] Distillation sub-call returned ${res.status}: ${errText.slice(0, 200)}`);
     }
-  } catch (err) {
-    // sub-call fallback
+  } catch (err: any) {
+    console.warn(`[MykyAgent] Distillation sub-call error: ${err?.message || err}`);
   }
 
   // Fallback if sub-call fails: return clean slice (up to 20,000 chars)
-  return content.slice(0, 20000);
+  return { text: content.slice(0, 20000) };
 }
 
 export default function (pi: any) {
@@ -315,8 +415,11 @@ export default function (pi: any) {
           bundle += `## Search Snippets:\n` + raw.search_snippets.map((s: any) => `• ${s.title} (${s.url}): ${s.snippet}`).join("\n");
         }
 
-        const summary = await distillWithSubagent(query, bundle, ctx?.model);
-        return { content: [{ type: "text", text: summary }] };
+        const { text: summary, usage } = await distillWithSubagent(query, bundle, ctx);
+        return {
+          content: [{ type: "text", text: summary }],
+          ...(usage ? { usage } : {}),
+        };
       } catch (e: any) {
         return {
           content: [{ type: "text", text: `Search failed: ${e.message}` }],
@@ -364,8 +467,11 @@ export default function (pi: any) {
           ? query 
           : "extract all code blocks, installation commands, API specifications, and download links from this page";
 
-        const summary = await distillWithSubagent(extractionFocus, text, ctx?.model);
-        return { content: [{ type: "text", text: summary }] };
+        const { text: summary, usage } = await distillWithSubagent(extractionFocus, text, ctx);
+        return {
+          content: [{ type: "text", text: summary }],
+          ...(usage ? { usage } : {}),
+        };
       } catch (e: any) {
         return {
           content: [{ type: "text", text: `Fetch failed: ${e.message}` }],
