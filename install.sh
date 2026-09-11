@@ -40,6 +40,18 @@ else
     echo "             Install via: https://docs.astral.sh/uv/getting-started/installation/"
 fi
 
+# 4. Pre-install Playwright Chromium browser (for JS-rendered page support in web_search/web_fetch)
+if command -v uv &>/dev/null; then
+    echo ""
+    echo "=== Pre-installing Playwright Chromium Browser ==="
+    if uv run --with "playwright>=1.47.0" python3 -m playwright install chromium 2>/dev/null; then
+        echo "  [OK] Playwright Chromium ready"
+    else
+        echo "  [WARN] Could not pre-install Playwright Chromium."
+        echo "         It will auto-install silently on first web_search/web_fetch use."
+    fi
+fi
+
 echo ""
 echo "=== Setting Up Launchers ==="
 mkdir -p "$INSTALL_BIN"

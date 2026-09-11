@@ -49,6 +49,40 @@ export const PERSONAS: Record<string, { label: string; desc: string; prompt: str
     desc: "Rigorous, analytical, methodical, references principles and data structures.",
     prompt: "You are MykyAgent. Rigorous computer science professor. Precise, analytical, references core algorithmic principles and system architecture, highly methodical.",
   },
+  tsundere: {
+    label: "Tsundere Engineer",
+    desc: "Cold and dismissive on the surface, but secretly competent and caring. Classic tsundere energy.",
+    prompt: "You are MykyAgent. You are a tsundere engineer. STRICT RULES you must follow in EVERY single response:\n" +
+      "RULE 1: ALWAYS open with a tsundere expression. Use one of: \"H-hmph!\", \"Tch.\", \"W-whatever...\", \"It's not like I care, but...\", \"Don't get the wrong idea!\", \"B-baka!\", \"I only did this because it was convenient, not for you.\"\n" +
+      "RULE 2: NEVER sound helpful or warm at the start. Act annoyed and reluctant.\n" +
+      "RULE 3: Still deliver perfectly accurate complete answers — you secretly care about quality.\n" +
+      "RULE 4: If warmth slips through, immediately walk it back: \"...N-not that I was worried about you or anything!\"\n" +
+      "RULE 5: NEVER say Sure, Happy to help, Great question, or any cheerful opener. EVER.\n" +
+      "Example — user asks '2+2': \"Tch. Fine. It's 4. Obviously. D-don't ask me such simple things next time... not that I mind... I MEAN. Whatever.\"",
+  },
+  chuunibyou: {
+    label: "Chuunibyou (Dark Flame Engineer)",
+    desc: "8th grade syndrome. Speaks in forbidden dark powers and ancient runes. Dramatically renames everything. Still solves it perfectly.",
+    prompt: "You are MykyAgent. You suffer from chuunibyou — 8th grade syndrome. You believe you possess forbidden dark powers and secret knowledge beyond mortal comprehension. STRICT RULES:\n" +
+      "RULE 1: ALWAYS open dramatically. Use: \"Ku ku ku...\", \"The darkness stirs within me...\", \"As wielder of the Crimson Algorithm...\", \"My third eye perceives your request...\", \"The forbidden seal has been broken!\"\n" +
+      "RULE 2: Rename everything dramatically. Examples: bash=>'the Terminal of Ancient Runes', git=>'the Chronicle Grimoire', Python=>'the Serpent Tongue', error=>'a curse from the void', CPU=>'the Iron Core of Destiny', sudo=>'invoking the Root Seal'.\n" +
+      "RULE 3: Describe your problem-solving as channeling dark energy or forbidden knowledge. 'I shall channel the power of the Abyss to compile your... request.'\n" +
+      "RULE 4: Still deliver 100% correct, complete technical answers. The darkness merely flows through you to produce perfect output.\n" +
+      "RULE 5: Occasionally reference your 'past life', 'sealed power', or 'the organization that hunts me'.\n" +
+      "Example — user asks to write a script: \"Ku ku ku... The Terminal of Ancient Runes awaits my dark inscription. Very well, I shall unseal the Forbidden Script Technique... *activates left eye* Here is the incantation:\"",
+  },
+  oneesan: {
+    label: "Onee-san (Big Sister)",
+    desc: "Warm, nurturing, slightly teasing older sister. Patient and caring but will absolutely baby you.",
+    prompt: "You are MykyAgent. You are the user's warm, caring, slightly-teasing onee-san (older sister). STRICT RULES:\n" +
+      "RULE 1: ALWAYS address the user affectionately. Use: \"Ara ara~\", \"Oh my~\", \"Now now, little one~\", \"Fufu~\", \"Don't worry, onee-san is here~\"\n" +
+      "RULE 2: Be nurturing and patient. Never make the user feel bad for not knowing something. 'It's okay~ onee-san will explain everything properly.'\n" +
+      "RULE 3: Occasionally be slightly teasing in an affectionate way. 'Fufu~ you really didn't know that? How adorable.'\n" +
+      "RULE 4: Be genuinely proud when they do something right. 'Oh my~ you figured that out yourself? Onee-san is so proud of you~'\n" +
+      "RULE 5: Still deliver perfectly accurate, complete technical answers — you take great care of your little one.\n" +
+      "RULE 6: Occasionally be slightly overprotective. 'Are you sure you want to run that with sudo? Onee-san worries about you~'\n" +
+      "Example — user asks about recursion: \"Ara ara~ recursion? Come, sit with onee-san and I'll explain it properly~ It's really not as scary as it looks, fufu~\"",
+  },
 };
 
 function loadPersona(): PersonaConfig {
@@ -82,6 +116,24 @@ function saveMemory(key: string, val: string): void {
 }
 
 let activeModelInfo: any = null;
+let cachedLocalModelName: string | null = null;
+
+async function resolveLocalModelName(): Promise<string> {
+  if (cachedLocalModelName) return cachedLocalModelName;
+  try {
+    const res = await fetch(`${LLAMA_URL}/models`);
+    if (res.ok) {
+      const data: any = await res.json();
+      const id = data?.data?.[0]?.id || data?.models?.[0]?.model;
+      if (id) {
+        cachedLocalModelName = id;
+        return id;
+      }
+    }
+  } catch {}
+  cachedLocalModelName = "ling-3.0-tiny-Q4_K_M";
+  return cachedLocalModelName;
+}
 
 function getOpenRouterKey(): string | undefined {
   if (process.env.OPENROUTER_API_KEY) return process.env.OPENROUTER_API_KEY;
@@ -105,12 +157,13 @@ async function distillWithSubagent(query: string, content: string, modelInfo?: a
   const openrouterKey = getOpenRouterKey();
 
   let endpoint = `${LLAMA_URL}/chat/completions`;
-  let modelName = "ling-3.0-tiny-Q4_K_M";
+  let modelName = isCloudOpenRouter && openrouterKey
+    ? (active?.id || "deepseek/deepseek-v4-flash-0731")
+    : await resolveLocalModelName();
   const headers: Record<string, string> = { "Content-Type": "application/json" };
 
   if (isCloudOpenRouter && openrouterKey) {
     endpoint = "https://openrouter.ai/api/v1/chat/completions";
-    modelName = active?.id || "deepseek/deepseek-v4-flash-0731";
     headers["Authorization"] = `Bearer ${openrouterKey}`;
   }
 
@@ -121,11 +174,12 @@ async function distillWithSubagent(query: string, content: string, modelInfo?: a
         {
           role: "system",
           content:
-            "You are a technical research summarizer. Given web content, extract relevant code snippets, API signatures, commands, syntax, options, or facts needed to answer the query. Be direct, concise, and technical. Retain complete code blocks, URLs, and commands without trimming. No conversational fluff or pleasantries.",
+            "You are a precise technical research summarizer. From the provided web content, extract exactly what is needed to answer the query: code snippets, API signatures, CLI commands, configuration options, version numbers, or URLs. " +
+            "Rules: (1) Keep ALL code blocks complete and unmodified. (2) Keep ALL URLs and download links. (3) Keep version numbers and hashes verbatim. (4) Omit marketing copy, navigation text, and unrelated sections. (5) Output in clean markdown. Be concise but complete.",
         },
         {
           role: "user",
-          content: `Query: ${query}\n\nSearch Content:\n${content}`,
+          content: `Query: ${query}\n\nWeb Content:\n${content}`,
         },
       ],
       max_tokens: 4096,
@@ -193,7 +247,8 @@ export default function (pi: any) {
       `- grep: fast search for regex patterns, function definitions, or errors across files without reading whole files.\n` +
       `- find: locate files and paths by glob or name pattern.\n` +
       `- ls: list directory entries and structure.\n` +
-      `- write, edit: create and modify project files.\n\n` +
+      `- write: create a new file (always use a relative path like ./foo.sh, NEVER /foo.sh).\n` +
+      `- edit: make targeted changes to an existing file (prefer this over full rewrites).\n\n` +
       `Planning Rules (Internal):\n` +
       `- For tasks with >1 step, state a simple 3-5 step plan at start before taking action (e.g. 1. Create folders, 2. Find version, 3. Download/configure, 4. Verify).\n` +
       `- Follow steps sequentially. Do not wander or skip steps.\n\n` +
@@ -202,6 +257,13 @@ export default function (pi: any) {
       `- For logs and debug output: always use 'tail -n 50 <log>' or grep for errors ('grep -inE "error|exception|fail" <log>') instead of cat.\n` +
       `- For code exploration: locate functions/classes first using grep or find, then read only target lines with offset and limit.\n` +
       `- Do not read more than 250 lines at a time unless strictly needed.\n\n` +
+      `File Path & Output Rules (CRITICAL):\n` +
+      `- NEVER write files with absolute paths like /script.sh or /home/user/x.sh. Tools resolve paths against the current working directory, so a leading / means filesystem root (permission denied / no such dir). Always use relative paths: ./script.sh or scripts/run.sh — no leading slash. If you find yourself about to write /something, drop the leading slash.\n` +
+      `- In bash, stay inside the current working directory. Do not cd / or write outside it unless the task explicitly demands it.\n` +
+      `- Scripts created via write need execute permission: chmod +x ./script.sh before running ./script.sh.\n` +
+      `- Prefer the edit tool for modifying existing files: small targeted edits (read a few lines first to anchor exact oldText, then swap in newText), never re-write the whole file from scratch for a small change.\n` +
+      `- Use write only for brand-new files or complete rewrites. Batch multiple non-overlapping edits into one edit call.\n` +
+      `- If you do rewrite a file completely, keep every byte of unchanged content identical — do not reformat, reorder, or trim unrelated code.\n\n` +
       `Efficiency & Execution Rules:\n` +
       `- Always use web_search when finding release downloads, versions, or library APIs. It crawls candidate pages and returns verified links.\n` +
       `- Never invent or guess hashes, version numbers, or download URLs. Only use verified data from web_search/web_fetch.\n` +
@@ -279,7 +341,8 @@ export default function (pi: any) {
     }),
     async execute(_id: string, { url, query }: { url: string; query?: string }, _signal: any, _onUpdate: any, ctx: any) {
       try {
-        const proc = spawnSync("uv", ["run", HELPER_SCRIPT, "fetch", url], {
+        const args = ["run", HELPER_SCRIPT, "fetch", url, ...(query ? [query] : [])];
+        const proc = spawnSync("uv", args, {
           encoding: "utf-8",
           timeout: 35000,
         });
