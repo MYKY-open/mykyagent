@@ -316,6 +316,97 @@ async function distillWithSubagent(query: string, content: string, ctxOrModel?: 
   return { text: content.slice(0, 20000) };
 }
 
+const ANSI_REGEX = /\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
+
+function isProgressLine(line: string): boolean {
+  const clean = line.replace(ANSI_REGEX, "").trim();
+  if (!clean) return false;
+  // yt-dlp / youtube-dl: [download]  12.3% of ...
+  if (/^\[download\]\s+\d+(\.\d+)?%/.test(clean)) return true;
+  // ffmpeg / avconv: frame=\s*\d+\s+fps=... or size=\s*\d+.*time=
+  if (/^(frame=\s*\d+|size=\s*\d+.*time=)/i.test(clean)) return true;
+  // curl / wget progress bars: 10% [=====>  ] or [=====>  ] 10%
+  if (/^\s*\d+%\s*\[[=>.\s#-]+\]/.test(clean)) return true;
+  if (/^\[[=>.\s#-]+\]\s*\d+%/.test(clean)) return true;
+  if (/^[#=\s-]{5,}\s+\d+(\.\d+)?%/.test(clean)) return true;
+  // tqdm / python: 12%|████  | 12/100 [00:01<00:08, 10.2it/s]
+  if (/^\s*\d+%\s*\|[█#=\s\-\.\/\|]+.*(?:it\/s|s\/it|[0-9:]+<[0-9:]+)/.test(clean)) return true;
+  // pip / wheel progress: ━━━ 10/100 MB
+  if (/[━─=]{3,}\s+\d+(\.\d+)?\/\d+(\.\d+)?\s+[kMG]?B/i.test(clean)) return true;
+  // curl table meter: 0 0 0 0 0 0 --:--:--
+  if (/^\s*\d+\s+[\d\.]+[kMGT]?\s+\d+\s+[\d\.]+[kMGT]?\s+\d+\s+[\d\.]+[kMGT]?\s+[\d\:]+/i.test(clean)) return true;
+  // git transfer: Receiving objects: 45% (450/1000)
+  if (/^(Receiving|Resolving|Counting|Compressing|Writing)\s+objects:\s+\d+%/i.test(clean)) return true;
+  // docker / generic percent: Progress: [ 45% ]
+  if (/^Progress:\s*\[\s*\d+%\s*\]/i.test(clean)) return true;
+  return false;
+}
+
+function collapseProgressItems(items: string[]): string[] {
+  const result: string[] = [];
+  let currentBatch: string[] = [];
+
+  function flush() {
+    if (currentBatch.length === 0) return;
+    if (currentBatch.length <= 2) {
+      result.push(...currentBatch);
+    } else {
+      result.push(currentBatch[0]);
+      result.push(`[... ${currentBatch.length - 2} progress updates collapsed ...]`);
+      result.push(currentBatch[currentBatch.length - 1]);
+    }
+    currentBatch = [];
+  }
+
+  for (const item of items) {
+    if (isProgressLine(item)) {
+      currentBatch.push(item);
+    } else {
+      flush();
+      result.push(item);
+    }
+  }
+  flush();
+  return result;
+}
+
+export function cleanCommandOutput(text: string): string {
+  if (!text || typeof text !== "string") return text;
+
+  // Quick check: if text has no carriage return, no percent sign, no frame indicator, and no ANSI codes,
+  // then it is standard output (e.g. ls, cat, diff) and can be returned as-is immediately.
+  if (!text.includes("\r") && !text.includes("%") && !text.includes("frame=") && !text.includes("objects:") && !text.includes("\x1b")) {
+    return text;
+  }
+
+  // 1. Normalize CRLF to LF
+  const normalized = text.replace(/\r\n/g, "\n");
+  const rawLines = normalized.split("\n");
+  const unpackedLines: string[] = [];
+
+  for (const rawLine of rawLines) {
+    if (!rawLine.includes("\r")) {
+      unpackedLines.push(rawLine);
+      continue;
+    }
+
+    // Split by \r: in terminal output, each \r indicates an in-place update/overwrite.
+    const parts = rawLine.split("\r").map((p) => p.trimEnd()).filter((p) => p.length > 0);
+    if (parts.length === 0) {
+      unpackedLines.push("");
+      continue;
+    }
+
+    // Collapse progress updates within this line
+    const collapsedParts = collapseProgressItems(parts);
+    unpackedLines.push(...collapsedParts);
+  }
+
+  // Also collapse consecutive progress lines across \n boundaries
+  const finalLines = collapseProgressItems(unpackedLines);
+  return finalLines.join("\n").replace(ANSI_REGEX, "");
+}
+
 export default function (pi: any) {
   // 1. Caveman System Prompt + Memory Injection
   pi.on("before_agent_start", async (event: any, ctx: any) => {
@@ -365,7 +456,8 @@ export default function (pi: any) {
       `- NEVER cat entire large files, logs, or dependency bundles into context.\n` +
       `- For logs and debug output: always use 'tail -n 50 <log>' or grep for errors ('grep -inE "error|exception|fail" <log>') instead of cat.\n` +
       `- For code exploration: locate functions/classes first using grep or find, then read only target lines with offset and limit.\n` +
-      `- Do not read more than 250 lines at a time unless strictly needed.\n\n` +
+      `- Do not read more than 250 lines at a time unless strictly needed.\n` +
+      `- Prevent terminal progress spam in bash: always pass quiet or no-progress flags when running downloaders, encoders, or package managers (e.g. yt-dlp --no-progress, ffmpeg -nostats -loglevel error, curl -sS, wget -q, pip install -q, git clone -q).\n\n` +
       `File Path & Output Rules (CRITICAL):\n` +
       `- NEVER write files with absolute paths like /script.sh or /home/user/x.sh. Tools resolve paths against the current working directory, so a leading / means filesystem root (permission denied / no such dir). Always use relative paths: ./script.sh or scripts/run.sh — no leading slash. If you find yourself about to write /something, drop the leading slash.\n` +
       `- In bash, stay inside the current working directory. Do not cd / or write outside it unless the task explicitly demands it.\n` +
@@ -385,7 +477,33 @@ export default function (pi: any) {
     return { systemPrompt };
   });
 
-  // 2. Web Search Tool (Autonomous deep research & multi-hop crawl)
+  // 2. Command Output Sanitizer (prevents terminal progress bars, ffmpeg/yt-dlp tickers, and ANSI escapes from flooding context)
+  pi.on("tool_result", async (event: any) => {
+    if (event.toolName !== "bash" && event.toolName !== "powershell") {
+      return;
+    }
+    if (!Array.isArray(event.content)) {
+      return;
+    }
+
+    let modified = false;
+    const newContent = event.content.map((item: any) => {
+      if (item && item.type === "text" && typeof item.text === "string") {
+        const cleaned = cleanCommandOutput(item.text);
+        if (cleaned !== item.text) {
+          modified = true;
+          return { ...item, text: cleaned };
+        }
+      }
+      return item;
+    });
+
+    if (modified) {
+      return { content: newContent };
+    }
+  });
+
+  // 3. Web Search Tool (Autonomous deep research & multi-hop crawl)
   pi.registerTool({
     name: "web_search",
     label: "Web Search",
