@@ -281,7 +281,7 @@ that the helper is invoked with the right arguments, and that a model can turn t
 returned bundle into a usable answer.
 
 ```bash
-MYKYAGENT_BASE_URL=http://192.168.0.147:8080/v1 MYKYAGENT_API_KEY=cannotguess \
+MYKYAGENT_BASE_URL=http://127.0.0.1:8080/v1 MYKYAGENT_API_KEY=<your-key> \
     ./run_e2e.sh
 ```
 

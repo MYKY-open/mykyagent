@@ -1,6 +1,7 @@
 import { Type } from "@sinclair/typebox";
 import { execFile } from "node:child_process";
 import { runSearchHops, type ResearchPayload } from "./search_hops.ts";
+import { recoverLeakedToolCalls } from "./tool_recovery.ts";
 import {
   forgetMemoryEntry,
   listMemoryEntries,
@@ -715,10 +716,23 @@ export default function (pi: any) {
       `- Search smartly: Never guess version numbers or old years in search queries. Search for official manifests, release APIs, or version archives.\n` +
       `- Do not repeat: Never re-fetch a URL that already failed or yielded no direct links.\n` +
       `- Combine commands: Chain related actions in bash (e.g. mkdir && curl && echo config) instead of taking separate turns.\n` +
-      `- Factual verification: Verify actual downloaded versions/files from file contents or metadata before reporting. Do not invent version numbers.\n` +
+      `- Factual verification: Verify actual downloaded versions/files from file contents or metadata before reporting. Do not invent version numbers.\n\n` +
+      `Tool Calling Rules (CRITICAL):\n` +
+      `- When calling tools, you MUST close the thinking block with </think> before emitting tool calls. NEVER output <tool_call> inside <think>.\n` +
       memBlock;
 
     return { systemPrompt };
+  });
+
+  // 1b. Tool Call Auto-Recovery Hook
+  // Catches tool calls generated inside <think> blocks or raw text without </think>,
+  // converts them to real toolCall blocks, and marks stopReason as "toolUse".
+  pi.on("message_end", async (event: any) => {
+    if (!event?.message) return;
+    const { recovered, message } = recoverLeakedToolCalls(event.message);
+    if (recovered) {
+      return { message };
+    }
   });
 
   // 2. Command Output Sanitizer (prevents terminal progress bars, ffmpeg/yt-dlp tickers, and ANSI escapes from flooding context)
