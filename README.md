@@ -95,6 +95,27 @@ fan-out queries ──► multi-engine SERP ──► RRF fusion ──► domai
 | Sources that disagree | When two URLs report different numbers for the same named entity, a conservative `conflicts` entry names the entity and the values. Requires two distinct values from two distinct sources in the same magnitude band, so it stays quiet on noise. |
 | Enumerative queries | `list / top / compare / leaderboard` gives table blocks a separate character allowance, so whole tables survive without paying 3x for every page's prose. |
 
+### `web_fetch`
+
+`web_fetch` fetches one URL and always distils it. Behaviour worth knowing:
+
+- **It reports what it actually gave you.** The tool result is prefixed with a
+  metadata block naming the page title, any redirect target, and - critically -
+  whether the content came from cache and how old it is. A 24h page cache that
+  silently serves yesterday's copy for "check this page" is worse than no cache.
+- **`fresh: true` bypasses the cache read** (it still refreshes the entry), so
+  the age report is actionable rather than just informative.
+- **Long pages need a `query`.** With a query, blocks are BM25-ranked against it
+  at `MYKYAGENT_PAGE_BUDGET`. With only a URL there is no relevance signal, so the
+  tool keeps whole blocks from the top up to `MYKYAGENT_NO_QUERY_BUDGET`, which is
+  larger because the model explicitly asked for that page.
+- **Charset handling is explicit.** `requests` reports ISO-8859-1 for `text/html`
+  with no charset parameter (the RFC 2616 default), which silently mojibaked every
+  page declaring its charset only in `<meta>`. Decoding now consults, in order: BOM,
+  HTTP header, `<meta charset>`/`http-equiv`, strict UTF-8, Latin-1.
+- PDFs, JSON, and plain text (`text/*`, bare `application/octet-stream` with a
+  text-like extension) are handled as first-class content types.
+
 ### Query classes
 
 The pipeline deliberately handles four question shapes differently. The first three
@@ -174,6 +195,8 @@ uv run search_helper.py selftest x                  # live end-to-end harness (n
 | `MYKYAGENT_MAX_HOPS` | `2` | Extra research rounds (0 disables, max 4) |
 | `MYKYAGENT_TABLE_EXTRA` | `2600` | Extra chars allowed for table blocks on enumerative queries |
 | `MYKYAGENT_PAGE_BUDGET` | `2200` | Chars of extracted text per page (main token lever) |
+| `MYKYAGENT_NO_QUERY_BUDGET` | `4000` | Budget when there is no query to rank blocks against |
+| `MYKYAGENT_JSON_BUDGET` | `6000` | Cap on a JSON API response passed through verbatim |
 | `MYKYAGENT_NO_BROWSER` | unset | `1` disables Playwright entirely |
 | `MYKYAGENT_NO_APIS` | unset | `1` disables structured API providers |
 | `MYKYAGENT_CACHE_DIR` | `~/.cache/mykyagent` | SQLite cache location (SERP 1h, pages 24h) |
@@ -236,14 +259,50 @@ directory listing. Do not re-litigate without new evidence.
 
 ## Tests
 
-`./run_tests.sh` runs everything offline, no network needed:
+### Offline - `./run_tests.sh`
+
+Everything here runs without a network:
 
 | Suite | Assertions | Covers |
 | --- | --- | --- |
 | `memory.test.ts` | 34 | slug/path safety, caps, index, migration, injection guard |
 | `search_hops.test.ts` | 22 | multi-hop control flow, `FOLLOWUP` parsing |
-| `search_helper.py unit` | 26 | intent detection, nav, fields, conflicts |
+| `search_helper.py unit` | 51 | charset decoding, title extraction, block truncation, intent, nav, fields, conflicts |
 
 ```
 ALL SUITES PASSED
+```
+
+### End-to-end - `./run_e2e.sh`
+
+Drives the **real registered tools** through the real helper against a real model.
+This is the layer unit tests cannot reach: that the handlers are wired correctly,
+that the helper is invoked with the right arguments, and that a model can turn the
+returned bundle into a usable answer.
+
+```bash
+MYKYAGENT_BASE_URL=http://192.168.0.147:8080/v1 MYKYAGENT_API_KEY=cannotguess \
+    ./run_e2e.sh
+```
+
+The script skips cleanly if the endpoint is unreachable or esbuild is missing. It
+starts a local fixture server (a page with a title, non-ASCII text, and no charset
+in its HTTP header - the exact case that used to mojibake) and uses a unique URL
+per run so the cold-cache assertion is genuinely cold.
+
+Assertions target the **tool's own strings** (the metadata lines it generates)
+rather than model output, which is paraphrased and non-deterministic.
+
+| Variable | Effect |
+| --- | --- |
+| `MYKYAGENT_BASE_URL` | OpenAI-compatible endpoint (required, else the suite skips) |
+| `MYKYAGENT_API_KEY` | optional bearer token |
+| `MYKYAGENT_E2E_SEARCH=1` | also run the live `web_search` check (slow, network) |
+
+`typebox_stub.ts` stands in for `@sinclair/typebox` when bundling the extension
+standalone: pi resolves the real package through its own loader aliases. Only the
+schema helpers are stubbed, so the code paths exercised are the real ones.
+
+```
+13 passed, 0 failed
 ```

@@ -143,6 +143,13 @@ PAGE_BUDGET = int(os.environ.get("MYKYAGENT_PAGE_BUDGET", "2200"))
 # Enumerative questions need whole tables, but paying 3x for every page is
 # wasteful. Extra allowance applies to table blocks only.
 TABLE_EXTRA = int(os.environ.get("MYKYAGENT_TABLE_EXTRA", "2600"))
+# When there is no query to rank blocks against (an explicit web_fetch of a
+# URL), a 2200-char head cut tends to return the intro and table of contents
+# rather than the answer. The model asked for this page by name, so give it
+# enough of the page to be worth the fetch.
+NO_QUERY_BUDGET = int(os.environ.get("MYKYAGENT_NO_QUERY_BUDGET", "4000"))
+# Cap on a JSON API response passed through verbatim.
+JSON_BUDGET = int(os.environ.get("MYKYAGENT_JSON_BUDGET", "6000"))
 
 UA_BROWSER = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -405,6 +412,31 @@ def cache_get(kind: str, key: str, ttl: int):
         return None
 
 
+def cache_get_age(kind: str, key: str, ttl: int):
+    """Like cache_get, but also returns the entry's age in seconds.
+
+    Callers that hand cached content to a model need to say how old it is;
+    silently serving a 24h-old page for "check this page now" is worse than
+    paying to re-fetch it.
+    """
+    c = _db()
+    if c is None:
+        return None
+    try:
+        with _cache_lock:
+            row = c.execute(
+                "SELECT ts, val FROM kv WHERE k = ?", (_ck(kind, key),)
+            ).fetchone()
+        if not row:
+            return None
+        age = time.time() - row[0]
+        if age > ttl:
+            return None
+        return json.loads(row[1]), age
+    except Exception:
+        return None
+
+
 def cache_put(kind: str, key: str, val) -> None:
     c = _db()
     if c is None:
@@ -620,12 +652,25 @@ def _decode_html(raw: bytes, content_type: str = "") -> str:
         return raw.decode("latin-1", errors="replace")
 
 
-def html_to_markdown(html: str, url: str) -> tuple[str, list[str]]:
-    """Return (markdown, direct_download_links). One shot, no chunking here."""
+def html_to_markdown(html: str, url: str) -> tuple[str, list[str], str]:
+    """Return (markdown, direct_download_links, title). One shot, no chunking here."""
     try:
         soup = BeautifulSoup(html, "html.parser")
     except Exception:
-        return "", []
+        return "", [], ""
+
+    # --- page title ---------------------------------------------------------
+    # Grab it before stripping, otherwise <title> leaks in as a bare first line
+    # of the body: a wasted token on every fetch and a useless "title".
+    title = ""
+    t_el = soup.find("title")
+    if t_el is not None:
+        title = t_el.get_text(" ", strip=True)
+    if not title:
+        h1 = soup.find("h1")
+        if h1 is not None:
+            title = h1.get_text(" ", strip=True)
+    title = re.sub(r"\s+", " ", title).strip()[:200]
 
     # --- direct download / resource links (before any stripping) -------------
     links: list[str] = []
@@ -646,7 +691,7 @@ def html_to_markdown(html: str, url: str) -> tuple[str, list[str]]:
     # --- drop structural noise ---------------------------------------------
     for tag in soup(
         ["script", "style", "noscript", "svg", "iframe", "video", "canvas",
-         "form", "button", "input", "select", "textarea", "template",
+         "form", "button", "input", "select", "textarea", "template", "title",
          "nav", "footer", "aside"]
     ):
         tag.decompose()
@@ -738,10 +783,15 @@ def html_to_markdown(html: str, url: str) -> tuple[str, list[str]]:
 
     text = "\n".join(s for s in soup.stripped_strings if s)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if title:
+        # The <title> is very often repeated verbatim as the first heading.
+        first, _, rest = text.partition("\n")
+        if re.sub(r"^#+\s*", "", first).strip() == title:
+            text = rest.lstrip()
     if len(text) > HARD_TEXT_CAP:
         text = text[:HARD_TEXT_CAP]
 
-    return text, links
+    return text, links, title
 
 
 # ---------------------------------------------------------------------------
@@ -778,12 +828,40 @@ def split_blocks(text: str) -> list[str]:
     return blocks
 
 
+def head_blocks(text: str, budget: int) -> str:
+    """Keep whole blocks from the top of the document until the budget is full.
+
+    Used when there is no query to rank against. A raw `text[:budget]` cut lands
+    mid-sentence or halfway through a code fence, which is both ugly and lossy.
+    """
+    if not text or budget <= 0:
+        return ""
+    if len(text) <= budget:
+        return text
+
+    out: list[str] = []
+    used = 0
+    for b in split_blocks(text):
+        if out and used + len(b) + 2 > budget:
+            break
+        out.append(b)
+        used += len(b) + 2
+
+    joined = "\n\n".join(out).strip() or text
+    if len(joined) > budget:
+        # One oversized block (usually a single code fence): cut on a line break.
+        cut = joined[:budget]
+        nl = cut.rfind("\n")
+        joined = cut[:nl] if nl > 0 else cut
+    return joined.strip()
+
+
 def select_blocks(text: str, query: str | None, budget: int, enum_mode: bool = False) -> str:
     """Rank blocks by BM25 with heading-context inheritance, greedily fill budget."""
     if not text:
         return ""
     if not query:
-        return text[:budget]
+        return head_blocks(text, budget)
 
     blocks = split_blocks(text)
     if not blocks:
@@ -801,8 +879,7 @@ def select_blocks(text: str, query: str | None, budget: int, enum_mode: bool = F
     base = bm25_scores(query, clean)
     if not any(base):
         # No lexical overlap at all: fall back to document order.
-        head = clean[0][: max(0, budget)]
-        return head
+        return head_blocks(text, budget)
 
     max_base = max(base) or 1.0
 
@@ -832,7 +909,7 @@ def select_blocks(text: str, query: str | None, budget: int, enum_mode: bool = F
         scored.append((eff + bonus, i, blk))
 
     if not scored:
-        return text[:budget]
+        return head_blocks(text, budget)
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
@@ -1597,6 +1674,15 @@ def _pdf_text(raw: bytes) -> str:
         return ""
 
 
+_TEXT_EXT = (
+    ".txt", ".md", ".markdown", ".rst", ".json", ".jsonl", ".yaml", ".yml",
+    ".toml", ".ini", ".cfg", ".conf", ".properties", ".log", ".csv", ".tsv",
+    ".sh", ".bash", ".zsh", ".fish", ".py", ".rb", ".js", ".mjs", ".cjs", ".ts",
+    ".jsx", ".tsx", ".rs", ".go", ".java", ".kt", ".c", ".h", ".cc", ".cpp",
+    ".hpp", ".cs", ".php", ".pl", ".lua", ".sql", ".diff", ".patch", ".lock",
+)
+
+
 def fetch(
     url: str,
     query: str | None = None,
@@ -1604,12 +1690,24 @@ def fetch(
     budget: int = PAGE_BUDGET,
     ttl: int = PAGE_TTL,
     enum_mode: bool = False,
+    _fresh: bool = False,
 ) -> dict:
-    """Fetch one URL. Returns {url,text,links[,browser]} or {url,error}."""
-    ck = cache_get("page", url, ttl)
-    if ck and (query is None or ck.get("_q") == query):
-        ck.pop("_q", None)
-        return ck
+    """Fetch one URL.
+
+    Returns {url,text,links,title[,browser][,cached,age_s][,final_url]} or
+    {url,error}. Cache hits report their age so a caller can tell a fresh fetch
+    from a day-old copy; `_fresh` bypasses the cache read entirely.
+    """
+    eff_budget = budget if query else max(budget, NO_QUERY_BUDGET)
+
+    hit = None if _fresh else cache_get_age("page", url, ttl)
+    if hit:
+        ck, age = hit
+        if query is None or ck.get("_q") == query:
+            ck.pop("_q", None)
+            ck["cached"] = True
+            ck["age_s"] = round(age, 1)
+            return ck
 
     try:
         resp = session().get(
@@ -1624,6 +1722,10 @@ def fetch(
             if status >= 400:
                 return {"url": url, "error": f"HTTP {status}"}
 
+            # A redirect means the canonical URL is not the one we asked for.
+            final = getattr(resp, "url", url) or url
+            extra = {} if final == url else {"final_url": final}
+
             raw = resp.raw.read(MAX_HTML_BYTES + 1, decode_content=True)
             if len(raw) > MAX_HTML_BYTES:
                 raw = raw[:MAX_HTML_BYTES]
@@ -1632,39 +1734,65 @@ def fetch(
                 text = _pdf_text(raw)
                 if not text:
                     return {"url": url, "error": "pdf with no extractable text"}
-                text = select_blocks(text, query, budget, enum_mode) if query else text[:budget]
-                res = {"url": url, "text": text, "links": []}
+                text = select_blocks(text, query, eff_budget, enum_mode)
+                res = {"url": url, "text": text, "links": [], "title": "", **extra}
                 cache_put("page", url, {**res, "_q": query})
                 return res
 
             if "application/json" in ct or "+json" in ct:
+                truncated = False
                 try:
                     parsed = json.loads(raw.decode("utf-8", errors="replace"))
-                    text = json.dumps(parsed, indent=1, ensure_ascii=False)
+                    # Compact: indentation is pure token cost for no added meaning
+                    # to a model that parses the structure anyway.
+                    text = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
                 except Exception:
-                    text = raw.decode("utf-8", errors="replace")
-                res = {"url": url, "text": text[:4000], "links": []}
+                    text = _decode_html(raw, ct)
+                if len(text) > JSON_BUDGET:
+                    text, truncated = text[:JSON_BUDGET], True
+                res = {
+                    "url": url,
+                    "text": text,
+                    "links": [],
+                    "title": "",
+                    "truncated": truncated,
+                    **extra,
+                }
                 cache_put("page", url, {**res, "_q": query})
                 return res
 
-            if "html" not in ct and "xml" not in ct and "text/" not in ct:
-                return {"url": url, "error": f"unsupported content-type: {ct}"}
+            # Some hosts serve plain text with no Content-Type, or as
+            # application/octet-stream. Fall back to the URL extension.
+            explicit_text = ("html" in ct) or ("xml" in ct) or ("text/" in ct)
+            tolerated = ct == "" or "octet-stream" in ct
+            text_like_ext = urlparse(url).path.lower().endswith(_TEXT_EXT)
+            if not explicit_text and not (tolerated and text_like_ext):
+                return {"url": url, "error": f"unsupported content-type: {ct or '(none)'}"}
 
             html = _decode_html(raw, ct)
         finally:
             resp.close()
 
-        text, links = html_to_markdown(html, url)
+        text, links, title = html_to_markdown(html, url)
 
         if _is_js_gated(html, text) and not NO_BROWSER and not out_of_time(8):
-            br = _fetch_browser(url, query, browser=_browser, budget=budget, enum_mode=enum_mode)
+            br = _fetch_browser(
+                url, query, browser=_browser, budget=eff_budget, enum_mode=enum_mode
+            )
             if br.get("text") and len(br["text"]) > len(text):
-                res = {"url": url, "text": br["text"], "links": links, "browser": True}
+                res = {
+                    "url": url,
+                    "text": br["text"],
+                    "links": links,
+                    "title": br.get("title") or title,
+                    "browser": True,
+                    **extra,
+                }
                 cache_put("page", url, {**res, "_q": query})
                 return res
 
-        text = select_blocks(text, query, budget, enum_mode) if query else text[:budget]
-        res = {"url": url, "text": text, "links": links}
+        text = select_blocks(text, query, eff_budget, enum_mode)
+        res = {"url": url, "text": text, "links": links, "title": title, **extra}
         cache_put("page", url, {**res, "_q": query})
         return res
     except Exception as e:
@@ -1817,9 +1945,9 @@ def _fetch_browser(
             pass  # partial render is still useful
         html = page.content()
         page.close()
-        text, links = html_to_markdown(html, url)
-        text = select_blocks(text, query, budget, enum_mode) if query else text[:budget]
-        return {"url": url, "text": text, "links": links, "browser": True}
+        text, links, title = html_to_markdown(html, url)
+        text = select_blocks(text, query, budget, enum_mode)
+        return {"url": url, "text": text, "links": links, "title": title, "browser": True}
     except Exception as e:
         return {"url": url, "error": f"[browser] {e}"}
     finally:
@@ -2103,7 +2231,7 @@ def research(query: str) -> dict:
         pages.append(
             {
                 "url": r["url"],
-                "title": r.get("title", ""),
+                "title": res.get("title") or r.get("title", ""),
                 "content": res["text"],
                 "score": round(next((s for s, q in ranked if q["url"] == r["url"]), 0.0), 2),
                 "browser": res.get("browser", False),
@@ -2216,7 +2344,7 @@ def research(query: str) -> dict:
                         pages.append(
                             {
                                 "url": r["url"],
-                                "title": r.get("title", ""),
+                                "title": res.get("title") or r.get("title", ""),
                                 "content": res["text"],
                                 "score": 2.0,
                                 "browser": res.get("browser", False),
@@ -2371,6 +2499,39 @@ def unit() -> dict:
     ck("charset: invalid utf-8 does not raise", _decode_html(b"\xff\xfe\xfa", "text/html") != "")
     ck("charset: empty input", _decode_html(b"", "text/html") == "")
     ck("charset: json-ish plain text", _decode_html(b'{"a":"\xc3\xa9"}', "application/json") == '{"a":"\u00e9"}')
+
+    # --- block-aware truncation when there is no query to rank against ------
+    doc = "First paragraph here.\n\nSecond paragraph here.\n\n```py\ncode_here()\n```\n\nTAIL that must be dropped."
+    ck("head_blocks: never exceeds budget", len(head_blocks(doc, 60)) <= 60, len(head_blocks(doc, 60)))
+    ck("head_blocks: keeps whole blocks", "TAIL" not in head_blocks(doc, 60), repr(head_blocks(doc, 60)))
+    ck("head_blocks: short input untouched", head_blocks("tiny", 100) == "tiny")
+    ck("head_blocks: empty input", head_blocks("", 100) == "")
+    ck("head_blocks: zero budget", head_blocks("abc", 0) == "")
+    big_code = "```\n" + "\n".join(f"line{i:03d}" for i in range(200)) + "\n```"
+    hb = head_blocks(big_code, 200)
+    ck("head_blocks: oversized block cut on a line break", len(hb) <= 200 and hb.endswith(tuple("0123456789")), repr(hb[-20:]))
+    ck("select_blocks: no query defers to head_blocks", select_blocks(doc, None, 60) == head_blocks(doc, 60))
+
+    # --- title --------------------------------------------------------------
+    md, _lk, ti = html_to_markdown(
+        "<html><head><title>My Page</title></head><body><p>Body text long enough to survive.</p></body></html>",
+        "https://x.test/",
+    )
+    ck("title: extracted from <title>", ti == "My Page", ti)
+    ck("title: does not leak into the body", "My Page" not in md, repr(md[:60]))
+    ck("title: body survives", "Body text" in md, repr(md[:80]))
+    _md, _lk, ti2 = html_to_markdown("<html><body><h1>Only H1</h1><p>Text.</p></body></html>", "https://x.test/")
+    ck("title: falls back to <h1>", ti2 == "Only H1", ti2)
+    _md, _lk, ti3 = html_to_markdown("<html><body><p>No title at all.</p></body></html>", "https://x.test/")
+    ck("title: empty when absent", ti3 == "")
+    md4, _lk, ti4 = html_to_markdown(
+        "<html><head><title>Dup</title></head><body><h1>Dup</h1><p>Body.</p></body></html>", "https://x.test/"
+    )
+    ck("title: verbatim repeat of first heading dropped", md4 == "Body.", repr(md4))
+    md5, _lk, _t5 = html_to_markdown(
+        "<html><head><title>T</title></head><body><h1>Caf\u00e9 na\u00efve</h1><p>Body.</p></body></html>", "https://x.test/"
+    )
+    ck("title: distinct heading is kept", md5.startswith("# Caf\u00e9"), repr(md5[:40]))
     # Regression: a single generic query word must not hijack a squatter domain.
     sq = [
         {"url": "https://nginx.org/en/docs/"},
@@ -2507,8 +2668,9 @@ def main() -> None:
             res = fused_search(arg, max_results=10)[0]
             print(json.dumps(res))
         elif mode == "fetch":
-            q = sys.argv[3] if len(sys.argv) > 3 else None
-            print(json.dumps(fetch(arg, q)))
+            rest = [a for a in sys.argv[3:] if a != "--fresh"]
+            q = rest[0] if rest else None
+            print(json.dumps(fetch(arg, q, _fresh="--fresh" in sys.argv[3:])))
         elif mode == "research":
             print(json.dumps(research(arg)))
         elif mode == "selftest":

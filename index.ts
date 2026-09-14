@@ -174,7 +174,8 @@ interface DistillationResult {
  */
 function runHelper(
   args: string[],
-  timeoutMs: number
+  timeoutMs: number,
+  signal?: AbortSignal
 ): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     execFile(
@@ -186,6 +187,7 @@ function runHelper(
         encoding: "utf-8",
         cwd: here,
         env: process.env,
+        ...(signal ? { signal } : {}),
       },
       (err: any, stdout: string, stderr: string) => {
         // A timeout or non-zero exit can still carry a usable JSON payload
@@ -203,13 +205,27 @@ function runHelper(
 const UNTRUSTED_OPEN = "<<<UNTRUSTED_WEB_CONTENT>>>";
 const UNTRUSTED_CLOSE = "<<<END_UNTRUSTED_WEB_CONTENT>>>";
 
+/** Collapse arbitrary text to one bounded line. Used for anything that reaches
+ * the model from an untrusted source in a position that looks authoritative. */
+const oneLine = (s: any, n = 200): string =>
+  String(s ?? "").replace(/\s+/g, " ").trim().slice(0, n);
+
+/** Human-readable age, so a stale cache hit is obvious rather than silent. */
+function fmtAge(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return "unknown age";
+  if (seconds < 90) return `${Math.round(seconds)}s`;
+  if (seconds < 5400) return `${Math.round(seconds / 60)}m`;
+  if (seconds < 129600) return `${Math.round(seconds / 3600)}h`;
+  return `${Math.round(seconds / 86400)}d`;
+}
+
 /**
  * Render authoritative, API-verified data (release tags, package versions,
  * Maven artifacts) separately from scraped prose. This is the part the model
  * should treat as ground truth for versions and download URLs.
  */
-async function researchOnce(query: string): Promise<ResearchPayload> {
-  const { stdout } = await runHelper(["research", query], 150000);
+async function researchOnce(query: string, signal?: AbortSignal): Promise<ResearchPayload> {
+  const { stdout } = await runHelper(["research", query], 150000, signal);
   try {
     return JSON.parse(stdout || "{}");
   } catch {
@@ -235,8 +251,6 @@ function renderResearchBundle(
   // These live OUTSIDE the untrusted fence: they are the helper's own findings
   // about the retrieval, not web content, and the model must act on them.
   // Values are still flattened and capped -- they derive from page text.
-  const flat = (s: any, n = 120) => String(s ?? "").replace(/\s+/g, " ").trim().slice(0, n);
-
   if (Array.isArray(raw?.conflicts) && raw.conflicts.length > 0) {
     head.push(
       "CONFLICTING SOURCES - the sources below report different values. Surface the\n" +
@@ -244,9 +258,9 @@ function renderResearchBundle(
         (raw.conflicts as any[])
           .map((c) => {
             const vals = Array.isArray(c?.values)
-              ? c.values.map((v: any) => `${flat(v?.value, 40)} (${(v?.sources || []).map((s: any) => flat(s, 60)).join(", ")})`).join("  vs  ")
+              ? c.values.map((v: any) => `${oneLine(v?.value, 40)} (${(v?.sources || []).map((s: any) => oneLine(s, 60)).join(", ")})`).join("  vs  ")
               : "";
-            return `  - ${flat(c?.entity, 80)}: ${vals}`;
+            return `  - ${oneLine(c?.entity, 80)}: ${vals}`;
           })
           .join("\n")
     );
@@ -255,7 +269,7 @@ function renderResearchBundle(
   if (Array.isArray(raw?.warnings) && raw.warnings.length > 0) {
     head.push(
       "RETRIEVAL WARNINGS - this result may be incomplete; do not paper over it:\n" +
-        (raw.warnings as any[]).map((w) => `  - ${flat(w, 200)}`).join("\n")
+        (raw.warnings as any[]).map((w) => `  - ${oneLine(w, 200)}`).join("\n")
     );
   }
 
@@ -732,7 +746,7 @@ export default function (pi: any) {
     parameters: Type.Object({
       query: Type.String({ description: "Search query or goal" }),
     }),
-    async execute(_id: string, { query }: { query: string }, _signal: any, _onUpdate: any, ctx: any) {
+    async execute(_id: string, { query }: { query: string }, signal: any, _onUpdate: any, ctx: any) {
       try {
         const maxHops = Math.max(
           0,
@@ -741,7 +755,7 @@ export default function (pi: any) {
 
         const res = await runSearchHops(query, {
           maxHops,
-          research: researchOnce,
+          research: (q: string) => researchOnce(q, signal),
           render: (raw, opts) => renderResearchBundle(query, raw, opts),
           distill: (bundle, allowFollowup) =>
             distillWithSubagent(query, bundle, ctx, { allowFollowup }),
@@ -773,14 +787,27 @@ export default function (pi: any) {
       url: Type.String({ description: "Web page or documentation URL to fetch" }),
       query: Type.Optional(
         Type.String({
-          description: "Optional specific topic or question to distill from the page.",
+          description:
+            "Optional specific topic or question to distill from the page. STRONGLY recommended for long pages: without it the tool can only return the start of the page.",
+        })
+      ),
+      fresh: Type.Optional(
+        Type.Boolean({
+          description:
+            "Bypass the cache and re-fetch. Use when the page is known to change often or you need its current state and the result was reported as cached.",
         })
       ),
     }),
-    async execute(_id: string, { url, query }: { url: string; query?: string }, _signal: any, _onUpdate: any, ctx: any) {
+    async execute(
+      _id: string,
+      { url, query, fresh }: { url: string; query?: string; fresh?: boolean },
+      _signal: any,
+      _onUpdate: any,
+      ctx: any
+    ) {
       try {
-        const args = ["fetch", url, ...(query ? [query] : [])];
-        const { stdout } = await runHelper(args, 90000);
+        const args = ["fetch", url, ...(query ? [query] : []), ...(fresh ? ["--fresh"] : [])];
+        const { stdout } = await runHelper(args, 90000, _signal);
 
         const raw = JSON.parse(stdout || "{}");
         if (raw.error) {
@@ -788,25 +815,41 @@ export default function (pi: any) {
         }
 
         const links: string[] = Array.isArray(raw.links) ? raw.links : [];
-        const bodyParts: string[] = [];
-        if (links.length) {
-          bodyParts.push(`## Direct links found on page\n${links.join("\n")}`);
+        const meta: string[] = [];
+        if (raw.title) meta.push(`Page title: ${oneLine(raw.title, 200)}`);
+        if (raw.final_url) meta.push(`Redirected to: ${oneLine(raw.final_url, 300)}`);
+        if (raw.cached) {
+          // Do not let a day-old copy masquerade as the page's current state.
+          meta.push(
+            `FROM CACHE, ${fmtAge(Number(raw.age_s))} old - anything published since then is NOT reflected. Re-call with fresh=true if you need the current version.`
+          );
         }
+        if (raw.truncated) meta.push("Response was truncated at the size cap; it is incomplete.");
+
+        const bodyParts: string[] = [];
+        if (links.length) bodyParts.push(`## Direct links found on page\n${links.join("\n")}`);
         bodyParts.push(raw.text || "");
 
-        const extractionFocus = query && query.trim().length > 0
-          ? query
-          : "extract all code blocks, installation commands, API specifications, and download links from this page";
+        const extractionFocus =
+          query && query.trim().length > 0
+            ? query
+            : "Summarize what this page contains: its purpose, its main sections, and any key facts, code, commands, configuration, versions or useful links.";
 
         const bundle = `${UNTRUSTED_OPEN}\n${bodyParts.join("\n\n")}\n${UNTRUSTED_CLOSE}`;
         const { text: summary, usage } = await distillWithSubagent(extractionFocus, bundle, ctx);
+
+        // Tool metadata goes to the agent, NOT into the summariser's bundle:
+        // a notice about the retrieval is not page content, and putting it in the
+        // bundle made the summariser report it as a quote from the page.
+        const prefix = meta.length ? `${meta.join("\n")}\n\n---\n\n` : "";
         return {
-          content: [{ type: "text", text: summary }],
+          content: [{ type: "text", text: prefix + summary }],
           ...(usage ? { usage } : {}),
         };
       } catch (e: any) {
+        const aborted = e?.name === "AbortError" || /abort/i.test(e?.message || "");
         return {
-          content: [{ type: "text", text: `Fetch failed: ${e.message}` }],
+          content: [{ type: "text", text: aborted ? "Fetch cancelled." : `Fetch failed: ${e.message}` }],
           isError: true,
         };
       }
