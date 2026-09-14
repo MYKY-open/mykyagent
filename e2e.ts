@@ -14,7 +14,7 @@
  * Assertions deliberately target the tool's OWN strings (the metadata lines we
  * generate) rather than model output, which is paraphrased and non-deterministic.
  */
-import ext from "./index.ts";
+import ext, { getLocalApiKey } from "./index.ts";
 
 const results: { name: string; ok: boolean; extra?: string }[] = [];
 const t = (name: string, ok: boolean, extra = "") => {
@@ -50,6 +50,29 @@ const call = async (name: string, args: any): Promise<{ text: string; error: boo
 };
 
 const fixture = process.env.MYKYAGENT_E2E_FIXTURE;
+
+// --- preflight: is the model actually usable? -------------------------------
+// Without this the tool assertions pass even when every distillation sub-call is
+// rejected, because the tools fall back to dumping raw text. That silently turns
+// this suite into a test of the fallback path.
+{
+  const base = process.env.MYKYAGENT_BASE_URL!;
+  const apiKey = getLocalApiKey();
+  const headers: Record<string, string> = {};
+  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+  const probe = await fetch(`${base}/models`, { headers, signal: AbortSignal.timeout(10000) }).catch(
+    () => null
+  );
+  const ok = !!probe?.ok;
+  t("model: endpoint authenticates", ok, probe ? `HTTP ${probe.status}` : "unreachable");
+  if (!ok) {
+    console.log(
+      "\nAborting: the model endpoint is not usable, so any further tool assertions would be\n" +
+        "testing the raw-text fallback rather than the model path."
+    );
+    process.exit(1);
+  }
+}
 if (!fixture) {
   console.log(" SKIP  MYKYAGENT_E2E_FIXTURE not set");
 } else {

@@ -111,7 +111,7 @@ function savePersona(persona: PersonaConfig): void {
 let activeModelInfo: any = null;
 let cachedLocalModelName: string | null = null;
 
-function getLocalApiKey(): string {
+export function getLocalApiKey(): string {
   if (process.env.MYKYAGENT_API_KEY) return process.env.MYKYAGENT_API_KEY;
   if (process.env.API_KEY) return process.env.API_KEY;
   if (process.env.OPENAI_API_KEY) return process.env.OPENAI_API_KEY;
@@ -123,7 +123,10 @@ function getLocalApiKey(): string {
       if (key) return key;
     }
   } catch {}
-  return "cannotguess";
+  // No credential fallback on purpose. A hardcoded key is a committed secret,
+  // and silently sending a wrong one turns a config mistake into an opaque 401.
+  // Callers omit the Authorization header entirely when this is empty.
+  return "";
 }
 
 async function resolveLocalModelName(baseUrl: string = LLAMA_URL): Promise<string> {
@@ -496,7 +499,15 @@ async function distillWithSubagent(
       }
     } else {
       const errText = await res.text().catch(() => "");
-      console.warn(`[MykyAgent] Distillation sub-call returned ${res.status}: ${errText.slice(0, 200)}`);
+      if (res.status === 401 || res.status === 403) {
+        console.warn(
+          `[MykyAgent] Distillation sub-call rejected (HTTP ${res.status}) by ${endpoint}. ` +
+            `No usable API key was found. Set MYKYAGENT_API_KEY (or API_KEY / OPENAI_API_KEY), ` +
+            `or add providers["llama-local"].apiKey to ~/.pi/agent/models.json.`
+        );
+      } else {
+        console.warn(`[MykyAgent] Distillation sub-call returned ${res.status}: ${errText.slice(0, 200)}`);
+      }
     }
   } catch (err: any) {
     console.warn(`[MykyAgent] Distillation sub-call error: ${err?.message || err}`);

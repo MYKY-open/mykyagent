@@ -290,13 +290,18 @@ starts a local fixture server (a page with a title, non-ASCII text, and no chars
 in its HTTP header - the exact case that used to mojibake) and uses a unique URL
 per run so the cold-cache assertion is genuinely cold.
 
+It **preflights the credentials** and aborts if the endpoint rejects them. Without
+that check the suite passes even when every distillation sub-call is rejected,
+because the tools fall back to dumping raw text - so it would be testing the
+fallback path while claiming to test the model path.
+
 Assertions target the **tool's own strings** (the metadata lines it generates)
 rather than model output, which is paraphrased and non-deterministic.
 
 | Variable | Effect |
 | --- | --- |
 | `MYKYAGENT_BASE_URL` | OpenAI-compatible endpoint (required, else the suite skips) |
-| `MYKYAGENT_API_KEY` | optional bearer token |
+| `MYKYAGENT_API_KEY` | bearer token. Falls back to `API_KEY`, `OPENAI_API_KEY`, then `providers["llama-local"].apiKey` in `~/.pi/agent/models.json`. There is deliberately no hardcoded default: a missing key produces an explicit 401 message naming the ways to set it. |
 | `MYKYAGENT_E2E_SEARCH=1` | also run the live `web_search` check (slow, network) |
 
 `typebox_stub.ts` stands in for `@sinclair/typebox` when bundling the extension
