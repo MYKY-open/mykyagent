@@ -1,5 +1,6 @@
 import { Type } from "@sinclair/typebox";
 import { execFile } from "node:child_process";
+import { ModelSelectorComponent } from "@earendil-works/pi-coding-agent";
 import { runSearchHops, type ResearchPayload } from "./search_hops.ts";
 import { recoverLeakedToolCalls } from "./tool_recovery.ts";
 import {
@@ -21,6 +22,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const HELPER_SCRIPT = join(here, "search_helper.py");
 const MEMORY_DIR = join(homedir(), ".config", "mykyagent");
 const PERSONA_FILE = join(MEMORY_DIR, "persona.json");
+const WEBMODEL_FILE = join(MEMORY_DIR, "webmodel.json");
 const LLAMA_URL = process.env.MYKYAGENT_BASE_URL || "http://127.0.0.1:8080/v1";
 
 export interface PersonaConfig {
@@ -109,8 +111,37 @@ function savePersona(persona: PersonaConfig): void {
   writeFileSync(PERSONA_FILE, JSON.stringify(persona, null, 2), "utf-8");
 }
 
+// --- Web model (distillation) override ---------------------------------------
+// When set, web_search/web_fetch summarisation sub-calls use this model instead
+// of the main conversation model. Unset (default) = follow the main model.
+
+interface WebModelConfig {
+  provider: string;
+  id: string;
+}
+
+function loadWebModel(): WebModelConfig | null {
+  try {
+    if (existsSync(WEBMODEL_FILE)) {
+      const cfg = JSON.parse(readFileSync(WEBMODEL_FILE, "utf-8"));
+      if (cfg?.provider && cfg?.id) return { provider: String(cfg.provider), id: String(cfg.id) };
+    }
+  } catch {}
+  return null;
+}
+
+function saveWebModel(cfg: WebModelConfig | null): void {
+  mkdirSync(MEMORY_DIR, { recursive: true });
+  if (cfg) {
+    writeFileSync(WEBMODEL_FILE, JSON.stringify(cfg, null, 2), "utf-8");
+  } else {
+    if (existsSync(WEBMODEL_FILE)) writeFileSync(WEBMODEL_FILE, JSON.stringify({ follow: true }, null, 2), "utf-8");
+  }
+}
+
 let activeModelInfo: any = null;
 let cachedLocalModelName: string | null = null;
+const warnedMissingWebModels = new Set<string>();
 
 export function getLocalApiKey(): string {
   if (process.env.MYKYAGENT_API_KEY) return process.env.MYKYAGENT_API_KEY;
@@ -350,14 +381,49 @@ function formatStructured(structured: any): string {
   return out.join("\n");
 }
 
+// --- /model-web interactive picker -------------------------------------------
+// Mirrors pi's built-in /model UX exactly: type-to-filter, arrows, enter, esc.
+// Reuses pi's own ModelSelectorComponent over a thin shim of the ModelRegistry
+// facade (the component only needs getAvailableSnapshot/getModel/getError/refresh).
+
+// Sentinel entry shown inside the picker: selecting it clears the override.
+const DEFAULT_WEB_MODEL_ENTRY = { provider: "default", id: "follow main model", name: "follow main model" };
+
+function makeWebModelRuntimeShim(registry: any): any {
+  return {
+    getAvailableSnapshot: () => [DEFAULT_WEB_MODEL_ENTRY, ...registry.getAvailable()],
+    getModel: (provider: string, id: string) =>
+      provider === DEFAULT_WEB_MODEL_ENTRY.provider
+        ? DEFAULT_WEB_MODEL_ENTRY
+        : registry.find(provider, id),
+    getError: () => registry.getError(),
+    refresh: (opts: any) => registry.refresh(opts),
+  };
+}
+
 async function distillWithSubagent(
   query: string,
   content: string,
   ctxOrModel?: any,
   opts: { allowFollowup?: boolean; preamble?: string } = {}
 ): Promise<DistillationResult> {
-  const model = ctxOrModel?.model || ctxOrModel || activeModelInfo;
+  let model = ctxOrModel?.model || ctxOrModel || activeModelInfo;
   const modelRegistry = ctxOrModel?.modelRegistry;
+
+  // Web model override (/model-web): route this summariser sub-call to a
+  // dedicated model instead of the main conversation model. Silently falls
+  // back to the main model when unset or unresolvable (e.g. e2e ctx has no
+  // modelRegistry). Warn-once so a stale override can't spam every web call.
+  const webModelCfg = loadWebModel();
+  if (webModelCfg && modelRegistry) {
+    const override = modelRegistry.find(webModelCfg.provider, webModelCfg.id);
+    if (override) {
+      model = override;
+    } else if (!warnedMissingWebModels.has(webModelCfg.provider + "/" + webModelCfg.id)) {
+      warnedMissingWebModels.add(webModelCfg.provider + "/" + webModelCfg.id);
+      console.warn(`[MykyAgent] /model-web ${webModelCfg.provider}/${webModelCfg.id} not in model registry; distillation follows main model.`);
+    }
+  }
 
   const systemPrompt =
     "You are a precise technical research summarizer. From the provided web content, extract exactly what is needed to answer the query: code snippets, API signatures, CLI commands, configuration options, version numbers, or URLs. " +
@@ -1108,6 +1174,115 @@ export default function (pi: any) {
         const current = loadPersona().current;
         const available = Object.keys(PERSONAS).join(", ");
         ctx.ui?.notify?.(`Current persona: ${current}. Available: ${available}`, "info");
+      }
+    },
+  });
+
+  // 11. Web Model Slash Command (/model-web [list | set <provider>/<id> | clear])
+  //
+  // Deliberately a slash command and not a tool: like /persona, only the user
+  // picks models. Routes ONLY the web_search/web_fetch distillation sub-calls
+  // (distillWithSubagent) to the chosen model; the main conversation model is
+  // untouched and managed by pi's built-in /model command.
+  pi.registerCommand("model-web", {
+    description: "Set model for web_search/web_fetch distillation (e.g. /model-web set llama-local/Qwen3.5-9B, /model-web list, /model-web clear)",
+    handler: async (args: string, ctx: any) => {
+      const trimmed = args?.trim();
+      const registry = ctx?.modelRegistry;
+
+      if (trimmed === "list") {
+        const current = loadWebModel();
+        const models = registry ? registry.getAvailable() : [];
+        const lines = [`current: ${current ? `${current.provider}/${current.id}` : "follow main model (default)"}`];
+        for (const m of models) {
+          const mark = current && m.provider === current.provider && m.id === current.id ? " ← web" : "";
+          lines.push(`• ${m.provider}/${m.id}${mark}`);
+        }
+        if (!models.length) lines.push("(no models in registry)");
+        ctx.ui?.notify?.(lines.join("\n"), "info");
+        return;
+      }
+
+      if (trimmed?.startsWith("set ")) {
+        const target = trimmed.slice(4).trim();
+        const slash = target.lastIndexOf("/");
+        if (!registry || !target || slash <= 0) {
+          ctx.ui?.notify?.("Usage: /model-web set <provider>/<model-id>", "error");
+          return;
+        }
+        const provider = target.slice(0, slash);
+        const id = target.slice(slash + 1);
+        const resolved = registry.find(provider, id);
+        if (!resolved) {
+          const available = registry.getAvailable().map((m: any) => `${m.provider}/${m.id}`).join("\n");
+          ctx.ui?.notify?.(`Model "${target}" not found. Available:\n${available}`, "error");
+          return;
+        }
+        saveWebModel({ provider, id });
+        ctx.ui?.notify?.(`Web distillation model set to: ${provider}/${id}\n(main model unchanged)`, "info");
+        return;
+      }
+
+      if (trimmed === "clear" || trimmed === "default" || trimmed === "reset") {
+        saveWebModel(null);
+        ctx.ui?.notify?.("Web distillation follows the main model (default).", "info");
+        return;
+      }
+
+      if (trimmed) {
+        ctx.ui?.notify?.("Usage: /model-web [list | set <provider>/<model-id> | clear]", "error");
+        return;
+      }
+
+      // No args: pi's own /model picker (searchable), pointed at the registry
+      if (ctx.ui?.custom && registry) {
+        const currentCfg = loadWebModel();
+        const currentModel = currentCfg ? registry.find(currentCfg.provider, currentCfg.id) : undefined;
+        const runtimeShim = makeWebModelRuntimeShim(registry);
+        const pickedModel: any = await ctx.ui.custom(
+          (tui: any, _theme: any, _kb: any, done: (m: any | undefined) => void) =>
+            new ModelSelectorComponent(
+              tui,
+              currentModel ?? DEFAULT_WEB_MODEL_ENTRY,
+              runtimeShim,
+              [], // no scoped-models UI; show all available
+              (model: any) => done(model),
+              () => done(undefined)
+            ),
+          {
+            overlay: true,
+            // Match /model placement: full-width, anchored above the input line
+            overlayOptions: { anchor: "bottom-left", width: "100%", margin: { left: 0, right: 0, bottom: 0 } },
+          }
+        );
+        if (pickedModel === undefined) return; // cancelled
+        if (pickedModel.provider === DEFAULT_WEB_MODEL_ENTRY.provider) {
+          saveWebModel(null);
+          ctx.ui?.notify?.("Web distillation follows the main model (default).", "info");
+          return;
+        }
+        saveWebModel({ provider: pickedModel.provider, id: pickedModel.id });
+        ctx.ui?.notify?.(`Web distillation model set to: ${pickedModel.provider}/${pickedModel.id}\n(main model unchanged)`, "info");
+      } else if (ctx.ui?.select && registry) {
+        const current = loadWebModel();
+        const options = ["follow main model (default)", ...registry.getAvailable().map((m: any) => `${m.provider}/${m.id}`)];
+        const selected = await ctx.ui.select("Model for web_search/web_fetch distillation:", options);
+        if (selected) {
+          if (selected.startsWith("follow main model")) {
+            saveWebModel(null);
+            ctx.ui?.notify?.("Web distillation follows the main model (default).", "info");
+          } else {
+            const slash = selected.lastIndexOf("/");
+            saveWebModel({ provider: selected.slice(0, slash), id: selected.slice(slash + 1) });
+            ctx.ui?.notify?.(`Web distillation model set to: ${selected}\n(main model unchanged)`, "info");
+          }
+        }
+      } else {
+        const current = loadWebModel();
+        ctx.ui?.notify?.(
+          current ? `Current web model: ${current.provider}/${current.id}` : "Web distillation follows the main model (default)",
+          "info"
+        );
       }
     },
   });

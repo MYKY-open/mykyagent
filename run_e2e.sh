@@ -87,6 +87,8 @@ OUT="$DIR/_e2e.generated.mjs"
 "$ESBUILD" "$DIR/e2e.ts" \
     --bundle --platform=node --format=esm \
     --alias:@sinclair/typebox="$DIR/typebox_stub.ts" \
+    --external:@earendil-works/pi-tui \
+    --external:@earendil-works/pi-coding-agent \
     --outfile="$OUT" >/dev/null
 
 echo "=== e2e (model: ${MYKYAGENT_BASE_URL}) ==="

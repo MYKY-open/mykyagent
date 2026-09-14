@@ -57,6 +57,18 @@ Switch the agent's tone and speaking style at any time in chat:
 * `/persona caveman` — Switch back to default caveman mode
 * `/persona set <instructions>` — Set a custom persona prompt
 
+## In-Chat Web Model
+Route only the `web_search` / `web_fetch` distillation sub-calls to a dedicated
+model; the main conversation model (pi's `/model`) is untouched:
+* `/model-web` — Open pi's model picker (searchable). First entry "follow main
+  model" clears the override; picking any other model saves it permanently.
+* `/model-web list` — Show the current override and all available models
+* `/model-web set <provider>/<model-id>` — Set directly
+* `/model-web clear` — Back to following the main model (default)
+
+Saved to `~/.config/mykyagent/webmodel.json` and persists across sessions.
+When no override is set, distillation uses the main model (default state).
+
 ---
 
 ## Web Search Architecture
