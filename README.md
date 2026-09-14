@@ -4,10 +4,11 @@ A lightweight, crash-proof agent overlay for small local reasoning models (like 
 
 ## Features
 - **Seamless `llm` Integration**: Supported natively in the `llm` orchestrator (Mode 12) with automatic context probing and model configuration.
-- **Subagent Web Distillation**: Autonomous multi-hop web crawling with clean technical summaries (<80 words) and priority code/link extraction. Zero raw DOM dumped into context (~90% context reduction).
+- **Reranked Web Research**: Multi-engine fan-out with reciprocal-rank fusion, authoritative API lookups (GitHub, Modrinth, PyPI, npm, NeoForge Maven), BM25 block extraction, and domain-authority ranking. Engine failover means one throttled search backend cannot kill a query.
+- **Token-Disciplined Distillation**: Per-page character budgets, cross-page duplicate-block removal, and hard caps on fallback dumps. A typical search spends ~2k tokens, not ~4k, and bad pages are dropped instead of summarised.
 - **Safe Local Code Inspection**: Guardrailed `read` tool enforcing 250-line chunks (max 15KB) to prevent 10,000-line files or logs from flooding local context. Automatic `grep`, `find`, and `ls` activation.
 - **Customizable Personas**: In-chat `/persona` slash command with presets (`caveman`, `senior`, `cyberpunk`, `pirate`, `butler`, `academic`, or `custom`) saved to `~/.config/mykyagent/persona.json`.
-- **Persistent Memory**: `memory_save` & `memory_list` tools saved to `~/.config/mykyagent/memory.json`.
+- **Persistent Memory (index + on-demand)**: Topic files under `~/.config/mykyagent/memory/`. Only a one-line summary per topic is injected into the system prompt; bodies load via `memory_read` when relevant. `memory_write` / `memory_read` / `memory_forget` / `memory_list`.
 - **Ultra Portable**: Clean TypeScript overlay with zero local `node_modules`.
 
 ## Quickstart
@@ -55,3 +56,194 @@ Switch the agent's tone and speaking style at any time in chat:
 * `/persona senior` — Switch to Senior Staff Engineer mode
 * `/persona caveman` — Switch back to default caveman mode
 * `/persona set <instructions>` — Set a custom persona prompt
+
+---
+
+## Web Search Architecture
+
+The `web_search` / `web_fetch` tools drive `search_helper.py`, a PEP 723 script
+run through `uv` (same idiom as the rest of the `llm` ecosystem — no shared venv,
+no `requirements.txt`).
+
+```
+fan-out queries ──► multi-engine SERP ──► RRF fusion ──► domain priors
+        │                                                        │
+        └──► structured APIs (GitHub/Modrinth/PyPI/npm/Maven/Wikipedia/SO)
+                                    │
+                          relevance-ranked fetch
+                                    │
+                 BM25 + section-context extraction (once)
+                                    │
+              cross-page dedupe ──► bounded bundle ──► summariser
+```
+
+**Why it is built this way**
+
+| Problem | Handling |
+| --- | --- |
+| Search engine throttling | Variants spread one query per engine (DuckDuckGo → Bing → Yahoo → Mojeek → Brave → Google), with failover, a per-run dead-backend cache, and a recovery sweep. |
+| Wrong/fake versions & download links | Authoritative APIs are consulted first and rendered in a separate "Authoritative API Data" block the summariser is told to prefer (e.g. NeoForge is read from Maven metadata, not GitHub tags). |
+| Low-quality SEO results | Hosting-company and tutorial-farm domains are penalised; official docs, wikis and GitHub are boosted; pages are re-ranked by actual query fit. |
+| Token burn | Per-page budget (`MYKYAGENT_PAGE_BUDGET`, default 2200 chars), near-duplicate page collapsing, repeated-block removal across pages, page count capped at 3–4, and fallback dumps capped at 4k chars. |
+| Error pages as "content" | Every response is validated for HTTP status and content type (this previously let 504/403 pages through as research). |
+| Prompt injection from web text | All fetched text is fenced in `<<<UNTRUSTED_WEB_CONTENT>>>` markers and the summariser is instructed to treat it as data, never instructions. |
+| Dead-end queries | If every search engine is unavailable, API providers still return verified results instead of an error. |
+| Multi-hop research | The summariser itself declares insufficiency by emitting `FOLLOWUP: <query>`; the agent then runs one more research round seeded with the new query. No extra LLM call is spent detecting gaps, and the loop stops the moment a round yields no new URLs. Capped by `MYKYAGENT_MAX_HOPS` (default 2, max 4). |
+| Navigational queries | When the query names its own source ("artificial analysis leaderboard"), the matching host is detected, its landing page is injected as a candidate, and it is boosted at *both* the candidate and page ranking stages. Only multi-word brand matches are trusted, so a generic word cannot hijack the query onto a squatter domain. |
+| Recency queries | `new / latest / current / changelog / released` switches the cache to short TTLs (SERP 5 min, pages 15 min) and probes the site's `/changelog`, `/releases`, `/news`, `/updates`, `/blog` paths in parallel. A site's changelog carries the dates its landing page omits. |
+| Missing requested field | If the user asked for dates/versions/scores and the fetched pages contain none, one escalation search runs automatically; if the field is still absent a `warnings` entry says so instead of quietly returning an incomplete answer. |
+| Sources that disagree | When two URLs report different numbers for the same named entity, a conservative `conflicts` entry names the entity and the values. Requires two distinct values from two distinct sources in the same magnitude band, so it stays quiet on noise. |
+| Enumerative queries | `list / top / compare / leaderboard` gives table blocks a separate character allowance, so whole tables survive without paying 3x for every page's prose. |
+
+### Query classes
+
+The pipeline deliberately handles four question shapes differently. The first three
+were invisible to the original test suite and were added after a real failure:
+
+| Class | Trigger | Behaviour |
+| --- | --- | --- |
+| Explanatory | default | Normal fan-out, RRF fusion, domain priors. |
+| Navigational | query names a site | Resolve to that host, inject and boost it. |
+| Recency | `new`, `latest`, `changelog` | Fresh cache TTLs + `/changelog` probing. |
+| Enumerative | `list`, `compare`, `leaderboard` | Table blocks get their own budget. |
+
+### Cost
+
+Per-page budget is the main token lever, and the browser pass is skipped when the
+plain fetches already contain the fields the user asked for. Measured on a
+recency + navigational query, before and after the last round of fixes:
+
+| | tokens | wall time | first source |
+| --- | --- | --- | --- |
+| before | ~7750 | 66 s | a GitHub mirror |
+| after | ~1500 | 8 s | `artificialanalysis.ai/changelog` |
+
+`timings` is returned in every payload, so regressions in where time is spent are
+visible instead of guessed at.
+
+### Multi-hop loop
+
+Implemented in `search_hops.ts` (kept free of the pi runtime so it is unit-testable).
+The contract:
+
+1. Round 1 researches the query; the summariser may end its answer with `FOLLOWUP: <query>`.
+2. If, and only if, that marker is present **and** the hop budget allows, a second research
+   round runs on the new query.
+3. Only pages with URLs not already seen are passed forward — no paying twice for the same content.
+4. The `FOLLOWUP:` line is a control channel and is stripped from the user-visible answer.
+
+It stops on: no marker, budget exhausted, a repeated follow-up query, or a round with zero new URLs.
+
+Run `./run_tests.sh` for the full offline suite: 22 control-flow assertions in
+`search_hops.test.ts` plus 26 intent/field/nav/conflict assertions in
+`search_helper.py unit`. No network required.
+
+### On cross-encoder rerankers (measured, not adopted)
+
+A `bge-reranker-base` / `ms-marco-MiniLM-L-6-v2` ONNX cross-encoder was benchmarked and is
+**not** used. Measured on labelled candidates from real searches:
+
+| method | P@3 (page selection) | nDCG@5 |
+| --- | --- | --- |
+| BM25 lexical | 0.000 | 0.146 |
+| **current: BM25 + domain priors** | **1.000** | **0.869** |
+| bge-reranker-base | 0.000 | 0.131 |
+| ms-marco-MiniLM-L-6-v2 (quantised) | 0.543 (block level) | block nDCG 0.543 |
+
+Rerankers measure *topical relevance*. SEO spam is topically perfect —
+`unanswered.io/guide/how-to-make-minecraft-server-faster` contains the query verbatim — so a
+cross-encoder ranks it first. The failure mode here is *authority*, which domain priors handle
+and a reranker cannot learn. Cost if ever revisited: `onnxruntime`, `tokenizers`,
+`huggingface-hub`, `numpy` plus a 23 MB (fast, 3 ms/pair) or 279 MB (good, 19 ms/pair) model file.
+
+### Modes
+
+```bash
+uv run search_helper.py search   "query"            # one SERP, fused + cached
+uv run search_helper.py fetch    "URL" [focus]      # one page -> distilled markdown
+uv run search_helper.py research "query"            # full pipeline (used by the agent)
+uv run search_helper.py unit     x                  # offline heuristic tests (no network)
+uv run search_helper.py selftest x                  # live end-to-end harness (network)
+```
+
+### Environment knobs
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `MYKYAGENT_SEARCH_DEADLINE` | `75` | Hard internal seconds budget; always emits JSON |
+| `MYKYAGENT_MAX_HOPS` | `2` | Extra research rounds (0 disables, max 4) |
+| `MYKYAGENT_TABLE_EXTRA` | `2600` | Extra chars allowed for table blocks on enumerative queries |
+| `MYKYAGENT_PAGE_BUDGET` | `2200` | Chars of extracted text per page (main token lever) |
+| `MYKYAGENT_NO_BROWSER` | unset | `1` disables Playwright entirely |
+| `MYKYAGENT_NO_APIS` | unset | `1` disables structured API providers |
+| `MYKYAGENT_CACHE_DIR` | `~/.cache/mykyagent` | SQLite cache location (SERP 1h, pages 24h) |
+| `MYKYAGENT_DEBUG` | unset | `1` prints pipeline progress to stderr |
+
+## Persistent Memory
+
+Memory is stored as one markdown file per topic under `~/.config/mykyagent/memory/`:
+
+```markdown
+---
+summary: search_helper.py architecture - engines, APIs, query classes, knobs
+updated: 2026-09-14
+---
+
+...the full body, loaded only on demand...
+```
+
+**Only the `summary` lines reach the system prompt.** They are injected as a small
+index, hard-capped by `MYKYAGENT_MEMORY_INDEX_CHARS`, and the model is told explicitly
+that bodies are not loaded:
+
+```
+## Persistent Memory (index only - bodies are NOT loaded)
+Call `memory_read` with the exact topic name when one becomes relevant.
+- minecraft_server_setup: MYKYpack NeoForge 1.21.1 server - paths, JVM flags...
+- mykyagent_search: search_helper.py architecture - engines, APIs, knobs...
+```
+
+Bodies are fetched with `memory_read` only when a topic becomes relevant. This keeps
+the per-turn prompt cost roughly constant as knowledge accumulates (~140 tokens for
+three topics holding ~7KB of notes), and keeps model-authored prose out of the
+highest-trust region of the context.
+
+| Tool | Purpose |
+| --- | --- |
+| `memory_read` | load one topic body by name |
+| `memory_write` | create/update a topic (`name`, one-line `summary`, `body`) |
+| `memory_forget` | delete a topic that is outdated or wrong |
+| `memory_list` | all topics with size and last-updated date |
+
+Topic names resolve loosely, so `"Proj Alpha"` finds `proj_alpha`. Summaries are
+forced to a single line and a topic name can never escape the memory root.
+
+An older flat `~/.config/mykyagent/memory.json` is imported once on startup and then
+renamed to `memory.json.migrated`.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `MYKYAGENT_MEMORY_DIR` | `~/.config/mykyagent/memory` | Store location |
+| `MYKYAGENT_MEMORY_INDEX_CHARS` | `1800` | Cap on the always-injected index |
+| `MYKYAGENT_MEMORY_BODY_CHARS` | `12000` | Cap on a single topic body |
+
+### Why not embeddings / RAG for memory
+
+Deliberately rejected. With only one-line summaries to match against, the failure mode
+is **scoping**, not similarity ranking - a per-topic index scoped by name solves it
+outright. Embeddings would add `onnxruntime` plus a 100-400MB model to replace a
+directory listing. Do not re-litigate without new evidence.
+
+## Tests
+
+`./run_tests.sh` runs everything offline, no network needed:
+
+| Suite | Assertions | Covers |
+| --- | --- | --- |
+| `memory.test.ts` | 34 | slug/path safety, caps, index, migration, injection guard |
+| `search_hops.test.ts` | 22 | multi-hop control flow, `FOLLOWUP` parsing |
+| `search_helper.py unit` | 26 | intent detection, nav, fields, conflicts |
+
+```
+ALL SUITES PASSED
+```
