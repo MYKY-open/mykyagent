@@ -69,6 +69,16 @@ model; the main conversation model (pi's `/model`) is untouched:
 Saved to `~/.config/mykyagent/webmodel.json` and persists across sessions.
 When no override is set, distillation uses the main model (default state).
 
+## Web Killswitch
+* `/web-toggle` — flip web tools on/off
+* `/web-toggle off` — remove `web_search` + `web_fetch` from the agent
+* `/web-toggle on` — re-enable
+* `/web-toggle status` — show current state
+
+Persisted in `~/.config/mykyagent/webkill.json`; survives restarts. When off,
+the tools are removed from the active toolset and the system prompt, and the
+model is told to answer from memory instead of attempting web lookups.
+
 ---
 
 ## Web Search Architecture

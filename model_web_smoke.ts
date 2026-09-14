@@ -12,14 +12,20 @@ const { initTheme } = await import("@earendil-works/pi-coding-agent");
 initTheme("dark");
 
 const WM = join(homedir(), ".config", "mykyagent", "webmodel.json");
+const WK = join(homedir(), ".config", "mykyagent", "webkill.json");
 const backup = existsSync(WM) ? readFileSync(WM, "utf-8") : null;
+const wkBackup = existsSync(WK) ? readFileSync(WK, "utf-8") : null;
 const notify = (m: string) => console.log("  [notify]", m.split("\n").join(" | "));
 
 const commands: Record<string, any> = {};
+const hooks: Record<string, any> = {};
+const toolState = { active: ["bash", "web_search", "web_fetch", "memory_list"] as string[] };
 (ext as any)({
-  on: () => {},
+  on: (n: string, f: any) => (hooks[n] = f),
   registerTool: () => {},
   registerCommand: (name: string, def: any) => (commands[name] = def),
+  getActiveTools: () => toolState.active,
+  setActiveTools: (t: string[]) => (toolState.active = t),
 });
 
 const fakeModel = { provider: "llama-local", id: "FAKE-MAIN" };
@@ -210,5 +216,30 @@ console.log("--- 11. picker lists default entry; picking it clears override ---"
   picker4.handleInput("\r");
   await handlerP;
   console.log("  file after picking default:", readFileSync(WM, "utf-8").replace(/\s+/g, " "));
+}
+
+console.log("--- 12. web-toggle: status, off, before_agent_start merge, on ---");
+{
+  const ctxB = { getModel: () => undefined, cwd: process.cwd(), ui: { notify } };
+  await commands["web-toggle"].handler("status", ctxB);
+  await commands["web-toggle"].handler("off", ctxB);
+  console.log("  file:", readFileSync(WK, "utf-8").replace(/\s+/g, " "));
+  console.log("  active tools after off:", toolState.active.join(","));
+  const res = await hooks["before_agent_start"]({}, ctxB);
+  const sp: string = res?.systemPrompt || "";
+  console.log("  merge keeps web off:", !toolState.active.includes("web_search"), "| prompt mentions DISABLED:", sp.includes("DISABLED"), "| prompt lacks web_search line:", !sp.includes("- web_search:"));
+  await commands["web-toggle"].handler("on", ctxB);
+  console.log("  active tools after on:", toolState.active.join(","));
+  const res2 = await hooks["before_agent_start"]({}, ctxB);
+  const sp2: string = res2?.systemPrompt || "";
+  console.log("  prompt has web_search line again:", sp2.includes("- web_search:"));
+}
+
+console.log("--- 13. restore webkill state ---");
+if (wkBackup === null) {
+  const { unlinkSync } = await import("node:fs");
+  try { unlinkSync(WK); } catch {}
+} else {
+  writeFileSync(WK, wkBackup, "utf-8");
 }
 console.log("done");

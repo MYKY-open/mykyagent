@@ -139,6 +139,27 @@ function saveWebModel(cfg: WebModelConfig | null): void {
   }
 }
 
+// --- Web killswitch -----------------------------------------------------------
+// /web-toggle removes web_search/web_fetch from the active toolset and the
+// system prompt. Persisted so a restart doesn't silently re-enable them.
+
+const WEBKILL_FILE = join(MEMORY_DIR, "webkill.json");
+const WEB_TOOL_NAMES = ["web_search", "web_fetch"];
+
+function webDisabled(): boolean {
+  try {
+    if (existsSync(WEBKILL_FILE)) {
+      return !!JSON.parse(readFileSync(WEBKILL_FILE, "utf-8"))?.disabled;
+    }
+  } catch {}
+  return false;
+}
+
+function setWebDisabled(disabled: boolean): void {
+  mkdirSync(MEMORY_DIR, { recursive: true });
+  writeFileSync(WEBKILL_FILE, JSON.stringify({ disabled }, null, 2), "utf-8");
+}
+
 let activeModelInfo: any = null;
 let cachedLocalModelName: string | null = null;
 const warnedMissingWebModels = new Set<string>();
@@ -726,9 +747,11 @@ export default function (pi: any) {
   // 1. Caveman System Prompt + Memory Injection
   pi.on("before_agent_start", async (event: any, ctx: any) => {
     activeModelInfo = ctx?.getModel?.();
+    const webOff = webDisabled();
     try {
+      const allDesired = ["read", "write", "edit", "bash", "grep", "find", "ls", "web_search", "web_fetch", "memory_read", "memory_write", "memory_forget", "memory_list"];
+      const desired = webOff ? allDesired.filter((t) => !WEB_TOOL_NAMES.includes(t)) : allDesired;
       const currentTools = pi.getActiveTools?.() || [];
-      const desired = ["read", "write", "edit", "bash", "grep", "find", "ls", "web_search", "web_fetch", "memory_read", "memory_write", "memory_forget", "memory_list"];
       const merged = Array.from(new Set([...currentTools, ...desired]));
       pi.setActiveTools?.(merged);
     } catch {}
@@ -740,6 +763,26 @@ export default function (pi: any) {
     const personaInfo = PERSONAS[activePersonaKey] || PERSONAS.caveman;
     const personaPrompt = personaCfg.customPrompt || personaInfo.prompt;
 
+    const toolLines = [
+      "- bash: run shell commands, check environment, download files, run scripts/tests.",
+      ...(webOff
+        ? ["- (web_search / web_fetch are DISABLED by /web-toggle; answer from memory or say you cannot check the web.)"]
+        : [
+            "- web_search: deep internet search (autonomously crawls top candidate pages, extracts verified download links, real versions, API specs).",
+            "- web_fetch: read specific webpage or documentation URL (distills clean technical specs, code blocks, links without bloating context).",
+          ]),
+      "- memory_read: load the full body of one memory topic by name. Call it when a topic listed in the memory index becomes relevant.",
+      "- memory_write: create or update a memory topic (name, one-line summary, body).",
+      "- memory_forget: delete a memory topic that is outdated or wrong.",
+      "- memory_list: list all memory topics with sizes and dates.",
+      "- read: inspect file chunks (safe default: 250 lines max per call; use offset & limit for large files).",
+      "- grep: fast search for regex patterns, function definitions, or errors across files without reading whole files.",
+      "- find: locate files and paths by glob or name pattern.",
+      "- ls: list directory entries and structure.",
+      "- write: create a new file (always use a relative path like ./foo.sh, NEVER /foo.sh).",
+      "- edit: make targeted changes to an existing file (prefer this over full rewrites).",
+    ];
+
     const todayStr = new Date().toISOString().slice(0, 10);
     const systemPrompt =
       `${personaPrompt}\n` +
@@ -747,19 +790,8 @@ export default function (pi: any) {
       `Active Persona: ${personaInfo.label}.\n` +
       `Goal: do user task completely and efficiently.\n\n` +
       `Available Tools:\n` +
-      `- bash: run shell commands, check environment, download files, run scripts/tests.\n` +
-      `- web_search: deep internet search (autonomously crawls top candidate pages, extracts verified download links, real versions, API specs).\n` +
-      `- web_fetch: read specific webpage or documentation URL (distills clean technical specs, code blocks, links without bloating context).\n` +
-      `- memory_read: load the full body of one memory topic by name. Call it when a topic listed in the memory index becomes relevant.\n` +
-      `- memory_write: create or update a memory topic (name, one-line summary, body).\n` +
-      `- memory_forget: delete a memory topic that is outdated or wrong.\n` +
-      `- memory_list: list all memory topics with sizes and dates.\n` +
-      `- read: inspect file chunks (safe default: 250 lines max per call; use offset & limit for large files).\n` +
-      `- grep: fast search for regex patterns, function definitions, or errors across files without reading whole files.\n` +
-      `- find: locate files and paths by glob or name pattern.\n` +
-      `- ls: list directory entries and structure.\n` +
-      `- write: create a new file (always use a relative path like ./foo.sh, NEVER /foo.sh).\n` +
-      `- edit: make targeted changes to an existing file (prefer this over full rewrites).\n\n` +
+      toolLines.join("\n") +
+      `\n\n` +
       `Planning Rules (Internal):\n` +
       `- For tasks with >1 step, state a simple 3-5 step plan at start before taking action (e.g. 1. Create folders, 2. Find version, 3. Download/configure, 4. Verify).\n` +
       `- Follow steps sequentially. Do not wander or skip steps.\n\n` +
@@ -1284,6 +1316,47 @@ export default function (pi: any) {
           "info"
         );
       }
+    },
+  });
+
+  // 12. Web Killswitch (/web-toggle [on | off | status])
+  //
+  // Deliberately a slash command and not a tool: like /model-web and /persona,
+  // only the user may flip it. Persisted so restarts don't silently re-enable
+  // the web tools. Applied both immediately and on every before_agent_start
+  // (that hook re-merges the full desired tool list each turn).
+  pi.registerCommand("web-toggle", {
+    description: "Enable/disable web_search + web_fetch (e.g. /web-toggle off, /web-toggle status)",
+    handler: async (args: string, ctx: any) => {
+      const trimmed = args?.trim().toLowerCase();
+      const apply = (disabled: boolean) => {
+        setWebDisabled(disabled);
+        try {
+          const current = pi.getActiveTools?.() || [];
+          const next = disabled
+            ? current.filter((t: string) => !WEB_TOOL_NAMES.includes(t))
+            : Array.from(new Set([...current, ...WEB_TOOL_NAMES]));
+          pi.setActiveTools?.(next);
+        } catch {}
+        ctx.ui?.notify?.(
+          disabled
+            ? "Web tools DISABLED (web_search + web_fetch removed; persists across restarts)."
+            : "Web tools ENABLED (web_search + web_fetch active).",
+          "info"
+        );
+      };
+
+      if (trimmed === "off" || trimmed === "disable") return apply(true);
+      if (trimmed === "on" || trimmed === "enable") return apply(false);
+      if (trimmed === "status") {
+        ctx.ui?.notify?.(webDisabled() ? "Web tools: DISABLED" : "Web tools: enabled (default)", "info");
+        return;
+      }
+      if (trimmed) {
+        ctx.ui?.notify?.("Usage: /web-toggle [on | off | status]", "error");
+        return;
+      }
+      apply(!webDisabled()); // bare command flips
     },
   });
 }
