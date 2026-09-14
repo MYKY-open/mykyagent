@@ -567,6 +567,59 @@ def _absolutize(href: str, base: str) -> str:
     return urljoin(base, href)
 
 
+_BOM_ENCODINGS = (
+    (b"\xef\xbb\xbf", "utf-8-sig"),
+    (b"\xff\xfe\x00\x00", "utf-32-le"),
+    (b"\x00\x00\xfe\xff", "utf-32-be"),
+    (b"\xff\xfe", "utf-16-le"),
+    (b"\xfe\xff", "utf-16-be"),
+)
+_HEADER_CHARSET_RE = re.compile(r"charset\s*=\s*[\"']?([\w.:-]+)", re.I)
+_META_CHARSET_RE = re.compile(rb"<meta[^>]+charset\s*=\s*[\"']?\s*([\w.:-]+)", re.I)
+
+
+def _decode_html(raw: bytes, content_type: str = "") -> str:
+    """Decode an HTML byte string to text using the best available signal.
+
+    This matters more than it looks. `requests` reports ISO-8859-1 for any
+    `text/html` response without an explicit charset parameter, because that is
+    the RFC 2616 default - so `raw.decode(resp.encoding)` silently mojibakes
+    every page that declares its charset only in a <meta> tag. 'Cafe\u0301' becomes
+    'Caf\u00c3\u00a9'; Japanese becomes garbage.
+
+    Order: BOM, then the raw HTTP header, then the <meta> tag, then UTF-8, then
+    Latin-1 as a last resort that can never fail.
+    """
+    if not raw:
+        return ""
+
+    for bom, enc in _BOM_ENCODINGS:
+        if raw.startswith(bom):
+            try:
+                return raw.decode(enc, errors="replace")
+            except LookupError:
+                break
+
+    m = _HEADER_CHARSET_RE.search(content_type or "")
+    if m:
+        try:
+            return raw.decode(m.group(1), errors="replace")
+        except (LookupError, UnicodeDecodeError):
+            pass
+
+    m = _META_CHARSET_RE.search(raw[:4096])  # covers <meta charset> and http-equiv
+    if m:
+        try:
+            return raw.decode(m.group(1).decode("ascii", "ignore"), errors="replace")
+        except (LookupError, UnicodeDecodeError):
+            pass
+
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1", errors="replace")
+
+
 def html_to_markdown(html: str, url: str) -> tuple[str, list[str]]:
     """Return (markdown, direct_download_links). One shot, no chunking here."""
     try:
@@ -1597,13 +1650,13 @@ def fetch(
             if "html" not in ct and "xml" not in ct and "text/" not in ct:
                 return {"url": url, "error": f"unsupported content-type: {ct}"}
 
-            html = raw.decode(resp.encoding or "utf-8", errors="replace")
+            html = _decode_html(raw, ct)
         finally:
             resp.close()
 
         text, links = html_to_markdown(html, url)
 
-        if _is_js_gated(html, text) and not NO_BROWSER:
+        if _is_js_gated(html, text) and not NO_BROWSER and not out_of_time(8):
             br = _fetch_browser(url, query, browser=_browser, budget=budget, enum_mode=enum_mode)
             if br.get("text") and len(br["text"]) > len(text):
                 res = {"url": url, "text": br["text"], "links": links, "browser": True}
@@ -2299,6 +2352,25 @@ def unit() -> dict:
         nav_host("how to fix nginx 502 bad gateway upstream", navres) is None,
         nav_host("how to fix nginx 502 bad gateway upstream", navres),
     )
+
+    # --- charset decoding ---------------------------------------------------
+    # requests reports ISO-8859-1 for text/html with no charset parameter, which
+    # used to mojibake every page declaring its charset only in <meta>.
+    fr = "Caf\u00e9 na\u00efve".encode("utf-8")
+    ck("charset: no header charset still decodes utf-8", _decode_html(fr, "text/html") == "Caf\u00e9 na\u00efve", _decode_html(fr, "text/html"))
+    ck("charset: explicit header honoured", _decode_html(fr, "text/html; charset=utf-8") == "Caf\u00e9 na\u00efve")
+    ck("charset: latin-1 header honoured", _decode_html("Caf\u00e9".encode("latin-1"), "text/html; charset=iso-8859-1") == "Caf\u00e9")
+    ck("charset: quoted header value", _decode_html(fr, 'text/html; charset="utf-8"') == "Caf\u00e9 na\u00efve")
+    ck("charset: <meta charset> honoured", _decode_html(b'<meta charset="utf-8">' + fr, "text/html").endswith("Caf\u00e9 na\u00efve"))
+    ck(
+        "charset: <meta http-equiv> honoured",
+        _decode_html(b'<meta http-equiv="Content-Type" content="text/html; charset=utf-8">' + fr, "text/html").endswith("Caf\u00e9 na\u00efve"),
+    )
+    ck("charset: utf-8 BOM stripped", _decode_html(b"\xef\xbb\xbfhi", "text/html") == "hi")
+    ck("charset: header beats meta", _decode_html("caf\u00e9".encode("latin-1"), "text/html; charset=latin-1") == "caf\u00e9")
+    ck("charset: invalid utf-8 does not raise", _decode_html(b"\xff\xfe\xfa", "text/html") != "")
+    ck("charset: empty input", _decode_html(b"", "text/html") == "")
+    ck("charset: json-ish plain text", _decode_html(b'{"a":"\xc3\xa9"}', "application/json") == '{"a":"\u00e9"}')
     # Regression: a single generic query word must not hijack a squatter domain.
     sq = [
         {"url": "https://nginx.org/en/docs/"},
