@@ -763,7 +763,11 @@ export default function (pi: any) {
       const desired = webOff ? allDesired.filter((t) => !WEB_TOOL_NAMES.includes(t)) : allDesired;
       const currentTools = pi.getActiveTools?.() || [];
       const merged = Array.from(new Set([...currentTools, ...desired]));
-      pi.setActiveTools?.(merged);
+      // Subtract AFTER the union: pi's fresh-session default toolset contains the
+      // registered web tools, so a restart with webkill.json {disabled:true} must
+      // remove them here or the union silently re-enables the killswitched tools.
+      const finalTools = webOff ? merged.filter((t) => !WEB_TOOL_NAMES.includes(t)) : merged;
+      pi.setActiveTools?.(finalTools);
     } catch {}
 
     const memBlock = memoryIndexBlock();
@@ -1457,11 +1461,17 @@ export default function (pi: any) {
       const apply = (disabled: boolean) => {
         setWebDisabled(disabled);
         try {
-          const current = pi.getActiveTools?.() || [];
-          const next = disabled
-            ? current.filter((t: string) => !WEB_TOOL_NAMES.includes(t))
-            : Array.from(new Set([...current, ...WEB_TOOL_NAMES]));
-          pi.setActiveTools?.(next);
+          // Only touch the live toolset when we can read it back reliably:
+          // building from an empty/missing snapshot would call setActiveTools([])
+          // and wipe every tool, not just the web ones. The before_agent_start
+          // hook re-applies the persisted state on the next turn regardless.
+          const current = pi.getActiveTools?.();
+          if (Array.isArray(current) && current.length > 0) {
+            const next = disabled
+              ? current.filter((t: string) => !WEB_TOOL_NAMES.includes(t))
+              : Array.from(new Set([...current, ...WEB_TOOL_NAMES]));
+            pi.setActiveTools?.(next);
+          }
         } catch {}
         ctx.ui?.notify?.(
           disabled

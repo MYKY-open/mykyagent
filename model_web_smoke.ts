@@ -233,6 +233,20 @@ console.log("--- 12. web-toggle: status, off, before_agent_start merge, on ---")
   const res2 = await hooks["before_agent_start"]({}, ctxB);
   const sp2: string = res2?.systemPrompt || "";
   console.log("  prompt has web_search line again:", sp2.includes("- web_search:"));
+
+  console.log("--- 12b. killswitch survives a RESTART (fresh session defaults) ---");
+  await commands["web-toggle"].handler("off", ctxB);
+  // Simulate a brand-new session: pi's defaults include the registered web tools.
+  toolState.active = ["bash", "read", "web_search", "web_fetch", "memory_list"];
+  const res3 = await hooks["before_agent_start"]({}, ctxB);
+  const sp3: string = res3?.systemPrompt || "";
+  console.log(
+    "  merge strips web tools on restart:",
+    !toolState.active.includes("web_search") && !toolState.active.includes("web_fetch"),
+    "| other tools kept:", toolState.active.includes("bash") && toolState.active.includes("read"),
+    "| prompt says DISABLED:", sp3.includes("DISABLED")
+  );
+  await commands["web-toggle"].handler("on", ctxB);
 }
 
 console.log("--- 13. restore webkill state ---");
