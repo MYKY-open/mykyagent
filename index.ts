@@ -22,6 +22,16 @@ import {
   taskOutput,
   taskStatus,
 } from "./background_tasks.ts";
+import {
+  canonicalJson,
+  loadOpenRouterRouting,
+  parseRoutingArg,
+  readOpenRouterRoutingFromModelsJson,
+  reconcileOpenRouterRouting,
+  saveOpenRouterRouting,
+  syncOpenRouterRoutingToModelsJson,
+  type ORRouting,
+} from "./or_routing.ts";
 import { constants, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { access, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -532,7 +542,13 @@ async function distillWithSubagent(
   }
 
   try {
+    // /or-routing state → OpenRouter `provider` request field (upstream provider
+    // selection/sorting, e.g. {"sort":"price"}). Read per-request so a switch
+    // flip applies to the next distillation sub-call without a restart.
+    const openRouterRouting: ORRouting | null =
+      isCloudOpenRouter && openrouterKey ? loadOpenRouterRouting() : null;
     const payload = JSON.stringify({
+      ...(openRouterRouting ? { provider: openRouterRouting } : {}),
       model: modelName,
       messages: [
         {
@@ -734,6 +750,11 @@ export function cleanCommandOutput(text: string, fullOutputPath?: string): strin
 
 export default function (pi: any) {
   migrateLegacyMemory();
+
+  // 0. OpenRouter routing switch: reconcile the persisted /or-routing state with
+  // ~/.pi/agent/models.json (pi snapshots models.json once at startup, so this
+  // must land BEFORE the model registry is built). No-op when both agree.
+  reconcileOpenRouterRouting();
 
   // 1. Caveman System Prompt + Memory Injection
   pi.on("before_agent_start", async (event: any, ctx: any) => {
@@ -1466,6 +1487,62 @@ export default function (pi: any) {
         return;
       }
       apply(!webDisabled()); // bare command flips
+    },
+  });
+
+  // 13. OpenRouter routing switch (/or-routing [off | status | <sort> | <json>])
+  //
+  // Like /web-toggle: user-only slash command, persisted state, never a tool.
+  // ON writes providers.openrouter.compat.openRouterRouting into
+  // ~/.pi/agent/models.json (pi sends it as the OpenRouter `provider` request
+  // field — main model picks it up on the next pi start) AND feeds the
+  // direct-HTTP distillation fallback above (applied immediately, per-request).
+  pi.registerCommand("or-routing", {
+    description:
+      "OpenRouter routing prefs (e.g. /or-routing price, /or-routing '{\"only\":[\"deepseek\"]}', /or-routing off, /or-routing status)",
+    handler: async (args: string, ctx: any) => {
+      const trimmed = args?.trim();
+      const apply = (routing: ORRouting | null) => {
+        saveOpenRouterRouting(routing);
+        const res = syncOpenRouterRoutingToModelsJson(routing);
+        const where = res.ok
+          ? "written to ~/.pi/agent/models.json (main model: new pi sessions; web distillation: immediate)"
+          : `models.json update FAILED: ${res.error} (switch state saved; distillation still applies it)`;
+        ctx.ui?.notify?.(
+          routing
+            ? `OpenRouter routing ON: ${canonicalJson(routing)} — ${where}`
+            : `OpenRouter routing OFF (default) — ${where}`,
+          res.ok ? "info" : "error"
+        );
+      };
+
+      if (!trimmed) {
+        // Bare command flips: off → price, on → off (the common mode).
+        apply(loadOpenRouterRouting() ? null : { sort: "price" });
+        return;
+      }
+      const lower = trimmed.toLowerCase();
+      if (lower === "off" || lower === "disable" || lower === "default") {
+        apply(null);
+        return;
+      }
+      if (lower === "status" || lower === "show") {
+        const state = loadOpenRouterRouting();
+        const live = readOpenRouterRoutingFromModelsJson();
+        ctx.ui?.notify?.(
+          `OpenRouter routing switch: ${state ? canonicalJson(state) : "off (default)"}\nmodels.json: ${
+            live ? canonicalJson(live) : "unset"
+          }\n(main model applies on next pi start; distillation applies immediately)`,
+          "info"
+        );
+        return;
+      }
+      const parsed = parseRoutingArg(trimmed);
+      if ("error" in parsed) {
+        ctx.ui?.notify?.(`Invalid routing: ${parsed.error}\nUsage: /or-routing [off | status | <sort-name> | '<json-object>']`, "error");
+        return;
+      }
+      apply(parsed.routing);
     },
   });
 }
