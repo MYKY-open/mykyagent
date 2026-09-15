@@ -12,6 +12,16 @@ import {
   readMemoryEntry,
   writeMemoryEntry,
 } from "./memory.ts";
+import {
+  cleanTasks,
+  formatTaskStatus,
+  listTasks,
+  loadTask,
+  startTask,
+  stopTask,
+  taskOutput,
+  taskStatus,
+} from "./background_tasks.ts";
 import { constants, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { access, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -749,7 +759,7 @@ export default function (pi: any) {
     activeModelInfo = ctx?.getModel?.();
     const webOff = webDisabled();
     try {
-      const allDesired = ["read", "write", "edit", "bash", "grep", "find", "ls", "web_search", "web_fetch", "memory_read", "memory_write", "memory_forget", "memory_list"];
+      const allDesired = ["read", "write", "edit", "bash", "grep", "find", "ls", "web_search", "web_fetch", "memory_read", "memory_write", "memory_forget", "memory_list", "task_start", "task_status", "task_output", "task_stop"];
       const desired = webOff ? allDesired.filter((t) => !WEB_TOOL_NAMES.includes(t)) : allDesired;
       const currentTools = pi.getActiveTools?.() || [];
       const merged = Array.from(new Set([...currentTools, ...desired]));
@@ -775,6 +785,11 @@ export default function (pi: any) {
       "- memory_write: create or update a memory topic (name, one-line summary, body).",
       "- memory_forget: delete a memory topic that is outdated or wrong.",
       "- memory_list: list all memory topics with sizes and dates.",
+      "- task_start: launch a long-running command as a BACKGROUND task and continue working; do not block on builds, downloads, servers, test suites.",
+      "- task_status: check background task(s) - running, done (exit code), or dead.",
+      "- task_output: read a bounded tail of a background task's log (never the whole file).",
+      "- task_stop: terminate a background task.",
+      "- Background task rules: for anything expected to run longer than ~60s, prefer task_start over bash so you stay responsive. Check progress with task_status/task_output instead of guessing. Report the task id and log path to the user.",
       "- read: inspect file chunks (safe default: 250 lines max per call; use offset & limit for large files).",
       "- grep: fast search for regex patterns, function definitions, or errors across files without reading whole files.",
       "- find: locate files and paths by glob or name pattern.",
@@ -1073,6 +1088,96 @@ export default function (pi: any) {
     },
   });
 
+  // 8b. Background task tools -- start long-running commands without blocking,
+  // then poll status and bounded log tails. Metadata persists under
+  // ~/.config/mykyagent/tasks/ so tasks survive an agent restart.
+  pi.registerTool({
+    name: "task_start",
+    label: "Task Start",
+    description:
+      "Launch a long-running shell command as a DETACHED background task and return immediately with a task id. Use for builds, downloads, servers, batch jobs, test suites - anything over ~60s. The command keeps running while you continue other work; check progress later with task_status/task_output.",
+    parameters: Type.Object({
+      command: Type.String({ description: "Shell command to run in the background" }),
+      label: Type.Optional(Type.String({ description: "Short human-readable name for the task (e.g. 'build webapp')" })),
+      cwd: Type.Optional(Type.String({ description: "Working directory for the command (default: current directory)" })),
+    }),
+    async execute(_id: string, { command, label, cwd }: { command: string; label?: string; cwd?: string }, _signal: any, _onUpdate: any, ctx: any) {
+      try {
+        const meta = startTask(command, { label, cwd: cwd || ctx?.cwd });
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Started background task ${meta.id}${meta.label ? ` (${meta.label})` : ""} (pid ${meta.pid}).\n` +
+                `Command: ${meta.command}\nLog: ${meta.log}\n` +
+                `Continue with other work; check progress with task_status(task: "${meta.id}") or task_output(id: "${meta.id}"). ` +
+                `Do NOT re-run the command in bash while the task is running.`,
+            },
+          ],
+        };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `Could not start task: ${e.message}` }], isError: true };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "task_status",
+    label: "Task Status",
+    description:
+      "Check background task state: running, done (with exit code), stopped, or dead. Omit the id to list all tasks.",
+    parameters: Type.Object({
+      task: Type.Optional(Type.String({ description: "Task id to check (omit to list every task)" })),
+    }),
+    async execute(_id: string, { task }: { task?: string }) {
+      if (task) {
+        const meta = loadTask(task);
+        if (!meta) {
+          return { content: [{ type: "text", text: `No task "${task}". Call task_status without an id to list tasks.` }], isError: true };
+        }
+        return { content: [{ type: "text", text: formatTaskStatus(taskStatus(meta)) }] };
+      }
+      const all = listTasks();
+      if (all.length === 0) return { content: [{ type: "text", text: "No background tasks have been started." }] };
+      return { content: [{ type: "text", text: all.map(formatTaskStatus).join("\n") }] };
+    },
+  });
+
+  pi.registerTool({
+    name: "task_output",
+    label: "Task Output",
+    description:
+      "Read the tail of a background task's log (last N lines, capped like the read tool). Use this instead of reading the log file directly - it never floods the context.",
+    parameters: Type.Object({
+      id: Type.String({ description: "Task id" }),
+      lines: Type.Optional(Type.Number({ description: "How many trailing lines to return (default 50, max 250)" })),
+    }),
+    async execute(_id: string, { id, lines }: { id: string; lines?: number }) {
+      const out = taskOutput(id, lines ?? 50);
+      if (out === null) {
+        const meta = loadTask(id);
+        if (!meta) return { content: [{ type: "text", text: `No task "${id}".` }], isError: true };
+        return { content: [{ type: "text", text: `Task ${id} has produced no output yet. Log: ${meta.log}` }] };
+      }
+      return { content: [{ type: "text", text: out }] };
+    },
+  });
+
+  pi.registerTool({
+    name: "task_stop",
+    label: "Task Stop",
+    description: "Terminate a background task (SIGTERM, or SIGKILL with force). The whole process group is killed so child processes die too.",
+    parameters: Type.Object({
+      id: Type.String({ description: "Task id" }),
+      force: Type.Optional(Type.Boolean({ description: "SIGKILL instead of SIGTERM (default false)" })),
+    }),
+    async execute(_id: string, { id, force }: { id: string; force?: boolean }) {
+      const res = stopTask(id, !!force);
+      return { content: [{ type: "text", text: res.message }], ...(res.ok ? {} : { isError: true }) };
+    },
+  });
+
   // 9. Safe Read Tool (Protected chunk reading: default 250 lines, max 500 lines or 15KB per call)
   pi.registerTool({
     name: "read",
@@ -1316,6 +1421,26 @@ export default function (pi: any) {
           "info"
         );
       }
+    },
+  });
+
+  // 11b. Background tasks slash command (/tasks [clean]) -- user-facing view of
+  // what the agent has launched in the background.
+  pi.registerCommand("tasks", {
+    description: "List background tasks (e.g. /tasks, /tasks clean)",
+    handler: async (args: string, ctx: any) => {
+      const trimmed = args?.trim().toLowerCase();
+      if (trimmed === "clean") {
+        const removed = cleanTasks();
+        ctx.ui?.notify?.(removed.length ? `Cleaned ${removed.length} finished task(s): ${removed.join(", ")}` : "Nothing to clean.", "info");
+        return;
+      }
+      const all = listTasks();
+      if (all.length === 0) {
+        ctx.ui?.notify?.("No background tasks.", "info");
+        return;
+      }
+      ctx.ui?.notify?.(all.map(formatTaskStatus).join("\n"), "info");
     },
   });
 

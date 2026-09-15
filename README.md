@@ -9,6 +9,7 @@ A lightweight, crash-proof agent overlay for small local reasoning models (like 
 - **Safe Local Code Inspection**: Guardrailed `read` tool enforcing 250-line chunks (max 15KB) to prevent 10,000-line files or logs from flooding local context. Automatic `grep`, `find`, and `ls` activation.
 - **Customizable Personas**: In-chat `/persona` slash command with presets (`caveman`, `senior`, `cyberpunk`, `pirate`, `butler`, `academic`, or `custom`) saved to `~/.config/mykyagent/persona.json`.
 - **Persistent Memory (index + on-demand)**: Topic files under `~/.config/mykyagent/memory/`. Only a one-line summary per topic is injected into the system prompt; bodies load via `memory_read` when relevant. `memory_write` / `memory_read` / `memory_forget` / `memory_list`.
+- **Background Tasks**: Long-running commands (builds, downloads, servers, test suites) launched detached with `task_start`; the agent keeps working and polls `task_status` / bounded `task_output` tails, or kills with `task_stop`. `/tasks` lists them; metadata survives restarts under `~/.config/mykyagent/tasks/`.
 - **Ultra Portable**: Clean TypeScript overlay with zero local `node_modules`.
 
 ## Quickstart
@@ -279,6 +280,41 @@ is **scoping**, not similarity ranking - a per-topic index scoped by name solves
 outright. Embeddings would add `onnxruntime` plus a 100-400MB model to replace a
 directory listing. Do not re-litigate without new evidence.
 
+## Background Tasks
+
+The plain `bash` tool blocks the agent's whole turn, and a long build/download
+would tie it up while progress spam floods the context. Background tasks invert
+that: the command runs detached and outlives the tool call, output goes to a
+log file, and the agent checks back with bounded reads.
+
+| Tool | Purpose |
+| --- | --- |
+| `task_start` | spawn a command detached (own process group), return id + log path immediately |
+| `task_status` | state of one task or all: `running` / `done` (exit 0) / `stopped` (non-zero) / `dead` |
+| `task_output` | tail of the log - last N lines (default 50, max 250), 15KB byte cap, earlier lines summarised away |
+| `task_stop` | SIGTERM the whole process group (`force: true` for SIGKILL); writes a recorded exit code so the state resolves |
+
+Design notes:
+
+- **Detached + unref'd**: the task survives the tool call, the turn, and even the
+  agent process. `/tasks` lists what is out there after a restart.
+- **Exit code via marker file**: the spawned wrapper writes `~/.config/mykyagent/tasks/<id>.exit`
+  on normal completion, and `task_stop` writes the code for kills - so `done` vs
+  `still running` vs `died hard` stays distinguishable even though nothing keeps
+  a node process attached.
+- **Zombie trap handled**: detached children are only reaped when the spawning
+  agent exits, so `kill(pid, 0)` keeps succeeding on a finished task. `pidAlive`
+  treats a `Z` state in `/proc/<pid>/stat` as dead.
+- **Bounded output**: nothing from a task log reaches the context until the agent
+  asks for a tail, and the tail is capped exactly like the `read` tool.
+
+In-chat: `/tasks` lists all tasks, `/tasks clean` removes finished tasks older
+than 24h (metadata + log + marker).
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `MYKYAGENT_TASKS_DIR` | `~/.config/mykyagent/tasks` | Task metadata/log/marker location |
+
 ## Tests
 
 ### Offline - `./run_tests.sh`
@@ -288,6 +324,7 @@ Everything here runs without a network:
 | Suite | Assertions | Covers |
 | --- | --- | --- |
 | `memory.test.ts` | 34 | slug/path safety, caps, index, migration, injection guard |
+| `background_tasks.test.ts` | 31 | real-process lifecycle: start returns before completion, exit markers, kill, bounded tails, clean |
 | `search_hops.test.ts` | 22 | multi-hop control flow, `FOLLOWUP` parsing |
 | `search_helper.py unit` | 51 | charset decoding, title extraction, block truncation, intent, nav, fields, conflicts |
 
