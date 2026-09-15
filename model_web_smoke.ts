@@ -232,7 +232,12 @@ console.log("--- 12. web-toggle: status, off, before_agent_start merge, on ---")
   console.log("  active tools after on:", toolState.active.join(","));
   const res2 = await hooks["before_agent_start"]({}, ctxB);
   const sp2: string = res2?.systemPrompt || "";
-  console.log("  prompt has web_search line again:", sp2.includes("- web_search:"));
+  console.log(
+    "  web tools re-activated:",
+    toolState.active.includes("web_search") && toolState.active.includes("web_fetch"),
+    "| prompt drops DISABLED note:", !sp2.includes("DISABLED"),
+    "| cwd line present:", sp2.includes("Working Directory: ")
+  );
 
   console.log("--- 12b. killswitch survives a RESTART (fresh session defaults) ---");
   await commands["web-toggle"].handler("off", ctxB);
