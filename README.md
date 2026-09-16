@@ -82,6 +82,46 @@ model is told to answer from memory instead of attempting web lookups.
 
 ---
 
+## MCP Adapter (agent-controlled)
+
+The agent can connect to MCP (Model Context Protocol) servers itself:
+
+* `mcp_connect` — connect via **stdio** (`{command, args}` — spawn a local
+  server) or **streamable HTTP** (`{host, port, path?}` — remote server).
+  Every discovered tool is registered as `mcp_<server>_<tool>` immediately.
+* `mcp_disconnect` — drop a server, remove its tools, forget its config.
+* `mcp_list` — connected servers + tool inventory + killswitch state.
+
+Connections persist in `~/.config/mykyagent/mcp.json` and auto-reconnect on
+startup. Only servers the user asked for should ever be connected; MCP output
+is treated as untrusted external content and capped at
+`MYKYAGENT_MCP_RESULT_BYTES` (default 8000).
+
+**Global killswitch (user-only):**
+* `/mcp-toggle` — flip the whole adapter on/off
+* `/mcp-toggle off` — removes every `mcp_*` tool AND tears down all server sessions
+* `/mcp-toggle status` — current state
+
+Persisted in `~/.config/mykyagent/mcpkill.json`; survives restarts. Disabling
+is total: the three builtins, all discovered tools, and the sessions behind
+them all go away in one flip.
+
+Transport notes: stdio servers are newline-delimited JSON-RPC child processes
+(chrome-devtools-mcp, filesystem, ...); HTTP servers follow the MCP streamable
+HTTP transport (JSON or SSE responses, `mcp-session-id` header). Server stderr
+is discarded unless `MYKYAGENT_MCP_LOG` names a log file. Tests: `mcp.test.ts`
+(offline, fake transports) + `./run_mcp_smoke.sh` (live, against a real
+chrome-devtools-mcp bridging a browser on `127.0.0.1:9222`).
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `MYKYAGENT_MCP_RESULT_BYTES` | `8000` | Cap on a single MCP tool result |
+| `MYKYAGENT_MCP_INIT_TIMEOUT` | `45000` | initialize + tools/list timeout (npx cold starts are slow) |
+| `MYKYAGENT_MCP_CALL_TIMEOUT` | `120000` | Per tools/call timeout (browser automation is slow) |
+| `MYKYAGENT_MCP_LOG` | unset | If set, server stderr appended to this file |
+
+---
+
 ## Web Search Architecture
 
 The `web_search` / `web_fetch` tools drive `search_helper.py`, a PEP 723 script

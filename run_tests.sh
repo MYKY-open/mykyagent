@@ -38,8 +38,15 @@ else
     for f in "${TS_TESTS[@]}"; do
         name="$(basename "$f" .ts)"
         echo "=== $name ==="
-        out="$TMPOUT/$name.mjs"
-        if ! "$ESBUILD" "$f" --bundle --platform=node --format=esm --outfile="$out" >/dev/null; then
+        # Bundled into the repo dir (like run_e2e.sh) so --external imports of
+        # @earendil-works/* resolve against $DIR/node_modules at runtime.
+        out="$DIR/.tests.gen/$name.mjs"
+        mkdir -p "$DIR/.tests.gen"
+        if ! "$ESBUILD" "$f" --bundle --platform=node --format=esm \
+            --alias:@sinclair/typebox="$DIR/typebox_stub.ts" \
+            --external:@earendil-works/pi-tui \
+            --external:@earendil-works/pi-coding-agent \
+            --outfile="$out" >/dev/null; then
             echo "  BUILD FAILED"
             rc=1
             continue
@@ -47,7 +54,7 @@ else
         node "$out" || rc=1
         echo
     done
-    rm -rf "$TMPOUT"
+    rm -rf "$DIR/.tests.gen"
 fi
 
 # --- Python unit tests ------------------------------------------------------
