@@ -136,7 +136,7 @@ PAGE_TTL_FRESH = 900
 CONNECT_TIMEOUT = 5
 READ_TIMEOUT = 15
 MAX_HTML_BYTES = 3_000_000
-HARD_TEXT_CAP = 60_000
+HARD_TEXT_CAP = 300_000
 # Per-page character budget handed to the summariser. This is the single
 # biggest lever on token spend.
 PAGE_BUDGET = int(os.environ.get("MYKYAGENT_PAGE_BUDGET", "2200"))
@@ -203,6 +203,18 @@ DOMAIN_PENALTY = (
     "linkedin.com",
     "facebook.com",
     "reddit.com",
+)
+
+# Hosts whose pages cannot be read without a logged-in JS app. Snippets may
+# surface them but the fetched content is an empty shell.
+_WALL_HOSTS = (
+    "twitter.com",
+    "x.com",
+    "instagram.com",
+    "facebook.com",
+    "tiktok.com",
+    "threads.net",
+    "threads.com",
 )
 
 # Commercial hosting companies and tutorial farms dominate page 1 for any
@@ -538,6 +550,49 @@ def tok(s: str) -> list[str]:
     return _TOKEN.findall(s.lower())
 
 
+# Search-operator tokens a summariser may sprinkle into a followup query
+# ("site:news OR site:twitter.com"). They mean something to the SERP engine but
+# poison ranking: the operator payloads become "query words" and a page titled
+# "twitter.com releases" then scores as a perfect match.
+_SEARCH_OPS_RE = re.compile(
+    r"(?:^|\s)(?:site|inurl|inanchor|intitle|intext|filetype|related|cache|after|before|lang|tld):\S*",
+    re.I,
+)
+_BARE_OP_RE = re.compile(r"(?:^|\s)(?:AND|OR|NOT|XOR)(?=\s|$)", re.I)
+
+
+def clean_q(query: str) -> str:
+    """Strip search operators + bare boolean words for ranking/nav use.
+
+    The raw query still goes to the SERP engines (site: filters are useful
+    there); everything downstream that compares query tokens against page
+    text must use the cleaned form.
+    """
+    if not query:
+        return query
+    q = _SEARCH_OPS_RE.sub(" ", query)
+    q = _BARE_OP_RE.sub(" ", q)
+    return re.sub(r"\s+", " ", q).strip()
+
+
+_TOC_LINE_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+|^\s*\d+:\d{2}\b")
+_SHORT_HEAD_RE = re.compile(r"^#{1,6} ")
+
+
+def _is_toc_block(block: str) -> bool:
+    """A block made of bullets / timestamp links / tiny lines = nav junk."""
+    lines = [l for l in block.splitlines() if l.strip()]
+    if not lines or len(block) > 300:
+        return False
+    for l in lines:
+        if _TOC_LINE_RE.match(l):
+            continue
+        if _SHORT_HEAD_RE.match(l) or len(l) < 60:
+            continue
+        return False
+    return True
+
+
 def bm25_scores(query: str, docs: list[str], k1: float = 1.5, b: float = 0.75) -> list[float]:
     n = len(docs)
     if n == 0:
@@ -802,6 +857,9 @@ _NAV_JUNK = (
     "you signed in with another tab",
     "reload to refresh your session",
     "you signed out in another tab",
+    "log in](",
+    "sign up](",
+    "redirect_after_login",
     "clone via https",
     "dismiss alert",
     "skip to content",
@@ -828,31 +886,113 @@ def split_blocks(text: str) -> list[str]:
     return blocks
 
 
-def head_blocks(text: str, budget: int) -> str:
+def _split_toc_prefix(block: str) -> list[str]:
+    """Giant single blocks (transcripts, dumps) often START with a ToC/nav run.
+
+    A 250KB podcast transcript is one block because the body uses single
+    newlines. Cut the leading ToC/nav lines so BM25 and the window cut see the
+    actual content instead of "1. Introduction ... 24. Politics".
+    """
+    if len(block) <= 8000:
+        return [block]
+    lines = block.split("\n")
+    i = 0
+    while i < len(lines) and (
+        _TOC_LINE_RE.match(lines[i])
+        or _SHORT_HEAD_RE.match(lines[i])
+        or len(lines[i]) < 60
+    ):
+        i += 1
+    rest = "\n".join(lines[i:])
+    if not i or len(rest) < 500:
+        return [block]
+    return [rest]
+
+
+def _window_cut(block: str, query: str, budget: int) -> str:
+    """Cut an oversized block at the best query-matching window, not the start.
+
+    Podcast transcripts, giant issue dumps and scraped one-block pages put a
+    navigation/ToC prefix in the same block as the body. A naive
+    `block[:budget]` then returns the ToC every time. Sliding a budget-sized
+    window over the block and keeping the one with the highest query-token
+    overlap lands the cut inside the region that actually answers the query.
+    """
+    if len(block) <= budget:
+        return block
+    qt = {w for w in tok(query) if w not in _STOP}
+    if not qt:
+        return block[:budget]
+    step = max(1, budget // 4)
+    best, best_off = -1.0, 0
+    for off in range(0, len(block) - budget + 1, step):
+        win = set(tok(block[off : off + budget]))
+        sc = len(qt & win) / len(qt)
+        if sc > best:
+            best, best_off = sc, off
+        if best >= 0.999:
+            break
+    return block[best_off : best_off + budget]
+
+
+def head_blocks(text: str, budget: int, skip_nav: bool = False) -> str:
     """Keep whole blocks from the top of the document until the budget is full.
 
     Used when there is no query to rank against. A raw `text[:budget]` cut lands
     mid-sentence or halfway through a code fence, which is both ugly and lossy.
+
+    With skip_nav=True (BM25 fallback on a long doc), leading table-of-contents
+    and nav blocks are dropped first. Filling the budget with "1. Introduction
+    ... 24. Politics and immigration" links tells the summariser nothing and
+    reads as a failed extraction.
     """
     if not text or budget <= 0:
         return ""
     if len(text) <= budget:
         return text
 
+    if skip_nav and len(text) > budget * 2:
+        blocks = split_blocks(text)
+        total = len(text)
+        skipped = 0
+        i = 0
+        while i < len(blocks) and skipped < total * 0.6:
+            if _is_toc_block(blocks[i]):
+                skipped += len(blocks[i]) + 2
+                i += 1
+            else:
+                break
+        # Keep a reasonable remainder; never strip everything.
+        rest = "\n\n".join(blocks[i:]) if i else ""
+        if i and i < len(blocks) and len(rest) >= max(300, budget * 0.4):
+            text = rest
+
     out: list[str] = []
     used = 0
     for b in split_blocks(text):
         if out and used + len(b) + 2 > budget:
+            # A block that does not fit is normally dropped whole. But after a
+            # skip_nav strip the remainder is often one giant prose wall (a
+            # podcast transcript body is a single block) -- dropping it would
+            # leave only headings. Cut an oversized block to fill the budget.
+            room = budget - used
+            if len(b) > budget * 0.5 and room >= 120:
+                cut = b[:room]
+                nl = cut.rfind("\n")
+                out.append(cut[:nl] if nl > 100 else cut)
             break
         out.append(b)
         used += len(b) + 2
 
     joined = "\n\n".join(out).strip() or text
     if len(joined) > budget:
-        # One oversized block (usually a single code fence): cut on a line break.
+        # One oversized block (usually a single code fence): cut on a line
+        # break -- but only if the break is deep inside the budget. A doc like
+        # "heading\n\ngiant-one-line-body" would otherwise cut at the heading
+        # boundary and discard the entire body.
         cut = joined[:budget]
         nl = cut.rfind("\n")
-        joined = cut[:nl] if nl > 0 else cut
+        joined = cut[:nl] if nl > budget * 0.5 else cut
     return joined.strip()
 
 
@@ -876,10 +1016,18 @@ def select_blocks(text: str, query: str | None, budget: int, enum_mode: bool = F
     if not clean:
         clean = blocks
 
+    # One giant block defeats BM25 (whole doc = one score) and the window cut
+    # would land on its ToC prefix. Explode that prefix first.
+    if any(len(b) > 8000 for b in clean):
+        expanded: list[str] = []
+        for b in clean:
+            expanded.extend(_split_toc_prefix(b))
+        clean = expanded
+
     base = bm25_scores(query, clean)
     if not any(base):
         # No lexical overlap at all: fall back to document order.
-        return head_blocks(text, budget)
+        return head_blocks(text, budget, skip_nav=True)
 
     max_base = max(base) or 1.0
 
@@ -909,7 +1057,7 @@ def select_blocks(text: str, query: str | None, budget: int, enum_mode: bool = F
         scored.append((eff + bonus, i, blk))
 
     if not scored:
-        return head_blocks(text, budget)
+        return head_blocks(text, budget, skip_nav=True)
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
@@ -931,7 +1079,7 @@ def select_blocks(text: str, query: str | None, budget: int, enum_mode: bool = F
             room = budget - used
             if room < 220:
                 continue
-            blk = blk[:room] + "\n…"
+            blk = _window_cut(blk, query, room) + "\n…"
             used = budget
             picked.append((idx, blk))
             break
@@ -989,6 +1137,11 @@ def _prior(url: str) -> float:
         pass
     if _is_farm(url):
         s -= 3.0
+    # JS-walled hosts: requests gets an empty shell, the browser pass gets a
+    # login wall. They still crowd page 1 of SERPs for people-shaped queries,
+    # so rank them below everything that can actually be read.
+    if any(d == h or d.endswith("." + h) for h in _WALL_HOSTS):
+        s -= 4.0
     for bad in DOMAIN_PENALTY:
         if bad in d:
             s -= 1.2
@@ -2024,6 +2177,10 @@ def research(query: str) -> dict:
         ck["cached"] = True
         return ck
 
+    # Operators belong to the SERP engines only. Ranking, nav detection and
+    # block selection must see plain query words (see clean_q docstring).
+    query_c = clean_q(query)
+
     _t = time.monotonic()
     results, variants, engines = fused_search(query, fresh=recency)
     timings["serp"] = round(time.monotonic() - _t, 2)
@@ -2035,7 +2192,7 @@ def research(query: str) -> dict:
     }
 
     # --- navigational: honour the site the user named ----------------------
-    nav = nav_host(query, results)
+    nav = nav_host(query_c, results)
     if nav:
         results.append(
             {
@@ -2060,7 +2217,7 @@ def research(query: str) -> dict:
                 )
         stats["nav_domain"] = nav
 
-    qt = {w for w in tok(query) if w not in _STOP}
+    qt = {w for w in tok(query_c) if w not in _STOP}
 
     def _rank(pool: list[dict]) -> list[tuple[float, dict]]:
         out: list[tuple[float, dict]] = []
@@ -2089,7 +2246,7 @@ def research(query: str) -> dict:
     # repo we ask about the one the query is actually about.
     _t = time.monotonic()
     structured = _filter_structured(
-        gather_providers(query, [r["url"] for _, r in ranked], nav, recency), query
+        gather_providers(query_c, [r["url"] for _, r in ranked], nav, recency), query_c
     )
     timings["providers"] = round(time.monotonic() - _t, 2)
 
@@ -2162,7 +2319,7 @@ def research(query: str) -> dict:
         for r in picked:
             if futs and out_of_time(reserve):
                 break
-            futs[ex.submit(fetch, r["url"], query, None, page_budget, page_ttl, enumeration)] = r["url"]
+            futs[ex.submit(fetch, r["url"], query_c, None, page_budget, page_ttl, enumeration)] = r["url"]
         try:
             for f in as_completed(futs, timeout=max(1.0, min(30.0, remaining() - reserve * 0.6))):
                 try:
@@ -2203,7 +2360,7 @@ def research(query: str) -> dict:
                         if out_of_time(reserve * 0.75):
                             break
                         res = _fetch_browser(
-                            r["url"], query, browser=b, budget=page_budget, enum_mode=enumeration
+                            r["url"], query_c, browser=b, budget=page_budget, enum_mode=enumeration
                         )
                         if res and not res.get("error") and len(res.get("text", "").strip()) >= 120:
                             fetched[res["url"]] = res
@@ -2338,7 +2495,7 @@ def research(query: str) -> dict:
                     if out_of_time(20):
                         break
                     res = fetch(
-                        r["url"], query, None, page_budget, PAGE_TTL_FRESH, enumeration
+                        r["url"], query_c, None, page_budget, PAGE_TTL_FRESH, enumeration
                     )
                     if res and not res.get("error") and len(res.get("text", "").strip()) >= 120:
                         pages.append(
@@ -2507,6 +2664,45 @@ def unit() -> dict:
     ck("head_blocks: short input untouched", head_blocks("tiny", 100) == "tiny")
     ck("head_blocks: empty input", head_blocks("", 100) == "")
     ck("head_blocks: zero budget", head_blocks("abc", 0) == "")
+
+    # --- operator stripping -------------------------------------------------
+    ck("clean_q: strips site: operators", clean_q('dhh "wolves" reaction site:news OR site:twitter.com') == 'dhh "wolves" reaction', clean_q('dhh "wolves" reaction site:news OR site:twitter.com'))
+    ck("clean_q: strips bare OR/AND/NOT", clean_q("hypergamy OR marriage NOT twitter") == "hypergamy marriage twitter", clean_q("hypergamy OR marriage NOT twitter"))
+    ck("clean_q: keeps plain query", clean_q("best python orm 2026") == "best python orm 2026")
+    ck("clean_q: inurl/intitle too", clean_q("foo inurl:admin intitle:login") == "foo", clean_q("foo inurl:admin intitle:login"))
+    ck("clean_q: empty", clean_q("") == "")
+
+    # --- TOC-skipping head fallback -----------------------------------------
+    _toc_bullets = "\n\n".join(f"- {n}. Chapter number {n}" for n in range(1, 40))
+    _toc_body = "Real prose body text about dating apps and coupling. " * 30
+    toc_doc = (
+        "# Transcript for a Show\nThis is a transcript of a show.\n\n"
+        + "## Contents\n" + _toc_bullets
+        + "\n\n## Chapter 1\n" + _toc_body
+    )
+    skipped = head_blocks(toc_doc, 600, skip_nav=True)
+    ck("head_blocks skip_nav: drops leading ToC", "Chapter number 12" not in skipped and "dating apps" in skipped, skipped[:200])
+    plain = head_blocks(toc_doc, 600)
+    ck("head_blocks plain: keeps top of doc", "Contents" in plain or "Transcript" in plain, plain[:120])
+    ck("head_blocks skip_nav: short doc untouched", head_blocks("tiny doc", 600, skip_nav=True) == "tiny doc")
+    toc_only = "# Title\n\n" + "\n\n".join(f"- item {n}" for n in range(30)) + "\n\n" + "body " * 40
+    ck("head_blocks skip_nav: never strips everything", len(head_blocks(toc_only, 50, skip_nav=True)) > 0)
+
+    # --- oversized-block window cut -----------------------------------------
+    giant = "Contents\n" + "\n".join(f"- {n}. filler heading" for n in range(1, 60)) + "\n" + (
+        "Talk about programming and agents. " * 40
+        + "Now we discuss dating apps and traditional marriage. " * 20
+        + "More programming filler text here. " * 40
+    )
+    sel = select_blocks(giant, "dating apps traditional marriage", 300)
+    ck("window cut: lands on matching region", "dating apps" in sel, repr(sel[:120]))
+    sel2 = select_blocks("no overlap at all with query", "dating apps marriage", 100)
+    ck("window cut: no-query-token block still returns text", len(sel2) > 0, repr(sel2))
+
+    # --- wall-host penalty ---------------------------------------------------
+    ck("prior: twitter penalised", _prior("https://twitter.com/releases") <= -4.0, _prior("https://twitter.com/releases"))
+    ck("prior: x.com penalised", _prior("https://x.com/dhh/status/123") <= -4.0, _prior("https://x.com/dhh/status/123"))
+    ck("prior: normal host untouched", _prior("https://example.com/post") == 0.0, _prior("https://example.com/post"))
     big_code = "```\n" + "\n".join(f"line{i:03d}" for i in range(200)) + "\n```"
     hb = head_blocks(big_code, 200)
     ck("head_blocks: oversized block cut on a line break", len(hb) <= 200 and hb.endswith(tuple("0123456789")), repr(hb[-20:]))
