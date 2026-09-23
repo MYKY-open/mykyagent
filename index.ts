@@ -1,6 +1,7 @@
 import { Type } from "@sinclair/typebox";
 import { execFile } from "node:child_process";
 import { ModelSelectorComponent } from "@earendil-works/pi-coding-agent";
+import { fuzzyFilter, type AutocompleteItem } from "@earendil-works/pi-tui";
 import { runSearchHops, type ResearchPayload } from "./search_hops.ts";
 import { recoverLeakedToolCalls } from "./tool_recovery.ts";
 import {
@@ -20,15 +21,12 @@ import {
   writeMemoryEntry,
 } from "./memory.ts";
 import {
-  canonicalJson,
-  loadOpenRouterRouting,
-  parseRoutingArg,
-  readOpenRouterRoutingFromModelsJson,
-  reconcileOpenRouterRouting,
-  saveOpenRouterRouting,
-  syncOpenRouterRoutingToModelsJson,
-  type ORRouting,
-} from "./or_routing.ts";
+  addVariant,
+  listVariants,
+  parseTarget,
+  removeVariant,
+  suffixHints,
+} from "./model_variants.ts";
 import { constants, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { access, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -161,6 +159,89 @@ function setWebDisabled(disabled: boolean): void {
 let activeModelInfo: any = null;
 let cachedLocalModelName: string | null = null;
 const warnedMissingWebModels = new Set<string>();
+
+// --- Slash-command argument autocompletion -----------------------------------
+// getArgumentCompletions callbacks receive only the argument prefix (no ctx),
+// so the model registry is stashed here from the first hook/command that has
+// one (before_agent_start fires before any command in practice). The suffix
+// completions for /model-variant add don't need the registry at all.
+let completionRegistry: any = null;
+function noteCompletionRegistry(ctx: any): void {
+  if (ctx?.modelRegistry && ctx.modelRegistry !== completionRegistry) {
+    completionRegistry = ctx.modelRegistry;
+  }
+}
+
+/** Fuzzy-complete openrouter base ids for "/model-variant add <prefix>".
+ *  Value includes the "add " subcommand — pi replaces the WHOLE argument text
+ *  with item.value on accept. Falls back to models.json variants only when no
+ *  registry has been captured yet. */
+function completeVariantBases(rest: string): AutocompleteItem[] | null {
+  const seen = new Set<string>();
+  const items: { id: string; name?: string }[] = [];
+  for (const m of completionRegistry?.getAvailable?.() ?? []) {
+    if (m?.provider !== "openrouter" || typeof m?.id !== "string" || seen.has(m.id)) continue;
+    seen.add(m.id);
+    items.push({ id: m.id, name: m.name });
+  }
+  for (const v of listVariants()) {
+    const base = v.id.slice(0, v.id.lastIndexOf(":"));
+    if (!seen.has(base)) {
+      seen.add(base);
+      items.push({ id: base, name: v.name });
+    }
+  }
+  if (!items.length) return null;
+  const filtered = fuzzyFilter(items, rest, (i: any) => `${i.id} ${i.name ?? ""}`);
+  if (!filtered.length) return null;
+  return filtered.map((i: any) => ({ value: `add ${i.id}`, label: i.id, ...(i.name ? { description: i.name } : {}) }));
+}
+
+/** Fuzzy-complete provider ids for "/model-refresh <prefix>". */
+function completeProviders(rest: string): AutocompleteItem[] | null {
+  const ids = new Set<string>();
+  for (const m of completionRegistry?.getAvailable?.() ?? []) {
+    if (typeof m?.provider === "string") ids.add(m.provider);
+  }
+  for (const id of completionRegistry?.getRegisteredProviderIds?.() ?? []) {
+    if (typeof id === "string") ids.add(id);
+  }
+  const items = [...ids].sort().map((id) => ({ id }));
+  if (!items.length) return null;
+  const filtered = fuzzyFilter(items, rest, (i: any) => i.id);
+  return filtered.length ? filtered.map((i: any) => ({ value: i.id, label: i.id })) : null;
+}
+
+/** Fuzzy-complete provider/model for "/model-web set <prefix>".
+ *  Search text mirrors pi's own /model completion (provider, provider/id, id,
+ *  name) so "openrouter/z-ai" matches the same way. */
+function completeModelWebSet(rest: string): AutocompleteItem[] | null {
+  const models = completionRegistry?.getAvailable?.() ?? [];
+  if (!models.length) return null;
+  const items = models.map((m: any) => ({ provider: m.provider, id: m.id, name: m.name }));
+  const filtered = fuzzyFilter(items, rest, (i: any) => `${i.provider} ${i.provider}/${i.id} ${i.id} ${i.name ?? ""}`);
+  if (!filtered.length) return null;
+  return filtered.map((i: any) => ({ value: `set ${i.provider}/${i.id}`, label: i.id, description: i.provider }));
+}
+
+/** Suffix completions for "/model-variant add <base>:<partial>".
+ *  Known suffixes first (with notes); a full base id with no suffix typed yet
+ *  is NOT offered (colon must come from the user's keyboard). */
+function completeVariantSuffixes(rest: string): AutocompleteItem[] | null {
+  const colon = rest.lastIndexOf(":");
+  if (colon < 0) return null;
+  const base = rest.slice(0, colon);
+  const partial = rest.slice(colon + 1).toLowerCase();
+  const hints = suffixHints();
+  const matches = Object.entries(hints)
+    .filter(([suffix]) => suffix.startsWith(partial.toLowerCase()))
+    .map(([suffix, hint]) => ({
+      value: `add ${base}:${suffix}`,
+      label: `:${suffix}`,
+      ...(hint?.note ? { description: hint.note } : {}),
+    }));
+  return matches.length ? matches : null;
+}
 
 export function getLocalApiKey(): string {
   if (process.env.MYKYAGENT_API_KEY) return process.env.MYKYAGENT_API_KEY;
@@ -539,13 +620,7 @@ async function distillWithSubagent(
   }
 
   try {
-    // /or-routing state → OpenRouter `provider` request field (upstream provider
-    // selection/sorting, e.g. {"sort":"price"}). Read per-request so a switch
-    // flip applies to the next distillation sub-call without a restart.
-    const openRouterRouting: ORRouting | null =
-      isCloudOpenRouter && openrouterKey ? loadOpenRouterRouting() : null;
     const payload = JSON.stringify({
-      ...(openRouterRouting ? { provider: openRouterRouting } : {}),
       model: modelName,
       messages: [
         {
@@ -748,13 +823,9 @@ export function cleanCommandOutput(text: string, fullOutputPath?: string): strin
 export default function (pi: any) {
   migrateLegacyMemory();
 
-  // 0. OpenRouter routing switch: reconcile the persisted /or-routing state with
-  // ~/.pi/agent/models.json (pi snapshots models.json once at startup, so this
-  // must land BEFORE the model registry is built). No-op when both agree.
-  reconcileOpenRouterRouting();
-
   // 1. Caveman System Prompt + Memory Injection
   pi.on("before_agent_start", async (event: any, ctx: any) => {
+    noteCompletionRegistry(ctx);
     activeModelInfo = ctx?.getModel?.();
     const webOff = webDisabled();
     try {
@@ -1353,6 +1424,23 @@ export default function (pi: any) {
   // untouched and managed by pi's built-in /model command.
   pi.registerCommand("model-web", {
     description: "Set model for web_search/web_fetch distillation (e.g. /model-web set llama-local/Qwen3.5-9B, /model-web list, /model-web clear)",
+    getArgumentCompletions: (argumentText: string) => {
+      const trimmed = argumentText.trim();
+      if (!trimmed || !argumentText.includes(" ")) {
+        const subs = [
+          { value: "list", label: "list", description: "show override + available models" },
+          { value: "set", label: "set", description: "set distillation model" },
+          { value: "clear", label: "clear", description: "follow main model" },
+        ];
+        const filtered = argumentText.trim() ? fuzzyFilter(subs, trimmed, (s: any) => s.label) : subs;
+        return filtered.length ? filtered : null;
+      }
+      if (argumentText.startsWith("set ")) {
+        const rest = argumentText.slice(4);
+        return completeModelWebSet(rest);
+      }
+      return null;
+    },
     handler: async (args: string, ctx: any) => {
       const trimmed = args?.trim();
       const registry = ctx?.modelRegistry;
@@ -1552,59 +1640,160 @@ export default function (pi: any) {
     },
   });
 
-  // 13. OpenRouter routing switch (/or-routing [off | status | <sort> | <json>])
+  // 13b. Model refresh (/model-refresh [provider ...])
   //
-  // Like /web-toggle: user-only slash command, persisted state, never a tool.
-  // ON writes providers.openrouter.compat.openRouterRouting into
-  // ~/.pi/agent/models.json (pi sends it as the OpenRouter `provider` request
-  // field — main model picks it up on the next pi start) AND feeds the
-  // direct-HTTP distillation fallback above (applied immediately, per-request).
-  pi.registerCommand("or-routing", {
+  // pi snapshots models.json and provider model lists once at startup. This
+  // re-runs that load live: re-reads ~/.pi/agent/models.json (hand edits land
+  // immediately) and re-fetches provider model lists
+  // when network is allowed. `force` bypasses provider freshness checks so the
+  // command always does real work instead of silently no-oping.
+  pi.registerCommand("model-refresh", {
     description:
-      "OpenRouter routing prefs (e.g. /or-routing price, /or-routing '{\"only\":[\"deepseek\"]}', /or-routing off, /or-routing status)",
+      "Reload provider models (re-read models.json + refetch provider lists). e.g. /model-refresh, /model-refresh openrouter llama-local",
+    getArgumentCompletions: (argumentText: string) => {
+      return completeProviders(argumentText);
+    },
     handler: async (args: string, ctx: any) => {
-      const trimmed = args?.trim();
-      const apply = (routing: ORRouting | null) => {
-        saveOpenRouterRouting(routing);
-        const res = syncOpenRouterRoutingToModelsJson(routing);
-        const where = res.ok
-          ? "written to ~/.pi/agent/models.json (main model: new pi sessions; web distillation: immediate)"
-          : `models.json update FAILED: ${res.error} (switch state saved; distillation still applies it)`;
+      noteCompletionRegistry(ctx);
+      const registry = ctx?.modelRegistry;
+      if (!registry || typeof registry.refresh !== "function") {
+        ctx.ui?.notify?.("No model registry available in this context.", "error");
+        return;
+      }
+      const providers = args?.trim() ? args.trim().split(/[\s,]+/).filter(Boolean) : undefined;
+      const before = registry.getAvailable?.()?.length ?? 0;
+      try {
+        const res = await registry.refresh({ allowNetwork: true, force: true, providers });
+        // Force re-probe of the local llama-server model id on next use.
+        cachedLocalModelName = null;
+        const after = registry.getAvailable().length;
+        const errLines: string[] = [];
+        if (res?.errors) {
+          for (const [p, e] of res.errors as ReadonlyMap<string, Error>) {
+            errLines.push(`  ${p}: ${e?.message ?? String(e)}`);
+          }
+        }
+        const cfgErr = registry.getError?.();
+        if (cfgErr) errLines.push(`  models.json: ${cfgErr}`);
         ctx.ui?.notify?.(
-          routing
-            ? `OpenRouter routing ON: ${canonicalJson(routing)} — ${where}`
-            : `OpenRouter routing OFF (default) — ${where}`,
-          res.ok ? "info" : "error"
+          [
+            `Model refresh done: ${before} → ${after} available models.`,
+            ...(providers ? [`Providers: ${providers.join(", ")}`] : []),
+            ...(errLines.length ? ["Errors:", ...errLines] : []),
+            "(session model unchanged — /model-web list shows what is now available)",
+          ].join("\n"),
+          errLines.length ? "warning" : "info"
         );
-      };
+      } catch (err: any) {
+        ctx.ui?.notify?.(`Model refresh failed: ${err?.message ?? String(err)}`, "error");
+      }
+    },
+  });
 
-      if (!trimmed) {
-        // Bare command flips: off → price, on → off (the common mode).
-        apply(loadOpenRouterRouting() ? null : { sort: "price" });
+  // 13c. OpenRouter model variants (/model-variant add|list|remove)
+  //
+  // OpenRouter variant suffixes (":floor", ":nitro", ":free", ...) are valid
+  // model ids but absent from the /models catalog, so pi's registry can never
+  // match them. Adding a variant writes a REAL models.json entry cloned from
+  // the base model's metadata — pi upserts it onto the openrouter catalog and
+  // streams it natively. /model-refresh then makes it live immediately.
+  pi.registerCommand("model-variant", {
+    description:
+      "OpenRouter model variants: /model-variant add <model>:<suffix> | list | remove <model>:<suffix>",
+    getArgumentCompletions: (argumentText: string) => {
+      const trimmed = argumentText.trim();
+      if (!argumentText.includes(" ")) {
+        const subs = [
+          { value: "add", label: "add", description: "add/update a variant entry (e.g. add z-ai/glm-5.3-flash:floor)" },
+          { value: "list", label: "list", description: "show current variants" },
+          { value: "remove", label: "remove", description: "delete a variant entry" },
+        ];
+        const filtered = trimmed ? fuzzyFilter(subs, trimmed, (s: any) => s.label) : subs;
+        return filtered.length ? filtered : null;
+      }
+      if (argumentText.startsWith("add ")) {
+        const rest = argumentText.slice(4);
+        // Colon typed → complete suffixes; otherwise complete base model ids.
+        return rest.includes(":") ? completeVariantSuffixes(rest) : completeVariantBases(rest);
+      }
+      if (argumentText.startsWith("remove ")) {
+        const rest = argumentText.slice(7);
+        const items = listVariants().map((v: any) => ({ value: `remove ${v.id}`, label: v.id, ...(v.name ? { description: v.name } : {}) }));
+        const filtered = rest.trim() ? fuzzyFilter(items, rest, (i: any) => i.label) : items;
+        return filtered.length ? filtered : null;
+      }
+      return null;
+    },
+    handler: async (args: string, ctx: any) => {
+      noteCompletionRegistry(ctx);
+      const trimmed = args?.trim();
+      const sub = trimmed.split(/\s+/)[0]?.toLowerCase() ?? "";
+      const rest = trimmed.slice(sub.length).trim();
+
+      if (sub === "list" || !trimmed) {
+        const variants = listVariants();
+        if (!variants.length) {
+          ctx.ui?.notify?.(
+            "No OpenRouter variants in models.json.\nUsage: /model-variant add <model>:<suffix>  (e.g. z-ai/glm-5.3-flash:floor)",
+            "info"
+          );
+          return;
+        }
+        const lines = variants.map((v) => `• openrouter/${v.id}${v.name ? ` — ${v.name}` : ""}`);
+        ctx.ui?.notify?.(["OpenRouter variants (models.json):", ...lines].join("\n"), "info");
         return;
       }
-      const lower = trimmed.toLowerCase();
-      if (lower === "off" || lower === "disable" || lower === "default") {
-        apply(null);
+
+      if (sub === "add") {
+        if (!rest) {
+          ctx.ui?.notify?.("Usage: /model-variant add <model>:<suffix>  (e.g. z-ai/glm-5.3-flash:floor)", "error");
+          return;
+        }
+        // Quick syntax check for a tight feedback loop; addVariant re-parses.
+        const probe = parseTarget(rest);
+        if ("error" in probe) {
+          ctx.ui?.notify?.(`Invalid variant: ${probe.error}`, "error");
+          return;
+        }
+        ctx.ui?.notify?.(`Resolving base model for ${probe.variantId}…`, "info");
+        const res = await addVariant(rest, ctx?.modelRegistry);
+        if (!res.ok) {
+          ctx.ui?.notify?.(`Variant add failed: ${res.error}`, "error");
+          return;
+        }
+        // Refresh the live registry right away so the variant is selectable
+        // without leaving the session.
+        let refreshNote = "";
+        try {
+          const registry = ctx?.modelRegistry;
+          if (registry?.refresh) {
+            const rr = await registry.refresh({ allowNetwork: true, force: true, providers: ["openrouter"] });
+            const errs = rr?.errors?.size ?? 0;
+            refreshNote = errs ? ` (registry refreshed with ${errs} provider error(s))` : " (registry refreshed — pick it in /model now)";
+          } else {
+            refreshNote = "\nRun /model-refresh to make it selectable.";
+          }
+        } catch {
+          refreshNote = "\nRun /model-refresh to make it selectable.";
+        }
+        ctx.ui?.notify?.(`${res.message}${refreshNote}`, "info");
         return;
       }
-      if (lower === "status" || lower === "show") {
-        const state = loadOpenRouterRouting();
-        const live = readOpenRouterRoutingFromModelsJson();
-        ctx.ui?.notify?.(
-          `OpenRouter routing switch: ${state ? canonicalJson(state) : "off (default)"}\nmodels.json: ${
-            live ? canonicalJson(live) : "unset"
-          }\n(main model applies on next pi start; distillation applies immediately)`,
-          "info"
-        );
+
+      if (sub === "remove" || sub === "rm" || sub === "del") {
+        if (!rest) {
+          ctx.ui?.notify?.("Usage: /model-variant remove <model>:<suffix>", "error");
+          return;
+        }
+        const res = removeVariant(rest.replace(/^openrouter\//, ""));
+        ctx.ui?.notify?.(res.ok ? res.message : `Variant remove failed: ${res.error}`, res.ok ? "info" : "error");
         return;
       }
-      const parsed = parseRoutingArg(trimmed);
-      if ("error" in parsed) {
-        ctx.ui?.notify?.(`Invalid routing: ${parsed.error}\nUsage: /or-routing [off | status | <sort-name> | '<json-object>']`, "error");
-        return;
-      }
-      apply(parsed.routing);
+
+      ctx.ui?.notify?.(
+        "Usage: /model-variant [add <model>:<suffix> | list | remove <model>:<suffix>]",
+        "error"
+      );
     },
   });
 

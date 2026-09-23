@@ -70,6 +70,21 @@ model; the main conversation model (pi's `/model`) is untouched:
 Saved to `~/.config/mykyagent/webmodel.json` and persists across sessions.
 When no override is set, distillation uses the main model (default state).
 
+## Model Refresh
+pi snapshots provider models once at startup. To pick up edits to
+`~/.pi/agent/models.json` (or refreshed provider model lists) mid-session:
+* `/model-refresh` — re-read models.json + refetch provider model lists
+* `/model-refresh <provider> ...` — restrict to specific providers
+
+All model commands have fuzzy argument autocompletion (same matcher as pi's
+`/model`): `/model-variant add <tab>` completes openrouter base ids, typing
+`:` completes suffixes (`:floor`, `:free`, ...), `/model-refresh <tab>`
+completes provider ids.
+
+Reports the before/after available-model count and any per-provider errors.
+The current session model is unchanged; new models show up in `/model-web list`
+and pi's picker immediately.
+
 ## Web Killswitch
 * `/web-toggle` — flip web tools on/off
 * `/web-toggle off` — remove `web_search` + `web_fetch` from the agent
