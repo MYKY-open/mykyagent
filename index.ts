@@ -185,7 +185,9 @@ function completeVariantBases(rest: string): AutocompleteItem[] | null {
     items.push({ id: m.id, name: m.name });
   }
   for (const v of listVariants()) {
-    const base = v.id.slice(0, v.id.lastIndexOf(":"));
+    // Variant entry → seed its base; plain suffixless entry → seed itself.
+    const colon = v.id.lastIndexOf(":");
+    const base = colon > 0 ? v.id.slice(0, colon) : v.id;
     if (!seen.has(base)) {
       seen.add(base);
       items.push({ id: base, name: v.name });

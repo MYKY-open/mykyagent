@@ -14,6 +14,10 @@
  * cloned from the live registry, or fetched from OpenRouter's public catalog
  * when the registry doesn't know the base model yet.
  *
+ * Plain (suffixless) ids work too: pi refreshes openrouter from pi.dev's
+ * catalog mirror, which lacks some models (e.g. stealth/*), so a plain add
+ * rescues them from OpenRouter's live /models endpoint.
+ *
  * The base id must NOT already be a variant entry (no nested variants).
  */
 
@@ -40,18 +44,24 @@ export const suffixHints = () => VARIANT_HINTS;
 
 export interface ParsedTarget {
   base: string; // "z-ai/glm-5.3-flash"
-  suffix: string; // "floor"
-  variantId: string; // "z-ai/glm-5.3-flash:floor"
+  suffix: string; // "floor" ("" when no suffix — plain model add)
+  variantId: string; // "z-ai/glm-5.3-flash:floor" (or just base)
   known: boolean;
 }
 
-/** Parse "<provider/>base:suffix" (provider prefix tolerated, dropped). */
+/** Parse "<provider/>base[:suffix]" (provider prefix tolerated, dropped).
+ *  A plain id (no suffix) is also valid — lets /model-variant rescue models
+ *  missing from pi's catalog (e.g. stealth/ models pi.dev doesn't mirror). */
 export function parseTarget(raw: string): ParsedTarget | { error: string } {
   const trimmed = raw.trim().replace(/^openrouter\//, "");
   if (!trimmed) return { error: "empty target" };
   const colon = trimmed.lastIndexOf(":");
-  if (colon <= 0 || colon === trimmed.length - 1) {
-    return { error: `missing ":suffix" (e.g. ${trimmed}:floor)` };
+  if (colon < 0) {
+    return { base: trimmed, suffix: "", variantId: trimmed, known: false };
+  }
+  if (colon === 0) return { error: `missing base id (e.g. ${trimmed}z-ai/model:floor)` };
+  if (colon === trimmed.length - 1) {
+    return { error: `empty suffix after ":" (e.g. ${trimmed}floor)` };
   }
   const base = trimmed.slice(0, colon);
   const suffix = trimmed.slice(colon + 1);
@@ -89,12 +99,13 @@ function writeModelsJson(doc: any): { ok: true } | { ok: false; error: string } 
   }
 }
 
-/** Current variant entries under providers.openrouter.models. */
+/** Current entries under providers.openrouter.models (variants AND plain
+ *  rescued models — anything /model-variant or the user put there). */
 export function listVariants(): VariantDefinition[] {
   try {
     const doc = readModelsJson();
     const models = doc?.providers?.openrouter?.models;
-    return Array.isArray(models) ? models.filter((m: any) => typeof m?.id === "string" && m.id.includes(":")) : [];
+    return Array.isArray(models) ? models.filter((m: any) => typeof m?.id === "string") : [];
   } catch {
     return [];
   }
@@ -152,7 +163,13 @@ export async function addVariant(
 ): Promise<{ ok: true; message: string } | { ok: false; error: string }> {
   const parsed = parseTarget(raw);
   if ("error" in parsed) return { ok: false, error: parsed.error };
-  const { base, suffix, variantId, known } = parsed;
+  const { base, suffix, variantId } = parsed;
+
+  // Plain add of a model pi already knows: nothing to rescue, upserting a
+  // clone would only shadow the catalog entry.
+  if (!suffix && registry?.find?.("openrouter", base)) {
+    return { ok: true, message: `openrouter/${base} is already in pi's catalog — nothing to add.` };
+  }
 
   let def: VariantDefinition | { error: string } | null = cloneFromRegistry(registry, base);
   if (!def) def = await fetchBaseFromCatalog(base);
@@ -161,11 +178,11 @@ export async function addVariant(
     return { ok: false, error: `cannot resolve base "${base}": ${err}` };
   }
 
-  const hint = VARIANT_HINTS[suffix];
+  const hint = suffixHints()[suffix];
   const entry: VariantDefinition = {
     ...def,
     id: variantId,
-    name: `${def.name ?? base} (${suffix})`,
+    name: suffix ? `${def.name ?? base} (${suffix})` : (def.name ?? base),
     ...(hint?.reasoning ? { reasoning: true } : {}),
     ...(hint?.costZero ? { cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } } : {}),
   };
@@ -187,7 +204,7 @@ export async function addVariant(
 
   const res = writeModelsJson(doc);
   if (!res.ok) return { ok: false, error: `write failed: ${res.error}` };
-  const note = hint?.note ? ` (${hint.note})` : "";
+  const note = suffix ? (hint?.note ? ` (${hint.note})` : "") : " (rescued from OpenRouter's live catalog — not in pi's pi.dev mirror)";
   return {
     ok: true,
     message: `${replaced ? "Updated" : "Added"} openrouter/${variantId} in models.json${note}\nRun /model-refresh (or reopen /model) to use it now.`,

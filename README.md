@@ -70,6 +70,13 @@ model; the main conversation model (pi's `/model`) is untouched:
 Saved to `~/.config/mykyagent/webmodel.json` and persists across sessions.
 When no override is set, distillation uses the main model (default state).
 
+pi refreshes openrouter models from pi.dev's catalog mirror — which lacks
+some models entirely (e.g. `stealth/*`). `/model-variant add` also accepts
+plain suffixless ids and rescues them from OpenRouter's live catalog:
+* `/model-variant add stealth/space-bunny-alpha` — works even though no
+  amount of refreshing would ever surface it
+* `/model-variant add z-ai/glm-5.3-flash:floor` — suffix variant
+
 ## Model Refresh
 pi snapshots provider models once at startup. To pick up edits to
 `~/.pi/agent/models.json` (or refreshed provider model lists) mid-session:

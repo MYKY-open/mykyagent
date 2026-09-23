@@ -42,7 +42,11 @@ const t = (name: string, ok: boolean, extra = "") => {
 }
 {
   const p = MV.parseTarget("no-suffix-here");
-  t("parse: missing suffix rejected", "error" in p);
+  t("parse: suffixless id → plain add", !("error" in p) && p.base === "no-suffix-here" && p.suffix === "" && p.variantId === "no-suffix-here");
+}
+{
+  const p = MV.parseTarget(":floor");
+  t("parse: leading colon rejected", "error" in p);
 }
 {
   const p = MV.parseTarget("model:");
@@ -112,6 +116,22 @@ const fakeRegistry = {
 {
   const r = await MV.addVariant("garbage", fakeRegistry);
   t("add: bad arg rejected", r.ok === false);
+}
+
+// --- plain (suffixless) adds --------------------------------------------------
+{
+  const r = await MV.addVariant("z-ai/glm-5.3-flash", fakeRegistry);
+  t("plain add: already-known base is a no-op", r.ok === true && /already in pi's catalog/.test(r.message), JSON.stringify(r));
+  const doc = JSON.parse(readFileSync(MODELS, "utf-8"));
+  t("plain add: no shadow entry written", !doc.providers.openrouter.models.some((m: any) => m.id === "z-ai/glm-5.3-flash"));
+}
+{
+  // Plain add of an UNKNOWN base falls through to the live-catalog fetch —
+  // offline this fails clean, and no entry is written.
+  const r = await MV.addVariant("stealth/offline-test-model", fakeRegistry);
+  t("plain add: unknown base + no network fails clean", r.ok === false, JSON.stringify(r));
+  const doc = JSON.parse(readFileSync(MODELS, "utf-8"));
+  t("plain add: failed fetch writes nothing", !doc.providers.openrouter.models.some((m: any) => m.id === "stealth/offline-test-model"));
 }
 
 // --- removeVariant / listVariants ---------------------------------------------
