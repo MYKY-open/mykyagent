@@ -159,6 +159,20 @@ const fakeRegistry = {
   t("add after prune: recreates provider block", r.ok === true && existsSync(MODELS));
 }
 
+// --- sanitizeInput (pi models.json schema regression) -------------------------
+// pi's schema: input: ("text" | "image")[] — anything else (e.g. "video" from
+// OpenRouter's live catalog) makes pi reject the WHOLE models.json at startup.
+t(
+  (() => {
+    const ok1 = JSON.stringify(MV.sanitizeInput(["text", "video", "image"])) === '["text","image"]';
+    const ok2 = JSON.stringify(MV.sanitizeInput(["video", "audio"])) === '["text"]';
+    const ok3 = JSON.stringify(MV.sanitizeInput(undefined)) === '["text"]';
+    const ok4 = JSON.stringify(MV.sanitizeInput(["image"])) === '["image"]';
+    return ok1 && ok2 && ok3 && ok4;
+  })(),
+  "sanitizeInput contract"
+);
+
 rmSync(DIR, { recursive: true, force: true });
 console.log(`\nmodel_variants: ${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);

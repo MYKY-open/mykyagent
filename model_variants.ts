@@ -111,6 +111,18 @@ export function listVariants(): VariantDefinition[] {
   }
 }
 
+/** pi's models.json schema only allows input modalities "text" | "image"
+ *  (TypeBox Literal union). OpenRouter's live catalog advertises "video" etc. —
+ *  an unsanitized array makes pi reject the WHOLE models.json at startup. */
+export function sanitizeInput(modalities: unknown): string[] {
+  const allowed = ["text", "image"];
+  if (Array.isArray(modalities)) {
+    const filtered = modalities.filter((m: any) => allowed.includes(m));
+    if (filtered.length) return filtered;
+  }
+  return ["text"];
+}
+
 /** OpenRouter public catalog (no auth needed) — fallback when the registry
  *  doesn't know the base model (stale pi model cache, brand-new release). */
 async function fetchBaseFromCatalog(base: string): Promise<VariantDefinition | { error: string }> {
@@ -125,14 +137,15 @@ async function fetchBaseFromCatalog(base: string): Promise<VariantDefinition | {
       return Number.isFinite(n) ? n * 1_000_000 : 0;
     };
     const maxTokens = entry?.top_provider?.max_completion_tokens;
+    const contextWindow = entry?.context_length;
     return {
       id: base,
       name: entry.name ?? base,
       api: "openai-completions",
       reasoning: Array.isArray(entry?.supported_parameters) ? entry.supported_parameters.includes("reasoning") : false,
-      input: Array.isArray(entry?.architecture?.input_modalities) ? entry.architecture.input_modalities : ["text"],
-      contextWindow: entry?.context_length ?? 128000,
-      ...(maxTokens ? { maxTokens } : {}),
+      input: sanitizeInput(entry?.architecture?.input_modalities),
+      contextWindow: Number.isFinite(contextWindow) && contextWindow > 0 ? contextWindow : 128000,
+      ...(Number.isFinite(maxTokens) && maxTokens > 0 ? { maxTokens } : {}),
       cost: {
         input: perMil(entry?.pricing?.prompt),
         output: perMil(entry?.pricing?.completion),
