@@ -1342,15 +1342,47 @@ def ddg(query: str, max_results: int = 8, preferred: str | None = None, fresh: b
                 return res, backend
             dbg(f"serp [{backend}] empty")
         except Exception as e:
-            dbg(f"serp [{backend}] failed:", str(e)[:70])
+            msg = str(e)
+            if "no results found" in msg.lower():
+                # Zero hits for THIS query, not a dead engine. Marking the
+                # backend dead here poisoned every other variant's fallback
+                # chain and produced false "all engines rate limited" runs.
+                dbg(f"serp [{backend}] zero hits for this query")
+                continue
+            if "rate" in msg.lower() or "throttl" in msg.lower() or "timed out" in msg.lower():
+                dbg(f"serp [{backend}] throttled/timeout")
+                _mark_backend_dead(backend)
+                continue
+            dbg(f"serp [{backend}] failed:", msg[:70])
         _mark_backend_dead(backend)
 
     return [], None
 
 
+def serp_keywords(query: str, cap: int = 14) -> str:
+    """Reduce a query to leading content keywords for the SERP engines.
+
+    DDG/Bing/Yahoo are keyword matchers, not LLMs. The web_search contract
+    encourages the agent to pass a full natural-language research goal, and a
+    200-char prose query returns ZERO hits from every backend -- which ddgs
+    reports as a generic "No results found" exception, indistinguishable from
+    a throttle, so every engine gets marked dead and the run dies with a false
+    "all search engines rate limited" error. Keep the raw query for ranking
+    and API providers; only the SERP backends see the reduced form."""
+    q = re.sub(r"^\s*(research goal|goal|task|question|query|search)\s*[:\-]\s*", "", query, flags=re.I)
+    toks = re.findall(r"[a-z0-9][a-z0-9+#-]*(?:\.[a-z0-9][a-z0-9+#-]*)*", q.lower())
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in toks:
+        if t not in _STOP and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return " ".join(out[:cap]) or query.strip()
+
+
 def fanout_queries(query: str) -> list[str]:
     """Cheap query expansion. No LLM, no latency cost worth mentioning."""
-    q = query.strip()
+    q = serp_keywords(query)
     variants = [q]
     low = q.lower()
     # Incident / post-mortem queries benefit from an RCA-hunting variant before
@@ -1412,7 +1444,7 @@ def fused_search(
         _reset_backends()
         time.sleep(0.5)
         try:
-            r, backend = ddg(query, max_results, None, fresh)
+            r, backend = ddg(serp_keywords(query), max_results, None, fresh)
         except Exception:
             r, backend = [], None
         if r and not (len(r) == 1 and "error" in r[0]):
@@ -1676,7 +1708,9 @@ _FACTUAL = re.compile(r"\b(who|what|when|where|which|why|define|definition|meani
 
 
 def prov_wikipedia(query: str) -> list[dict]:
-    q = re.sub(r"\b(who|what|when|where|is|are|the|a|an)\b", " ", query, flags=re.I).strip()
+    # Same trap as the SERP engines: the Wikipedia search API returns nothing
+    # useful for a 200-char sentence. Reduce to content keywords first.
+    q = re.sub(r"\b(who|what|when|where|is|are|the|a|an)\b", " ", serp_keywords(query, cap=10), flags=re.I).strip()
     if len(q) < 2:
         return []
     d = _api_json(
@@ -2550,7 +2584,7 @@ def research(query: str) -> dict:
             "structured": {},
             "stats": stats,
         "timings": timings,
-            "error": "no results: all search engines rate limited and no API provider matched",
+            "error": "no results: SERP empty for all query variants across all engines (rate limited or zero hits) and no API provider matched",
         }
 
     # Adaptive depth: structured answers present -> fewer pages needed.
