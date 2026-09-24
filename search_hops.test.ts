@@ -1,4 +1,4 @@
-import { runSearchHops, parseFollowup, mergeUsage, type ResearchPayload } from "./search_hops.ts";
+import { runSearchHops, parseFollowup, parseMissing, mergeUsage, type ResearchPayload } from "./search_hops.ts";
 
 let pass = 0, fail = 0;
 const t = (name: string, cond: boolean, extra = "") => {
@@ -130,6 +130,62 @@ const render = (raw: ResearchPayload, o: { note?: string }) =>
   t("parse: indented + quoted", parseFollowup("a\n  FOLLOWUP: \"quoted q\"\n").followup === "quoted q");
   t("parse: empty followup rejected", parseFollowup("a\nFOLLOWUP:\n").followup === null);
   t("parse: mid-text FOLLOWUP not matched in prose", parseFollowup("I will not FOLLOWUP: x here").followup === null);
+  t("missing: none", parseMissing("plain answer").length === 0);
+  t("missing: extracts items", JSON.stringify(parseMissing("a\nMISSING: exact version\nb\nMISSING: fixed-in commit")) === JSON.stringify(["exact version", "fixed-in commit"]));
+  t("missing: empty item rejected", parseMissing("a\nMISSING:\nb").length === 0);
+}
+
+// 10. distilled findings from earlier rounds are passed as preamble (no amnesia)
+{
+  const preambles: (string | undefined)[] = [];
+  let n = 0;
+  await runSearchHops("original", {
+    maxHops: 2,
+    research: async (q) => ({ pages: [page(q === "original" ? "a.com" : "b.com")] }),
+    render,
+    distill: async (_bundle, _allow, preamble) => {
+      n++;
+      preambles.push(preamble);
+      return n === 1
+        ? { text: "Round-1 found 80% of the architecture.\nFOLLOWUP: check version flag" }
+        : { text: "Round-2 answer merged." };
+    },
+  });
+  t("first round has no preamble", preambles[0] === undefined, JSON.stringify(preambles[0]));
+  t("second round preamble carries round-1 findings", !!preambles[1] && preambles[1]!.includes("80% of the architecture"), JSON.stringify(preambles[1]));
+  t("preamble labelled with round number", !!preambles[1] && preambles[1]!.includes("Round 0"));
+}
+
+// 11. MISSING gaps drive the next hop when no FOLLOWUP is given
+{
+  const calls: string[] = [];
+  let n = 0;
+  const r = await runSearchHops("original", {
+    maxHops: 2,
+    research: async (q) => { calls.push(q); return { pages: [page(`u${calls.length}.com`)] }; },
+    render,
+    distill: async () => {
+      n++;
+      return n === 1
+        ? { text: "Partial answer.\nMISSING: parameter 21 count\nMISSING: Channel 291 build" }
+        : { text: "Gaps filled." };
+    },
+  });
+  t("gap-only round triggers followup from MISSING items", calls.length === 2 && calls[1] === "parameter 21 count Channel 291 build", JSON.stringify(calls));
+  t("MISSING lines stripped from final answer", r.answer === "Gaps filled.", JSON.stringify(r.answer));
+  t("hops counted for gap-driven round", r.hops === 1);
+}
+
+// 12. unresolved gaps are surfaced on the final result
+{
+  const r = await runSearchHops("q", {
+    maxHops: 1,
+    research: async (q) => ({ pages: [page(q === "q" ? "a.com" : "b.com")] }),
+    render,
+    distill: async () => ({ text: "Answer.\nMISSING: still unknown" }),
+  });
+  t("missing items reported", JSON.stringify(r.missing) === JSON.stringify(["still unknown"]), JSON.stringify(r.missing));
+  t("missing appended to answer", r.answer.includes("Missing information") && r.answer.includes("still unknown"), JSON.stringify(r.answer));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

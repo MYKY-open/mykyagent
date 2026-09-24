@@ -138,16 +138,18 @@ READ_TIMEOUT = 15
 MAX_HTML_BYTES = 3_000_000
 HARD_TEXT_CAP = 300_000
 # Per-page character budget handed to the summariser. This is the single
-# biggest lever on token spend.
-PAGE_BUDGET = int(os.environ.get("MYKYAGENT_PAGE_BUDGET", "2200"))
+# biggest lever on token spend. The distillation subagent is a cheap,
+# high-context model, so feed it whole sections, full code blocks and complete
+# tables -- it does the distilling, not the window-cutter.
+PAGE_BUDGET = int(os.environ.get("MYKYAGENT_PAGE_BUDGET", "12000"))
 # Enumerative questions need whole tables, but paying 3x for every page is
 # wasteful. Extra allowance applies to table blocks only.
 TABLE_EXTRA = int(os.environ.get("MYKYAGENT_TABLE_EXTRA", "2600"))
 # When there is no query to rank blocks against (an explicit web_fetch of a
-# URL), a 2200-char head cut tends to return the intro and table of contents
+# URL), a tiny head cut tends to return the intro and table of contents
 # rather than the answer. The model asked for this page by name, so give it
 # enough of the page to be worth the fetch.
-NO_QUERY_BUDGET = int(os.environ.get("MYKYAGENT_NO_QUERY_BUDGET", "4000"))
+NO_QUERY_BUDGET = int(os.environ.get("MYKYAGENT_NO_QUERY_BUDGET", "8000"))
 # Cap on a JSON API response passed through verbatim.
 JSON_BUDGET = int(os.environ.get("MYKYAGENT_JSON_BUDGET", "6000"))
 
@@ -545,9 +547,43 @@ _TOKEN = re.compile(r"[a-z0-9]+")
 _CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 
 
+def _stem(w: str) -> str:
+    """Lightweight suffix normaliser so 'crash'/'crashes', 'timeout'/'timeouts',
+    'build'/'building', 'fix'/'fixed' match in BM25 and overlap scoring.
+    Deliberately crude: applied identically to query and document tokens, and
+    only ever affects ranking -- never filtering -- so a bad stem costs a
+    little recall, not correctness."""
+    if len(w) <= 4:
+        return w
+    if w.endswith("ies") and len(w) > 5:
+        return w[:-3] + "y"
+    if w.endswith("es"):
+        base = w[:-2]
+        # crashes/matches/boxes lose 'es' (voiced sibilant plurals); types/notes
+        # keep their stem and fall through to the plain 's' rule below.
+        if len(base) >= 3 and base[-1] in "hxzs" and not base.endswith("ss"):
+            return base
+    if w.endswith("ing"):
+        base = w[:-3]
+        if len(base) >= 3:
+            # running -> runn is wrong; undouble the trailing consonant.
+            if base[-1] == base[-2] and base[-1] not in "lsz":
+                base = base[:-1]
+            return base
+    if w.endswith("ed"):
+        base = w[:-2]
+        if len(base) >= 3:
+            if base[-1] == base[-2] and base[-1] not in "lsz":
+                base = base[:-1]
+            return base
+    if w.endswith("s") and not w.endswith(("ss", "us", "is")) and len(w) > 4:
+        return w[:-1]
+    return w
+
+
 def tok(s: str) -> list[str]:
     s = _CAMEL.sub(" ", s)
-    return _TOKEN.findall(s.lower())
+    return [_stem(t) for t in _TOKEN.findall(s.lower())]
 
 
 # Search-operator tokens a summariser may sprinkle into a followup query
@@ -1119,7 +1155,7 @@ def _domain(url: str) -> str:
         return ""
 
 
-def _prior(url: str) -> float:
+def _prior(url: str, community: bool = False) -> float:
     d = _domain(url)
     s = 0.0
     for host, boost in DOMAIN_BOOST.items():
@@ -1144,9 +1180,37 @@ def _prior(url: str) -> float:
         s -= 4.0
     for bad in DOMAIN_PENALTY:
         if bad in d:
+            # Community-sentiment queries explicitly want Reddit threads; the
+            # penalty must not fight the intent that summoned them.
+            if community and "reddit" in bad:
+                break
             s -= 1.2
             break
     return s
+
+
+# Diagnostic/technical questions want post-mortems, RCA documents and deep
+# docs -- the brand homepage's marketing hero text only crowds them out. When
+# this matches, navigational boosting must skip shallow promo paths and only
+# reward deep subpaths (blog posts, docs, advisories) on the named domain.
+_DIAGNOSTIC_RE = re.compile(
+    r"\b(root cause|crash|crashes|issue|bug|cve|why|analysis|postmortem|"
+    r"post-mortem|outage|incident|vulnerab\w*|security|regression|broken|"
+    r"fails?|failure|debug)\b",
+    re.I,
+)
+_SHALLOW_PATHS = (
+    "", "/", "/about", "/news", "/press", "/company", "/home", "/careers",
+    "/products", "/product", "/pricing", "/contact", "/investors", "/customers",
+)
+
+
+def _is_promo_path(url: str) -> bool:
+    try:
+        path = urlparse(url).path.lower().rstrip("/")
+    except Exception:
+        return True
+    return path in _SHALLOW_PATHS
 
 
 def nav_host(query: str, results: list[dict]) -> str | None:
@@ -1289,6 +1353,16 @@ def fanout_queries(query: str) -> list[str]:
     q = query.strip()
     variants = [q]
     low = q.lower()
+    # Incident / post-mortem queries benefit from an RCA-hunting variant before
+    # the generic ones; the first slots win because the list is capped at 3.
+    if re.search(
+        r"\b(root cause|crash|crashes|outage|incident|postmortem|post-mortem|"
+        r"cve|vulnerab\w*|security|breach)\b",
+        low,
+    ):
+        variants.append(f"{q} postmortem root cause analysis")
+    elif re.search(r"\b(vs\.?|versus|compare|comparison|better|alternative)\b", low):
+        variants.append(f"{q} benchmark comparison")
     if not re.search(r"\b(docs?|documentation|api|reference)\b", low):
         variants.append(f"{q} documentation")
     if re.search(r"\b(download|install|release|version|latest|setup)\b", low):
@@ -1628,6 +1702,152 @@ def prov_wikipedia(query: str) -> list[dict]:
     ]
 
 
+# Community-intent meta words. They describe WHERE/WANT, not WHAT: Reddit
+# titles never repeat them, searching for them pollutes the corpus query, and
+# counting them in relevance overlap inflates the denominator until relevant
+# threads fall below threshold. Strip before talking to reddit providers.
+_META_TERM_RE = re.compile(
+    r"\b(reddit|community|consensus|opinions?|reviews?|sentiment|"
+    r"thoughts?|experiences?|recommend\w*|worth it|hype|complain\w*|"
+    r"gotchas?|pitfalls?)\b",
+    re.I,
+)
+
+
+def _strip_meta_terms(query: str) -> str:
+    """Remove community-intent meta words, keeping the actual topic words."""
+    return re.sub(r"\s+", " ", _META_TERM_RE.sub(" ", query)).strip()
+
+
+def _reddit_pullpush(query: str, limit: int) -> list[dict]:
+    """Fallback via the PullPush mirror (PushShift successor).
+
+    reddit.com's JSON endpoints hard-403 many datacenter/hosting IPs, but this
+    public mirror serves the same submission corpus without auth.
+    """
+    d = _api_json(
+        "https://api.pullpush.io/reddit/search/submission/?"
+        f"q={requests.utils.quote(query)}&size={max(6, limit * 3)}"
+        "&sort=desc&sort_type=score"
+    )
+    if not isinstance(d, dict):
+        return []
+    out: list[dict] = []
+    for d2 in d.get("data") or []:
+        pid, sub = d2.get("id") or "", d2.get("subreddit") or ""
+        if not pid or not sub:
+            continue
+        out.append(
+            {
+                "kind": "reddit",
+                "url": f"https://www.reddit.com/r/{sub}/comments/{pid}/",
+                "title": (d2.get("title") or "").strip(),
+                "subreddit": sub,
+                "ups": int(d2.get("score") or 0),
+                "comments": int(d2.get("num_comments") or 0),
+                "excerpt": (d2.get("selftext") or "").strip()[:1500],
+            }
+        )
+    return out
+
+
+def prov_reddit(query: str, limit: int = 3) -> list[dict]:
+    """Reddit search via public JSON APIs.
+
+    The HTML site is Cloudflare-walled for scrapers, but the JSON search
+    endpoint (or the PullPush mirror when reddit 403s the IP) still answers.
+    Gives high-signal developer discussion for community-sentiment /
+    migration-gotcha questions that SEO listicles would otherwise crowd out.
+    """
+    # Meta words ("... reddit", "community consensus on ...") must not reach
+    # the corpus query: Reddit would rank posts literally containing them.
+    q = _strip_meta_terms(query) or query
+    items: list[dict] = []
+    try:
+        r = session().get(
+            "https://www.reddit.com/search.json",
+            params={"q": q, "limit": max(6, limit * 3), "sort": "relevance", "t": "year"},
+            headers={"User-Agent": "MykyAgent/1.0 (technical research agent)"},
+            timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+        )
+        if r.status_code == 200:
+            for c in ((r.json() or {}).get("data") or {}).get("children") or []:
+                d = c.get("data") or {}
+                permalink = d.get("permalink") or ""
+                if not permalink:
+                    continue
+                items.append(
+                    {
+                        "kind": "reddit",
+                        "url": "https://www.reddit.com" + permalink,
+                        "title": (d.get("title") or "").strip(),
+                        "subreddit": d.get("subreddit") or "",
+                        "ups": int(d.get("score") or 0),
+                        "comments": int(d.get("num_comments") or 0),
+                        "excerpt": (d.get("selftext") or "").strip()[:1500],
+                    }
+                )
+        else:
+            dbg(f"reddit provider: HTTP {r.status_code}, trying PullPush mirror")
+    except Exception as e:
+        dbg("reddit provider failed:", e)
+    if not items:
+        try:
+            items = _reddit_pullpush(q, limit)
+        except Exception as e:
+            dbg("pullpush fallback failed:", e)
+            return []
+    # Engagement-weighted: an upvoted thread with an active comment section
+    # carries far more community signal than a stale lonely post.
+    items.sort(key=lambda it: it["ups"] + 3 * it["comments"], reverse=True)
+    return items[:limit]
+
+
+_CVE_RE = re.compile(r"\bCVE-\d{4}-\d{4,}\b", re.I)
+
+
+def prov_osv(query: str, limit: int = 3) -> list[dict]:
+    """OSV.dev advisory lookup for explicit CVE IDs in the query.
+
+    Returns exact affected/fixed version ranges straight from the advisory
+    database -- authoritative security ground truth with zero scraping.
+    """
+    ids: list[str] = []
+    for m in _CVE_RE.finditer(query):
+        up = m.group(0).upper()
+        if up not in ids:
+            ids.append(up)
+    ids = ids[:limit]
+    out: list[dict] = []
+    for vuln_id in ids:
+        try:
+            d = _api_json(f"https://api.osv.dev/v1/vulns/{vuln_id}")
+            if not isinstance(d, dict) or not d.get("id"):
+                continue
+            fixed: list[str] = []
+            for aff in d.get("affected") or []:
+                pkg = ((aff.get("package") or {}).get("name") or "").strip()
+                for rng in aff.get("ranges") or []:
+                    for ev in rng.get("events") or []:
+                        if ev.get("fixed"):
+                            fixed.append(f"{pkg}: fixed in {ev['fixed']}" if pkg else f"fixed in {ev['fixed']}")
+            summary = (d.get("summary") or "").strip()
+            details = (d.get("details") or "").strip()
+            out.append(
+                {
+                    "kind": "osv",
+                    "url": f"https://osv.dev/vulnerability/{vuln_id}",
+                    "title": f"{vuln_id}: {summary}" if summary else vuln_id,
+                    "excerpt": details[:2000],
+                    "fixed": fixed[:10],
+                    "aliases": [a for a in (d.get("aliases") or []) if isinstance(a, str)][:5],
+                }
+            )
+        except Exception as e:
+            dbg(f"osv provider failed for {vuln_id}:", e)
+    return out
+
+
 def prov_stackexchange(query: str, limit: int = 2) -> list[dict]:
     # SE relevance collapses on natural-language questions; feed it keywords only.
     kws = [w for w in tok(query) if w not in _STOP and len(w) > 2]
@@ -1680,6 +1900,15 @@ def gather_providers(query: str, urls: list[str], nav_hint: str | None = None,
             low,
         )
     )
+    community_intent = bool(
+        re.search(
+            r"\b(reddit|community|consensus|opinions?|reviews?|sentiment|"
+            r"thoughts|experiences?|recommend\w*|worth it|hype|complain\w*|"
+            r"gotchas?|pitfalls?)\b",
+            low,
+        )
+    )
+    osv_intent = bool(_CVE_RE.search(low))
 
     jobs = {
         "github_releases": lambda: prov_github(urls, query=query),
@@ -1696,6 +1925,10 @@ def gather_providers(query: str, urls: list[str], nav_hint: str | None = None,
             jobs["neoforge_maven"] = lambda: prov_maven_neoforge(query)
     if so_intent and remaining() > 20:
         jobs["stackoverflow"] = lambda: prov_stackexchange(query)
+    if community_intent and remaining() > 20:
+        jobs["reddit"] = lambda: prov_reddit(query)
+    if osv_intent and remaining() > 20:
+        jobs["osv"] = lambda: prov_osv(query)
     # An encyclopaedia summary is useless for "what changed on this site lately"
     # and costs two sequential API calls.
     if _FACTUAL.search(query) and not recency_hint and not nav_hint and remaining() > 20:
@@ -1757,12 +1990,17 @@ def _filter_structured(structured: dict, query: str) -> dict:
     unrelated high-score question pass on incidental word overlap.
     """
     qt = {w for w in tok(query) if w not in _STOP}
+    # Community meta words ("reddit", "community", ...) never appear in Reddit
+    # titles but inflate the overlap denominator, so relevant threads land
+    # right on (or below) the threshold. Judge reddit items on topic words only.
+    meta_qt = {w for w in tok(_strip_meta_terms(query)) if w not in _STOP}
     # name -> (identity fields, min overlap). Wikipedia is excluded because its
     # own search API already ranked relevance and titles are single words.
     fields: dict[str, tuple[tuple[str, ...], float]] = {
         "stackoverflow": (("title",), 0.5),
         "github_search": (("full_name", "description"), 0.4),
         "modrinth": (("title", "slug", "description"), 0.5),
+        "reddit": (("title", "subreddit"), 0.4),
     }
     out: dict = {}
     for name, items in structured.items():
@@ -1776,7 +2014,15 @@ def _filter_structured(structured: dict, query: str) -> dict:
             if spec and qt:
                 keys, thresh = spec
                 blob = " ".join(str(it.get(k) or "") for k in keys)
-                if _overlap(blob, qt) < thresh:
+                use_qt = meta_qt if (name == "reddit" and meta_qt) else qt
+                # A fixed fraction over a variable-length denominator is
+                # length-biased: a title cannot contain 40% of a 12-token
+                # question, so long specific queries get good hits rejected.
+                # Relax the fraction for long queries so the absolute match
+                # requirement saturates (~2 tokens); short queries keep the
+                # original strictness unchanged.
+                eff = thresh * min(1.0, 4.0 / len(use_qt))
+                if _overlap(blob, use_qt) < eff:
                     continue
             keep.append(it)
         if keep:
@@ -2218,6 +2464,16 @@ def research(query: str) -> dict:
         stats["nav_domain"] = nav
 
     qt = {w for w in tok(query_c) if w not in _STOP}
+    diagnostic = bool(_DIAGNOSTIC_RE.search(query_c))
+    community_intent = bool(
+        re.search(
+            r"\b(reddit|community|consensus|opinions?|reviews?|sentiment|"
+            r"thoughts|experiences?|recommend\w*|worth it|hype|complain\w*|"
+            r"gotchas?|pitfalls?)\b",
+            query_c,
+            re.I,
+        )
+    )
 
     def _rank(pool: list[dict]) -> list[tuple[float, dict]]:
         out: list[tuple[float, dict]] = []
@@ -2231,11 +2487,14 @@ def research(query: str) -> dict:
             score = (
                 _overlap(blob, qt) * 3.0
                 + (1.0 / (1 + i * 0.25)) * 1.5
-                + _prior(r["url"])
+                + _prior(r["url"], community=community_intent)
                 + float(r.get("_prov") or 0.0)
             )
             if nav and _domain(r["url"]) == nav:
-                score += 4.0
+                # Diagnostic queries: only deep content on the named site earns
+                # the boost; the homepage would just inject marketing copy.
+                if not (diagnostic and _is_promo_path(r["url"])):
+                    score += 4.0
             out.append((score, r))
         out.sort(key=lambda x: x[0], reverse=True)
         return out
@@ -2252,7 +2511,7 @@ def research(query: str) -> dict:
 
     prov_pool: list[dict] = []
     for name, items in structured.items():
-        if name not in ("github_search", "modrinth", "wikipedia", "stackoverflow"):
+        if name not in ("github_search", "modrinth", "wikipedia", "stackoverflow", "reddit"):
             continue
         for it in items:
             if not isinstance(it, dict) or not it.get("url"):
@@ -2299,12 +2558,15 @@ def research(query: str) -> dict:
         k in structured
         for k in ("neoforge_maven", "github_releases", "modrinth", "pypi", "npm")
     )
-    cap = 3 if (have_answer and DOWNLOAD_INTENT.search(query)) else (5 if enumeration else 4)
+    # The distillation subagent ingests 30k-60k chars happily, so fetch deeper
+    # than a context-starved summariser could afford. Structured-answer
+    # downloads still stay shallow (the API data already carries the artifact).
+    cap = 4 if (have_answer and DOWNLOAD_INTENT.search(query)) else (7 if enumeration else 6)
     if remaining() < 25:
         cap = min(cap, 3)
 
     # Over-fetch a little, then keep only the pages that actually fit the query.
-    picked = [r for _, r in ranked[: cap + 2]][: cap + 1]
+    picked = [r for _, r in ranked[: cap + 3]][: cap + 1]
 
     # Time reserved for assembly/return. Scales with the caller's budget so a
     # short deadline still fetches at least one page instead of none.
@@ -2313,7 +2575,7 @@ def research(query: str) -> dict:
     # --- parallel fetch with per-fetch deadline ----------------------------
     _t_fetch = time.monotonic()
     fetched: dict[str, dict] = {}
-    ex = ThreadPoolExecutor(max_workers=max(1, min(5, len(picked))))
+    ex = ThreadPoolExecutor(max_workers=max(1, min(8, len(picked))))
     try:
         futs = {}
         for r in picked:
@@ -2433,8 +2695,10 @@ def research(query: str) -> dict:
     def _page_key(p: dict) -> float:
         # Carry the candidate-stage ranking forward. Without this the navigational
         # target loses to GitHub purely because github.com has a bigger domain prior.
-        nav_bonus = 8.0 if (nav and _domain(p["url"]) == nav) else 0.0
-        return nav_bonus + p["_fit"] * 3.0 + _prior(p["url"]) + 0.25 * float(p.get("score") or 0.0)
+        nav_bonus = 0.0
+        if nav and _domain(p["url"]) == nav and not (diagnostic and _is_promo_path(p["url"])):
+            nav_bonus = 8.0
+        return nav_bonus + p["_fit"] * 3.0 + _prior(p["url"], community=community_intent) + 0.25 * float(p.get("score") or 0.0)
 
     pages.sort(key=_page_key, reverse=True)
     pages = [p for p in pages if not (_is_farm(p["url"]) and p["_fit"] < 0.6)]
@@ -2460,6 +2724,29 @@ def research(query: str) -> dict:
                 "url": item.get("url", ""),
                 "title": item.get("title", ""),
                 "content": item.get("extract", ""),
+                "score": 1.0,
+            }
+        )
+    for item in structured.get("reddit", []):
+        pages.append(
+            {
+                "url": item.get("url", ""),
+                "title": f"r/{item.get('subreddit', '')}: {item.get('title', '')}",
+                "content": (
+                    f"(reddit discussion, {item.get('ups', 0)} upvotes, "
+                    f"{item.get('comments', 0)} comments)\n{item.get('excerpt', '')}"
+                ),
+                "score": 1.0,
+            }
+        )
+    for item in structured.get("osv", []):
+        fixed = item.get("fixed") or []
+        fx = ("\nFixed versions: " + "; ".join(fixed)) if fixed else ""
+        pages.append(
+            {
+                "url": item.get("url", ""),
+                "title": item.get("title", ""),
+                "content": f"(OSV.dev advisory, authoritative){fx}\n{item.get('excerpt', '')}",
                 "score": 1.0,
             }
         )
