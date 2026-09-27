@@ -73,6 +73,7 @@ except Exception:  # pragma: no cover
 START = time.monotonic()
 DEADLINE_S = float(os.environ.get("MYKYAGENT_SEARCH_DEADLINE", "75"))
 NO_BROWSER = os.environ.get("MYKYAGENT_NO_BROWSER") == "1"
+FORCE_BROWSER = os.environ.get("MYKYAGENT_FORCE_BROWSER") == "1"
 NO_APIS = os.environ.get("MYKYAGENT_NO_APIS") == "1"
 DEBUG = os.environ.get("MYKYAGENT_DEBUG") == "1"
 
@@ -2070,7 +2071,21 @@ def _filter_structured(structured: dict, query: str) -> dict:
 
 def _is_js_gated(html: str, text: str) -> bool:
     low = (text or "").strip().lower()
-    if len(low) < 250:
+    if len(low) < 450:
+        return True
+    if any(
+        pat in low
+        for pat in (
+            "user rating: safe",
+            "user rating : safe",
+            "rating: safe",
+            "security status: safe",
+            "100% clean",
+            "100% safe",
+            "download now",
+            "click here to download",
+        )
+    ) and len(low) < 900:
         return True
     head = html[:6000].lower()
     if any(
@@ -2124,6 +2139,7 @@ def fetch(
     ttl: int = PAGE_TTL,
     enum_mode: bool = False,
     _fresh: bool = False,
+    force_browser: bool = False,
 ) -> dict:
     """Fetch one URL.
 
@@ -2131,12 +2147,14 @@ def fetch(
     {url,error}. Cache hits report their age so a caller can tell a fresh fetch
     from a day-old copy; `_fresh` bypasses the cache read entirely.
     """
+    should_force_browser = force_browser or FORCE_BROWSER
     eff_budget = budget if query else max(budget, NO_QUERY_BUDGET)
 
     hit = None if _fresh else cache_get_age("page", url, ttl)
     if hit:
         ck, age = hit
-        if query is None or ck.get("_q") == query:
+        # If caller forces browser, do not reuse a non-browser static cache entry
+        if (not should_force_browser or ck.get("browser")) and (query is None or ck.get("_q") == query):
             ck.pop("_q", None)
             ck["cached"] = True
             ck["age_s"] = round(age, 1)
@@ -2208,15 +2226,15 @@ def fetch(
 
         text, links, title = html_to_markdown(html, url)
 
-        if _is_js_gated(html, text) and not NO_BROWSER and not out_of_time(8):
+        if (should_force_browser or _is_js_gated(html, text)) and not NO_BROWSER and not out_of_time(8):
             br = _fetch_browser(
                 url, query, browser=_browser, budget=eff_budget, enum_mode=enum_mode
             )
-            if br.get("text") and len(br["text"]) > len(text):
+            if br.get("text") and (should_force_browser or len(br["text"]) > len(text)):
                 res = {
                     "url": url,
                     "text": br["text"],
-                    "links": links,
+                    "links": br.get("links") or links,
                     "title": br.get("title") or title,
                     "browser": True,
                     **extra,
@@ -3090,6 +3108,11 @@ def unit() -> dict:
         _prior("https://docs.oracle.com/en/java/x") > _prior("https://randomblog.example.com/x"),
     )
 
+    # --- js-gated detection ------------------------------------------------
+    ck("js_gated: short text triggers browser", _is_js_gated("<html></html>", "short text"))
+    ck("js_gated: rating safe stub triggers browser", _is_js_gated("<html></html>", "Softpedia Tool\nUser rating: safe\nDownload now"))
+    ck("js_gated: clean substantive text does not trigger", not _is_js_gated("<html><body>" + "x" * 600 + "</body></html>", "A substantive technical article explaining details. " * 20))
+
     passed = sum(1 for c in checks if c["ok"])
     return {
         "checks": len(checks),
@@ -3185,9 +3208,10 @@ def main() -> None:
             res = fused_search(arg, max_results=10)[0]
             print(json.dumps(res))
         elif mode == "fetch":
-            rest = [a for a in sys.argv[3:] if a != "--fresh"]
+            rest = [a for a in sys.argv[3:] if a not in ("--fresh", "--browser", "--force-browser")]
             q = rest[0] if rest else None
-            print(json.dumps(fetch(arg, q, _fresh="--fresh" in sys.argv[3:])))
+            force_br = "--browser" in sys.argv[3:] or "--force-browser" in sys.argv[3:]
+            print(json.dumps(fetch(arg, q, _fresh="--fresh" in sys.argv[3:], force_browser=force_br)))
         elif mode == "research":
             print(json.dumps(research(arg)))
         elif mode == "selftest":

@@ -111,6 +111,17 @@ const emptyDir = mkdtempSync(join(tmpdir(), "mykyagent-empty-"));
 process.env.MYKYAGENT_MEMORY_DIR = emptyDir;
 t("empty: index block is empty string", M.memoryIndexBlock() === "");
 t("empty: list is empty", M.listMemoryEntries().length === 0);
+t("empty: prefix-filtered index is empty too", M.memoryIndexBlock(M.charMemoryPrefix("evelyn")) === "");
+
+// --- per-character namespace prefix ------------------------------------------
+t("charMemoryPrefix slugifies slug", M.charMemoryPrefix("Evelyn von Code!") === "char-evelyn-von-code-");
+t("charMemoryPrefix safe chars only", /^char-[a-z0-9_-]+-$/.test(M.charMemoryPrefix("A_B")));
+
+M.writeMemoryEntry("char-evelyn-trust", "Evelyn trust meter", "body");
+M.writeMemoryEntry("char-evelyn-amulet", "Silver amulet flag", "body");
+const nsBlock = M.memoryIndexBlock("char-evelyn-");
+t("prefix filter: excludes global topics", !nsBlock.includes("alpha"));
+t("prefix filter: includes matching topic", nsBlock.includes("char-evelyn-trust"));
 
 rmSync(DIR, { recursive: true, force: true });
 rmSync(legacyDir, { recursive: true, force: true });

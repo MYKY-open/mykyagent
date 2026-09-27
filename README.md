@@ -92,6 +92,21 @@ Reports the before/after available-model count and any per-provider errors.
 The current session model is unchanged; new models show up in `/model-web list`
 and pi's picker immediately.
 
+## Universal Toggles (`/mykyagent`)
+Toggle any tool, skill, or agent feature on/off individually:
+* `/mykyagent` — Open interactive Settings picker (scroll with arrow keys, toggle with Enter/Space/arrows)
+* `/mykyagent status` — Print status summary of all tools, skills, and features
+* `/mykyagent toggle <name>` — Flip a tool, skill, or feature on/off (e.g. `/mykyagent toggle bash`)
+* `/mykyagent on <name>` / `/mykyagent off <name>` — Enable or disable explicitly (e.g. `/mykyagent off memory`, `/mykyagent off web-scraping`)
+* `/mykyagent reset` — Re-enable all tools, skills, and features back to default
+
+**Toggleable categories:**
+* **Tools**: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `memory_read`, `memory_write`, `memory_forget`, `memory_list`, `mcp_connect`, `mcp_disconnect`, `mcp_list`, and any discovered MCP server tools.
+* **Skills**: Master skills toggle (`skills`) and per-skill toggles (e.g. `web-scraping`).
+* **Features**: `memory` (persistent index & tools), `persona` (tone styling in prompt), `tool_recovery` (think-tag tool call recovery), `output_sanitizer` (progress bar/ticker cleaning), `web`, `mcp`.
+
+Saved to `~/.config/mykyagent/toggles.json` and persists across sessions.
+
 ## Web Killswitch
 * `/web-toggle` — flip web tools on/off
 * `/web-toggle off` — remove `web_search` + `web_fetch` from the agent
@@ -377,6 +392,64 @@ than 24h (metadata + log + marker).
 | --- | --- | --- |
 | `MYKYAGENT_TASKS_DIR` | `~/.config/mykyagent/tasks` | Task metadata/log/marker location |
 
+## RP Harness (Modes, Characters, Lorebooks)
+
+MykyAgent runs as a tri-mode harness. Samplers are never touched — mode switching only changes the system prompt, the active toolset, and the guard rules.
+
+### Modes
+
+| Command | Mode | Behavior |
+| --- | --- | --- |
+| `/mode code` | Software engineering (default) | Caveman/engineering prompt, all dev tools |
+| `/mode rp` | Roleplay | Character card prompt, coding tools **off**, RPG tools on |
+| `/mode rp-creator` | Story studio | Card architect prompt, creator + dev tools |
+
+`/mode` with no args opens an interactive picker. The persisted mode lives in `~/.config/mykyagent/mode.json`. The `rp` feature toggle (`/mykyagent off rp`) is the master killswitch: when off, everything behaves as code mode regardless of the stored mode.
+
+### Character Cards (Character Card V2 / Tavern-compatible)
+
+Cards are JSON in `~/.config/mykyagent/characters/<slug>.json` with fields `name`, `description`, `personality`, `scenario`, `first_message`, `mes_example`, optional `system_prompt`/`tags`/`lorebook`. `{{char}}`/`{{user}}` placeholders are substituted at render time. Only `name` is required — every other field is optional and simply omitted from the prompt when absent (real-world cards often ship without `scenario` or `personality`); validation reports the gaps as warnings.
+
+| Command | Effect |
+| --- | --- |
+| `/character` or `/rp` | Interactive picker (seeds bundled starters: evelyn, narrator, tutor-ada on first use) |
+| `/character load <name>` | Activate a card (auto-switches to `rp` mode, prints the greeting) |
+| `/character list` | Cards with token estimates |
+| `/character greeting` | Re-send the character's opening message |
+| `/character import <path\|url>` | Import a `.png` (chara/ccv3 tEXt chunk) or `.json` card from a local path or URL |
+| `/character unload` | Clear character, return to code mode |
+
+**Import** is SillyTavern-compatible: handles V1 flat cards (`first_mes`, `creatorcomment`), V2/V3 nested `{ spec, data }` payloads (base64 in the PNG `chara`/`ccv3` chunk — V3 preferred when both exist — including the UTF-16LE legacy encoding). Drops `alternate_greetings`, `extensions`, and embedded `character_book` with a warning; runs the same validation as `character_save`. Import does not auto-load — follow with `/character load <slug>`. The agent can also do it for you: "import the card at ~/Downloads/x.png" in creator mode just calls the same machinery via file reading + `character_save`.
+
+In `rp` mode the system prompt is rebuilt each turn as structured XML (`<character>`, `<scenario>`, `<dialogue_examples>`) that small local models follow well.
+
+### Per-Character Memory
+
+Agent memory is one global store in `~/.config/mykyagent/memory/`, but in `rp` mode with a loaded character it is **namespaced**: writes land in `char-<slug>-<topic>` files, the prompt index and `memory_list` show only that character's topics, and `memory_read` resolves the character's topics first (global topics remain readable by exact name for OOC questions). Switching characters or unloading switches namespaces automatically; `code` and `rp-creator` modes always see the global store.
+
+### RP-Creator Studio
+
+`/mode rp-creator` turns the agent into a character architect with dedicated tools:
+
+- `character_save(slug, card)` / `character_read(slug)` — card CRUD
+- `lorebook_save(slug, entries)` — world info files in `~/.config/mykyagent/lore/`
+- `card_audit(slug)` — token budget, `{{user}}`/`{{char}}` presence, missing greeting, lorebook trigger overlaps
+
+Workflows: `/rp-creator new` (interactive interview), `/rp-creator card <concept>`, `/rp-creator lore <world>`, `/rp-creator audit <slug>`. Post-session evolution: switch to creator mode and describe what happened ("Update Evelyn: she now trusts the user...").
+
+### Auto-Lorebook & Author's Note
+
+- **Lorebook**: each turn, the user's message is scanned for entry `keys`; matches are injected as an `<active_lore>` block for that turn only. Books load from the character's `lorebook` reference plus a global `default` book. Toggle: `/mykyagent toggle lorebook`.
+- **Author's Note**: `/an <text>` sets a steering block, `/an depth <n>` sets insertion depth (default 1), `/an clear` removes it, `/an show` displays it. Toggle: `/mykyagent toggle authors_note`.
+
+### RPG Tools
+
+Available in `rp` mode (toggle: `/mykyagent toggle rpg_tools`):
+
+- `dice_roll(spec="2d6+3")` — crypto-RNG dice: `d20`, `2d6+3`, `4dF`, `2d20kh1`
+- `game_state(action="set", key="inventory.gold", value=150)` — persistent dotted-key state per campaign in `~/.config/mykyagent/gamestate/`
+- `advance_time(hours=4)` — in-world clock with day/night phases
+
 ## Tests
 
 ### Offline - `./run_tests.sh`
@@ -385,6 +458,8 @@ Everything here runs without a network:
 
 | Suite | Assertions | Covers |
 | --- | --- | --- |
+| `rp.test.ts` | 70 | mode persistence/gating, card validation/rendering, lorebook scanning, author's note, dice/state/time, card audit |
+| `rp_wiring.test.ts` | 37 | registration, mode-gated toolset, RP/creator prompt dispatch, cross-mode card flow |
 | `memory.test.ts` | 34 | slug/path safety, caps, index, migration, injection guard |
 | `background_tasks.test.ts` | 31 | real-process lifecycle: start returns before completion, exit markers, kill, bounded tails, clean |
 | `search_hops.test.ts` | 22 | multi-hop control flow, `FOLLOWUP` parsing |

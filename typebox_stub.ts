@@ -18,4 +18,5 @@ export const Type: any = {
   Literal: schema,
   Union: schema,
   Record: schema,
+  Any: schema,
 };

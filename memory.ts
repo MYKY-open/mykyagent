@@ -200,12 +200,21 @@ export function migrateLegacyMemory(): number {
   return migrated;
 }
 
+/** Prefix used for per-character RP memory namespaces ("char-<slug>-<topic>"). */
+export const CHAR_MEMORY_PREFIX = "char-";
+
+export function charMemoryPrefix(slug: string): string {
+  return `${CHAR_MEMORY_PREFIX}${memorySlug(slug)}-`;
+}
+
 /**
  * The ONLY memory text that reaches the system prompt: topic names plus
- * one-line summaries, capped at MEMORY_INDEX_MAX characters.
+ * one-line summaries, capped at MEMORY_INDEX_MAX characters. When `onlyPrefix`
+ * is set, only topics under that namespace are shown (per-character RP mode).
  */
-export function memoryIndexBlock(): string {
-  const entries = listMemoryEntries();
+export function memoryIndexBlock(onlyPrefix?: string): string {
+  let entries = listMemoryEntries();
+  if (onlyPrefix) entries = entries.filter((e) => e.name.startsWith(onlyPrefix));
   if (entries.length === 0) return "";
 
   const lines: string[] = [];
@@ -230,3 +239,17 @@ export function memoryIndexBlock(): string {
   if (hidden > 0) block += `\n(${hidden} further topic(s) not shown - use memory_list)`;
   return block;
 }
+
+/** Delete every memory entry under a character namespace prefix. Returns count of deleted entries. */
+export function clearCharacterMemories(charSlug: string): number {
+  const prefix = `char-${charSlug}-`;
+  let count = 0;
+  for (const entry of listMemoryEntries()) {
+    if (entry.name.startsWith(prefix)) {
+      forgetMemory(entry.name);
+      count++;
+    }
+  }
+  return count;
+}
+

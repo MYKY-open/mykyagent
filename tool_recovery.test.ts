@@ -197,6 +197,87 @@ const userMsg = {
 const recovery3 = recoverLeakedToolCalls(userMsg);
 t("recovery non-assistant: ignored", recovery3.recovered === false);
 
+// --- 11. Python Function Call: Action: prefix + kwargs + list -----------------
+const pythonCallText = `Action: game_state(action="set", key="inventory", value=["rope", "half-torch"])`;
+const res11 = extractToolCallsFromText(pythonCallText, { isThinking: true });
+t("python action: extracts 1 call", res11.toolCalls.length === 1);
+t("python action: name is game_state", res11.toolCalls[0]?.name === "game_state");
+t("python action: action is set", res11.toolCalls[0]?.arguments?.action === "set");
+t("python action: key is inventory", res11.toolCalls[0]?.arguments?.key === "inventory");
+t(
+  "python action: value is array with items",
+  Array.isArray(res11.toolCalls[0]?.arguments?.value) &&
+    res11.toolCalls[0]?.arguments?.value[0] === "rope" &&
+    res11.toolCalls[0]?.arguments?.value[1] === "half-torch"
+);
+t("python action: thinking indicator present", res11.cleanedText === "[Recovered tool call: game_state]");
+
+// --- 12. Python Function Call in Narrative Text: clean prose ------------------
+const narrativeWithCall = `game_state(action="set", key="inventory", value=["rope", "half-torch"])
+
+The echoes of your confusion ring out into the cavern...`;
+const res12 = extractToolCallsFromText(narrativeWithCall, { isThinking: false });
+t("narrative text: extracts 1 call", res12.toolCalls.length === 1);
+t("narrative text: name is game_state", res12.toolCalls[0]?.name === "game_state");
+t("narrative text: cleanedText contains prose", res12.cleanedText === "The echoes of your confusion ring out into the cavern...");
+t("narrative text: no raw code in prose", !res12.cleanedText.includes("game_state"));
+
+// --- 13. Positional Args Mapping ----------------------------------------------
+const positionalText = `dice_roll("2d6+3", "Stealth check")`;
+const res13 = extractToolCallsFromText(positionalText);
+t("positional: extracts 1 call", res13.toolCalls.length === 1);
+t("positional: spec argument mapped", res13.toolCalls[0]?.arguments?.spec === "2d6+3");
+t("positional: reason argument mapped", res13.toolCalls[0]?.arguments?.reason === "Stealth check");
+
+// --- 14. Markdown Code Block Tool Call ----------------------------------------
+const codeBlockCall = `Let me check the dice:
+\`\`\`tool_call
+{"name": "dice_roll", "arguments": {"spec": "1d20", "reason": "Initiative"}}
+\`\`\`
+rolling now...`;
+const res14 = extractToolCallsFromText(codeBlockCall, { isThinking: false });
+t("code block: extracts 1 call", res14.toolCalls.length === 1);
+t("code block: name is dice_roll", res14.toolCalls[0]?.name === "dice_roll");
+t("code block: spec is 1d20", res14.toolCalls[0]?.arguments?.spec === "1d20");
+t("code block: prose preserved", res14.cleanedText.includes("Let me check the dice:") && res14.cleanedText.includes("rolling now..."));
+
+// --- 15. Deduplication across thinking and text ------------------------------
+const msgWithDupe = {
+  role: "assistant",
+  stopReason: "stop",
+  content: [
+    {
+      type: "thinking",
+      thinking: `I need to give the user the starting items.\nAction: game_state(action="set", key="inventory", value=["rope", "half-torch"])`,
+    },
+    {
+      type: "text",
+      text: `game_state(action="set", key="inventory", value=["rope", "half-torch"])\n\nThe echoes of your confusion ring out into the cavern...`,
+    },
+  ],
+};
+const recoveryDupe = recoverLeakedToolCalls(msgWithDupe);
+t("deduplication: recovered is true", recoveryDupe.recovered === true);
+t("deduplication: stopReason is toolUse", recoveryDupe.message.stopReason === "toolUse");
+const toolBlocks = recoveryDupe.message.content.filter((b: any) => b.type === "toolCall");
+t("deduplication: exactly 1 toolCall block appended", toolBlocks.length === 1);
+t("deduplication: call name is game_state", toolBlocks[0]?.name === "game_state");
+t(
+  "deduplication: text cleaned of leaked code",
+  recoveryDupe.message.content[1].text === "The echoes of your confusion ring out into the cavern..."
+);
+t(
+  "deduplication: thinking cleaned of leaked code",
+  recoveryDupe.message.content[0].thinking.includes("[Recovered tool call: game_state]") &&
+    !recoveryDupe.message.content[0].thinking.includes("Action: game_state")
+);
+
+// --- 16. Negative Test: False Positives --------------------------------------
+const normalProse = `I took action (not words) to resolve the issue with the system.`;
+const res16 = extractToolCallsFromText(normalProse);
+t("false positive: no tool calls extracted from English prose", res16.toolCalls.length === 0);
+t("false positive: text unchanged", res16.cleanedText === normalProse);
+
 // --- Summary -----------------------------------------------------------------
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

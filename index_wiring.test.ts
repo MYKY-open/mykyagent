@@ -4,13 +4,17 @@
  * mcpkill.json killswitch, and the /mcp-toggle command. The live-transport
  * coverage lives in mcp.test.ts + run_mcp_smoke.sh.
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const DIR = mkdtempSync(join(tmpdir(), "mykyagent-wire-"));
 process.env.MYKYAGENT_MCP_FILE = join(DIR, "mcp.json");
 process.env.MYKYAGENT_MCPKILL_FILE = join(DIR, "mcpkill.json");
+process.env.MYKYAGENT_WEBKILL_FILE = join(DIR, "webkill.json");
+process.env.MYKYAGENT_WEBBROWSER_FILE = join(DIR, "webbrowser.json");
+process.env.MYKYAGENT_TOGGLES_FILE = join(DIR, "toggles.json");
+process.env.MYKYAGENT_MODE_FILE = join(DIR, "mode.json");
 // Keep the startup auto-reconnect pointed at the empty temp config.
 
 const ext = (await import("./index.ts")).default;
@@ -80,6 +84,132 @@ t("mcp_list reports adapter state", typeof listed.content?.[0]?.text === "string
 const ghost = await tools.mcp_disconnect.execute("x", { server: "ghost" });
 t("mcp_disconnect on unknown server errors", ghost.isError === true, JSON.stringify(ghost).slice(0, 120));
 
+// --- 6. web browser override & /web-browser command -------------------------
+t("web_fetch tool registered", !!tools.web_fetch);
+t("web_fetch parameters include browser property", !!(tools.web_fetch?.parameters?.properties?.browser ?? tools.web_fetch?.parameters?.browser));
+t("/web-browser registered as a user command", !!commands["web-browser"]);
+t("/browser-toggle registered as an alias", !!commands["browser-toggle"]);
+
+const comp = commands["web-browser"].getArgumentCompletions("");
+t("web-browser argument completions return options", Array.isArray(comp) && comp.some((c: any) => c.value === "auto") && comp.some((c: any) => c.value === "on") && comp.some((c: any) => c.value === "off"));
+
+const readBrowserFileMode = () => {
+  const f = process.env.MYKYAGENT_WEBBROWSER_FILE!;
+  if (!existsSync(f)) return null;
+  return JSON.parse(readFileSync(f, "utf-8"))?.mode;
+};
+
+await commands["web-browser"].handler("on", cmdCtx);
+t("/web-browser on persists force mode", readBrowserFileMode() === "force");
+
+await commands["web-browser"].handler("off", cmdCtx);
+t("/web-browser off persists off mode", readBrowserFileMode() === "off");
+
+await commands["web-browser"].handler("auto", cmdCtx);
+t("/web-browser auto persists auto mode", readBrowserFileMode() === "auto");
+
+// bare toggle flips between auto and force
+await commands["web-browser"].handler("", cmdCtx);
+t("bare /web-browser flips auto to force", readBrowserFileMode() === "force");
+
+await commands["web-browser"].handler("", cmdCtx);
+t("bare /web-browser flips force to auto", readBrowserFileMode() === "auto");
+
+await commands["web-browser"].handler("status", cmdCtx);
+t("/web-browser status does not change mode", readBrowserFileMode() === "auto");
+
+// --- 7. /mykyagent command & universal toggles ------------------------------
+t("/mykyagent registered as a user command", !!commands["mykyagent"]);
+
+const maComp = commands["mykyagent"].getArgumentCompletions("");
+t(
+  "mykyagent argument completions include subcommands",
+  Array.isArray(maComp) &&
+    maComp.some((c: any) => c.value === "status") &&
+    maComp.some((c: any) => c.value === "toggle") &&
+    maComp.some((c: any) => c.value === "reset")
+);
+
+const maToggleComp = commands["mykyagent"].getArgumentCompletions("toggle ");
+t(
+  "mykyagent toggle completions list items",
+  Array.isArray(maToggleComp) &&
+    maToggleComp.some((c: any) => c.value.includes("bash")) &&
+    maToggleComp.some((c: any) => c.value.includes("memory"))
+);
+
+// Disable a tool via /mykyagent off bash
+await commands["mykyagent"].handler("off bash", cmdCtx);
+const { isToolEnabled, isFeatureEnabled, isSkillEnabled } = await import("./toggles.ts");
+t("/mykyagent off bash disables bash", isToolEnabled("bash") === false);
+t("/mykyagent off bash removes bash from live active tools", !activeTools.includes("bash"));
+
+// before_agent_start keeps bash disabled
+await hooks["before_agent_start"]({}, { cwd: DIR });
+t("before_agent_start does not re-add disabled bash", !activeTools.includes("bash"));
+
+// tool_call hook blocks disabled tool
+const blockedCall = await hooks["tool_call"]({ toolName: "bash", input: { command: "ls" } });
+t("tool_call blocks disabled bash", blockedCall?.block === true && blockedCall?.reason?.includes("disabled by /mykyagent"));
+
+// Re-enable bash via /mykyagent on bash
+await commands["mykyagent"].handler("on bash", cmdCtx);
+t("/mykyagent on bash re-enables bash", isToolEnabled("bash") === true);
+await hooks["before_agent_start"]({}, { cwd: DIR });
+t("before_agent_start restores enabled bash", activeTools.includes("bash"));
+
+const allowedCall = await hooks["tool_call"]({ toolName: "bash", input: { command: "ls" } });
+t("tool_call does not block enabled bash", !allowedCall?.block);
+
+// Test feature toggle: memory
+await commands["mykyagent"].handler("off memory", cmdCtx);
+t("/mykyagent off memory disables memory feature", isFeatureEnabled("memory") === false);
+await hooks["before_agent_start"]({}, { cwd: DIR });
+t("before_agent_start removes memory tools when memory feature is off", !activeTools.some((t) => t.startsWith("memory_")));
+
+// Test skill inclusion & toggle in systemPrompt
+const promptRes1 = await hooks["before_agent_start"](
+  {
+    systemPromptOptions: {
+      skills: [
+        {
+          name: "web-scraping",
+          description: "Scrape web pages",
+          filePath: "/path/to/SKILL.md",
+        },
+      ],
+    },
+  },
+  { cwd: DIR }
+);
+t("skills formatted in system prompt when enabled", promptRes1?.systemPrompt?.includes("web-scraping"));
+
+await commands["mykyagent"].handler("off web-scraping", cmdCtx);
+t("skill web-scraping disabled", isSkillEnabled("web-scraping") === false);
+
+const promptRes2 = await hooks["before_agent_start"](
+  {
+    systemPromptOptions: {
+      skills: [
+        {
+          name: "web-scraping",
+          description: "Scrape web pages",
+          filePath: "/path/to/SKILL.md",
+        },
+      ],
+    },
+  },
+  { cwd: DIR }
+);
+t("disabled skill omitted from system prompt", !promptRes2?.systemPrompt?.includes("web-scraping"));
+
+// Reset all toggles
+await commands["mykyagent"].handler("reset", cmdCtx);
+t("reset restores memory feature", isFeatureEnabled("memory") === true);
+t("reset restores skill", isSkillEnabled("web-scraping") === true);
+t("reset restores tool", isToolEnabled("bash") === true);
+
 rmSync(DIR, { recursive: true, force: true });
 console.log(`\n${pass} pass, ${fail} fail`);
 process.exit(fail === 0 ? 0 : 1);
+

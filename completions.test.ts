@@ -14,6 +14,8 @@ const DIR = mkdtempSync(join(tmpdir(), "mykyagent-comp-"));
 process.env.MYKYAGENT_MODELS_JSON = join(DIR, "models.json");
 process.env.MYKYAGENT_MCP_FILE = join(DIR, "mcp.json");
 process.env.MYKYAGENT_MCPKILL_FILE = join(DIR, "mcpkill.json");
+process.env.MYKYAGENT_MODE_FILE = join(DIR, "mode.json");
+process.env.MYKYAGENT_TOGGLES_FILE = join(DIR, "toggles.json");
 // One openrouter base model in the "catalog" + one models.json variant.
 writeFileSync(
   process.env.MYKYAGENT_MODELS_JSON,
@@ -125,6 +127,24 @@ await hooks["before_agent_start"]({}, { cwd: DIR, modelRegistry: fakeRegistry })
 {
   const c = await commands["model-web"].getArgumentCompletions("set llama-local/Qwen");
   t("mw: 'set llama-local/Qwen' slash query matches", (c ?? []).some((i: any) => i.value === "set llama-local/Qwen3.8-35B-A3B-Q4_K_M"), JSON.stringify(c));
+}
+
+// --- /mykyagent --------------------------------------------------------------
+{
+  const c = await commands["mykyagent"].getArgumentCompletions("");
+  t("ma: bare → subcommands", Array.isArray(c) && c.some((i: any) => i.value === "status") && c.some((i: any) => i.value === "toggle"), JSON.stringify(c));
+}
+{
+  const c = await commands["mykyagent"].getArgumentCompletions("tog");
+  t("ma: 'tog' fuzzy → toggle", Array.isArray(c) && c.some((i: any) => i.value === "toggle"), JSON.stringify(c));
+}
+{
+  const c = await commands["mykyagent"].getArgumentCompletions("toggle ");
+  t("ma: 'toggle ' → items with prefix", Array.isArray(c) && c.some((i: any) => i.value === "toggle bash"), JSON.stringify(c));
+}
+{
+  const c = await commands["mykyagent"].getArgumentCompletions("disable ");
+  t("ma: 'disable ' → items with prefix", Array.isArray(c) && c.some((i: any) => i.value === "disable memory"), JSON.stringify(c));
 }
 
 rmSync(DIR, { recursive: true, force: true });
