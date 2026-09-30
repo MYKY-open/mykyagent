@@ -285,9 +285,24 @@ and a reranker cannot learn. Cost if ever revisited: `onnxruntime`, `tokenizers`
 uv run search_helper.py search   "query"            # one SERP, fused + cached
 uv run search_helper.py fetch    "URL" [focus]      # one page -> distilled markdown
 uv run search_helper.py research "query"            # full pipeline (used by the agent)
+uv run search_helper.py multi    '["q1","q2"]'    # N queries concurrently, merged bundle
 uv run search_helper.py unit     x                  # offline heuristic tests (no network)
 uv run search_helper.py selftest x                  # live end-to-end harness (network)
 ```
+
+### Code layout (`webresearch/`)
+
+The original `search_helper.py` monolith is split into one concern per module
+(`config`, `cache`, `http`, `text`, `html`, `blocks`, `rank`, `serp`,
+`providers`, `fetchmod`, `pipeline`, `cli`); `search_helper.py` is a thin shim
+so all commands above keep working. Default behavior is unchanged —
+experiments live in `webresearch/backends.py` and are env-gated:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `MYKYAGENT_SERP_BACKEND` | `original` | `searxng` merges a self-hosted SearXNG aggregate into candidates (one JSON call, no scraper throttling; needs `MYKYAGENT_SEARXNG_URL`, default `http://127.0.0.1:8888`) |
+| `MYKYAGENT_EXTRACTOR` | `builtin` | `trafilatura` tries trafilatura first for article text, builtin fallback (`pip install trafilatura`) |
+| `MYKYAGENT_JINA_FALLBACK` | unset | `1` routes thin/failed fetches (JS shells, bot-walls, tweets) through `https://r.jina.ai/`; `MYKYAGENT_JINA_KEY` raises limits |
 
 ### Environment knobs
 
