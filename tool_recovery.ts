@@ -8,6 +8,9 @@
  *   4. As Python-style function calls: `tool_name(k=v, ...)` or `Action: tool_name(...)`
  *      which local reasoning/RP models (Gemma, Llama, Qwen, Ling) emit when prompted
  *      with tool signatures or following ReAct conventions.
+ *      Only recovered when the name is a registered tool (or mcp_*) or the call
+ *      carries an explicit `Action:`/`Tool:`/`Call:` marker — arbitrary prose
+ *      shaped like `Word(key=value)` must NOT be treated as a tool call.
  *
  * Converts the leaked calls into executable ToolCall content blocks,
  * cleans the leaked code syntax from thinking and narrative text blocks,
@@ -504,9 +507,18 @@ export function extractToolCallsFromText(
       // Must be a known tool, or start with mcp_, or have explicit Action: prefix,
       // or args contain explicit keyword assignments.
       const isKnown = knownTools.has(toolName) || toolName.startsWith("mcp_");
-      const hasKeywords = /\b[a-zA-Z_][a-zA-Z0-9_-]*\s*=/.test(rawArgs);
 
-      if (hasActionPrefix || isKnown || hasKeywords) {
+      // Accept a bare `name(...)` match only when it carries an explicit
+      // Action/Tool/Call marker or the name resolves to a registered tool.
+      // The old third condition (`key=value` anywhere in the parens) was far
+      // too weak: ordinary prose like
+      //     ... `raviole_defconfig` + KernelSU(`CONFIG_KSU=y`)
+      // matched, the span got deleted from the text, and a phantom
+      // "KernelSU" tool call was executed ("Tool KernelSU not found").
+      // Unknown names can't execute anyway, so suppressing them only keeps
+      // prose intact; known/mcp_ names and explicit Action: markers still
+      // recover as before.
+      if (hasActionPrefix || isKnown) {
         functionMatches.push({
           start: startIndex,
           end: endIndex,

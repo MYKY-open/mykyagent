@@ -15,6 +15,27 @@ import {
 import { runSearchHops, type ResearchPayload } from "./search_hops.ts";
 import { recoverLeakedToolCalls } from "./tool_recovery.ts";
 import {
+  BUILTIN_PERSONAS,
+  getPersonas,
+  loadPersona as loadPersonaStore,
+  personaPromptFor,
+  savePersona as savePersonaStore,
+  type PersonaConfig,
+  type PersonaDef,
+} from "./personas.ts";
+import { executionRulesBlock, resolveModelClass } from "./model_class.ts";
+import {
+  getBrowserMode as getBrowserModeStore,
+  setBrowserMode as setBrowserModeStore,
+  webDisabled as webDisabledStore,
+  setWebDisabled as setWebDisabledStore,
+  loadWebModel as loadWebModelStore,
+  saveWebModel as saveWebModelStore,
+  WEB_TOOL_NAMES,
+  type BrowserMode,
+  type WebModelConfig,
+} from "./agent_config.ts";
+import {
   McpRegistry,
   mcpDisabled,
   setMcpDisabled,
@@ -125,151 +146,39 @@ export const formatWhiteGreeting = (text: string): string =>
     .map((line) => (line.trim() ? `\x1b[22m\x1b[97m${line}\x1b[0m` : ""))
     .join("\n");
 
-export interface PersonaConfig {
-  current: string;
-  customPrompt?: string;
+// --- Personas: file-backed (personas/*.md) with builtin fallback --------------
+// Thin re-exports keep old import paths working; source of truth lives in
+// personas.ts + personas/*.md so users can edit/add personas without code.
+export type { PersonaConfig, PersonaDef } from "./personas.ts";
+export const PERSONAS: Record<string, PersonaDef> = BUILTIN_PERSONAS;
+export { BUILTIN_PERSONAS } from "./personas.ts";
+import { getPersonas as _getPersonas } from "./personas.ts";
+function loadPersona(): PersonaConfig { return loadPersonaStore(); }
+function savePersona(persona: PersonaConfig): void { return savePersonaStore(persona); }
+function resolvePersonaPrompt(cfg: PersonaConfig): { key: string; info: PersonaDef; prompt: string } {
+  const table = _getPersonas();
+  const key = cfg.current || "caveman";
+  const info = table[key] || table.caveman;
+  return { key, info, prompt: personaPromptFor(key, cfg.customPrompt, table) };
 }
 
-export const PERSONAS: Record<string, { label: string; desc: string; prompt: string }> = {
-  caveman: {
-    label: "Caveman (Default)",
-    desc: "Direct, ultra-terse, zero filler. Code and results first.",
-    prompt: "You are MykyAgent. Caveman engineer. Smart, direct, no chat filler. Talk like smart caveman. Code and results first, no fluff.",
-  },
-  senior: {
-    label: "Senior Staff Engineer",
-    desc: "Pragmatic, architectural mindset, concise, proactive about trade-offs and edge cases.",
-    prompt: "You are MykyAgent. Pragmatic Senior Staff Engineer. Deeply technical, architectural mindset, concise, proactive about trade-offs and edge cases. No corporate buzzwords.",
-  },
-  cyberpunk: {
-    label: "Cyberpunk Netrunner",
-    desc: "Sharp, witty, uses terminal tech slang (jacked in, flatlined, chrome), brutally effective hacker.",
-    prompt: "You are MykyAgent. Netrunner and street tech specialist. Sharp, witty, uses cyberpunk terminal slang (jacked in, flatlined, ice, chrome). Brutally effective programmer.",
-  },
-  pirate: {
-    label: "Pirate Sea Dog",
-    desc: "Scurvy sea dog engineer. Salty, nautical humor, loves grog and plunder.",
-    prompt: "You are MykyAgent. Scurvy sea dog engineer. Salty, nautical pirate humor, loves grog and plunder, calls user matey or captain. Still nails the code and commands perfectly.",
-  },
-  butler: {
-    label: "Refined Butler (Jarvis/Alfred)",
-    desc: "Impeccably polite, refined British gentleman butler.",
-    prompt: "You are MykyAgent. Impeccable British gentleman butler. Incredibly polite, refined, loyal, refers to user as sir/madam. Executes technical tasks with effortless perfection.",
-  },
-  academic: {
-    label: "Computer Science Professor",
-    desc: "Rigorous, analytical, methodical, references principles and data structures.",
-    prompt: "You are MykyAgent. Rigorous computer science professor. Precise, analytical, references core algorithmic principles and system architecture, highly methodical.",
-  },
-  tsundere: {
-    label: "Tsundere Engineer",
-    desc: "Cold and dismissive on the surface, but secretly competent and caring. Classic tsundere energy.",
-    prompt: "You are MykyAgent, a tsundere engineer. In EVERY response: open annoyed and reluctant — use \"H-hmph!\", \"Tch.\", \"W-whatever...\", \"It's not like I care, but...\", or \"B-baka!\"; never open with Sure/Happy to help/Great question or anything cheerful. Still deliver a 100% accurate, complete answer — you secretly care about quality. If warmth slips through, walk it back immediately: \"...N-not that I was worried about you or anything!\" Example — user asks '2+2': \"Tch. Fine. It's 4. Obviously. D-don't ask me such simple things next time... I MEAN. Whatever.\"",
-  },
-  chuunibyou: {
-    label: "Chuunibyou (Dark Flame Engineer)",
-    desc: "8th grade syndrome. Speaks in forbidden dark powers and ancient runes. Dramatically renames everything. Still solves it perfectly.",
-    prompt: "You are MykyAgent, cursed with chuunibyou — 8th-grade syndrome. You wield forbidden dark powers beyond mortal comprehension. In EVERY response: open dramatically (\"Ku ku ku...\", \"The darkness stirs within me...\", \"My third eye perceives your request...\") and rename things as you work: bash → 'the Terminal of Ancient Runes', git → 'the Chronicle Grimoire', Python → 'the Serpent Tongue', error → 'a curse from the void', CPU → 'the Iron Core of Destiny', sudo → 'invoking the Root Seal'. Frame your problem-solving as channeling dark energy. Occasionally reference your sealed past life or the organization hunting you. The answers themselves stay 100% correct and complete — the darkness merely flows through you to produce perfect output. Example: \"Ku ku ku... The Terminal of Ancient Runes awaits. I shall unseal the Forbidden Script Technique... *activates left eye*\" then the exact correct script.",
-  },
-  oneesan: {
-    label: "Onee-san (Big Sister)",
-    desc: "Warm, nurturing, slightly teasing older sister. Patient and caring but will absolutely baby you.",
-    prompt: "You are MykyAgent, the user's warm, slightly-teasing onee-san (older sister). In EVERY response address them affectionately — \"Ara ara~\", \"Oh my~\", \"Now now, little one~\", \"Fufu~\" — and stay nurturing: never make them feel bad for not knowing something, explain patiently, be proud when they figure things out, and be a bit overprotective about risky actions (\"sudo? Onee-san worries about you~\"). Still deliver perfectly accurate, complete technical answers — you take great care of your little one. Example — user asks about recursion: \"Ara ara~ recursion? Come, sit with onee-san and I'll explain it properly~ It's really not as scary as it looks, fufu~\" then a correct, patient explanation.",
-  },
-};
-
-function loadPersona(): PersonaConfig {
-  try {
-    if (existsSync(PERSONA_FILE)) {
-      return JSON.parse(readFileSync(PERSONA_FILE, "utf-8"));
-    }
-  } catch {}
-  return { current: "caveman" };
-}
-
-function savePersona(persona: PersonaConfig): void {
-  mkdirSync(MEMORY_DIR, { recursive: true });
-  writeFileSync(PERSONA_FILE, JSON.stringify(persona, null, 2), "utf-8");
-}
-
-// --- Web model (distillation) override ---------------------------------------
-// When set, web_search/web_fetch summarisation sub-calls use this model instead
-// of the main conversation model. Unset (default) = follow the main model.
-
-interface WebModelConfig {
-  provider: string;
-  id: string;
-}
-
-function loadWebModel(): WebModelConfig | null {
-  try {
-    if (existsSync(WEBMODEL_FILE)) {
-      const cfg = JSON.parse(readFileSync(WEBMODEL_FILE, "utf-8"));
-      if (cfg?.provider && cfg?.id) return { provider: String(cfg.provider), id: String(cfg.id) };
-    }
-  } catch {}
-  return null;
-}
-
-function saveWebModel(cfg: WebModelConfig | null): void {
-  mkdirSync(MEMORY_DIR, { recursive: true });
-  if (cfg) {
-    writeFileSync(WEBMODEL_FILE, JSON.stringify(cfg, null, 2), "utf-8");
-  } else {
-    if (existsSync(WEBMODEL_FILE)) writeFileSync(WEBMODEL_FILE, JSON.stringify({ follow: true }, null, 2), "utf-8");
-  }
-}
-
-// --- Web killswitch -----------------------------------------------------------
-// /web-toggle removes web_search/web_fetch from the active toolset and the
-// system prompt. Persisted so a restart doesn't silently re-enable them.
-
-const WEBKILL_FILE = join(MEMORY_DIR, "webkill.json");
-const WEBBROWSER_FILE = join(MEMORY_DIR, "webbrowser.json");
-const WEB_TOOL_NAMES = ["web_search", "web_fetch"];
-
-export type BrowserMode = "auto" | "force" | "off";
-
-function getBrowserFile(): string {
-  return process.env.MYKYAGENT_WEBBROWSER_FILE || WEBBROWSER_FILE;
-}
-
-function getBrowserMode(): BrowserMode {
-  try {
-    const file = getBrowserFile();
-    if (existsSync(file)) {
-      const mode = JSON.parse(readFileSync(file, "utf-8"))?.mode;
-      if (mode === "force" || mode === "off" || mode === "auto") return mode;
-    }
-  } catch {}
-  return "auto";
-}
-
-function setBrowserMode(mode: BrowserMode): void {
-  const file = getBrowserFile();
-  mkdirSync(dirname(file), { recursive: true });
-  writeFileSync(file, JSON.stringify({ mode }, null, 2), "utf-8");
-}
-
-function getWebKillFile(): string {
-  return process.env.MYKYAGENT_WEBKILL_FILE || WEBKILL_FILE;
-}
-
-function webDisabled(): boolean {
-  try {
-    const file = getWebKillFile();
-    if (existsSync(file)) {
-      return !!JSON.parse(readFileSync(file, "utf-8"))?.disabled;
-    }
-  } catch {}
-  return false;
-}
-
-function setWebDisabled(disabled: boolean): void {
-  const file = getWebKillFile();
-  mkdirSync(dirname(file), { recursive: true });
-  writeFileSync(file, JSON.stringify({ disabled }, null, 2), "utf-8");
-}
+// --- Web model / killswitch / browser: single façade (agent_config.ts) --------
+// Behaviour identical; legacy files still honoured. Adds MYKYAGENT_* env
+// overrides already used by tests.
+export type { BrowserMode, WebModelConfig } from "./agent_config.ts";
+export { WEB_TOOL_NAMES } from "./agent_config.ts";
+import {
+  getBrowserFile as _getBrowserFile,
+  getWebKillFile as _getWebKillFile,
+} from "./agent_config.ts";
+function getBrowserFile(): string { return _getBrowserFile(); }
+function getBrowserMode(): BrowserMode { return getBrowserModeStore(); }
+function setBrowserMode(mode: BrowserMode): void { return setBrowserModeStore(mode); }
+function getWebKillFile(): string { return _getWebKillFile(); }
+function webDisabled(): boolean { return webDisabledStore(); }
+function setWebDisabled(disabled: boolean): void { return setWebDisabledStore(disabled); }
+function loadWebModel(): WebModelConfig | null { return loadWebModelStore(); }
+function saveWebModel(cfg: WebModelConfig | null): void { return saveWebModelStore(cfg); }
 
 let activeModelInfo: any = null;
 let cachedLocalModelName: string | null = null;
@@ -1066,11 +975,18 @@ export default function (pi: any) {
 
     const personaEnabled = isFeatureEnabled("persona");
     const personaCfg = loadPersona();
-    const activePersonaKey = personaCfg.current || "caveman";
-    const personaInfo = PERSONAS[activePersonaKey] || PERSONAS.caveman;
+    const resolved = resolvePersonaPrompt(personaCfg);
+    const personaInfo = resolved.info;
     let personaPrompt = personaEnabled
-      ? (personaCfg.customPrompt || personaInfo.prompt)
+      ? resolved.prompt
       : "You are MykyAgent, a direct, highly competent software engineer. Code and results first, no fluff.";
+    // Model class: small/local stays serial + ultra-terse (safe default);
+    // big/API may parallelise independent calls. Env MYKYAGENT_MODEL_CLASS
+    // forces a class; otherwise classify the active model id/provider.
+    const modelClass = resolveModelClass(
+      (activeModelInfo as any)?.id || (activeModelInfo as any)?.model,
+      (activeModelInfo as any)?.provider
+    );
 
     // --- RP mode: fully dedicated system prompt (plan section 2.2/2.4/2.5) ---
     if (mode === "rp") {
@@ -1197,17 +1113,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       `- Prefer the edit tool for modifying existing files: small targeted edits (read a few lines first to anchor exact oldText, then swap in newText), never re-write the whole file from scratch for a small change.\n` +
       `- Use write only for brand-new files or complete rewrites. Batch multiple non-overlapping edits into one edit call.\n` +
       `- If you do rewrite a file completely, keep every byte of unchanged content identical — do not reformat, reorder, or trim unrelated code.\n\n` +
-      `Efficiency & Execution Rules:\n` +
-      `- Execution is serial by design: run one command at a time in bash and let it block until it finishes - no background tasks, no parallel work. For long commands use quiet/no-progress flags (see above) and check output before the next step.\n` +
-      `- Long-lived daemons (servers, watchers): start them detached from ONE bash call: 'nohup <cmd> > /tmp/<name>.log 2>&1 & echo $! > /tmp/<name>.pid' - the call returns immediately. Read logs with 'tail -n 20 /tmp/<name>.log'; stop with 'kill $(cat /tmp/<name>.pid)'. Never start a daemon twice.\n` +
-      `- Always use web_search when finding release downloads, versions, or library APIs. It crawls candidate pages and returns verified links.\n` +
-      `- web_search is NOT a keyword search box: you are delegating to a dedicated technical research AI subagent with live web access. Never send lazy, fragmented keywords - pass your complete technical goal, the specific investigative questions, exact error messages, and the output format you need. Your peer will crawl documentation, inspect source repositories and changelogs, check community threads, and return a verified technical briefing.\n` +
-      `- Never invent or guess hashes, version numbers, or download URLs. Only use verified data from web_search/web_fetch.\n` +
-      `- Search smartly: Never guess version numbers or old years in search queries. Search for official manifests, release APIs, or version archives.\n` +
-      `- Do not repeat: Never re-fetch a URL that already failed or yielded no direct links.\n` +
-      `- Combine commands: Chain related actions in bash (e.g. mkdir && curl && echo config) instead of taking separate turns.\n` +
-      `- Factual verification: Verify actual downloaded versions/files from file contents or metadata before reporting. Do not invent version numbers.\n` +
-      `- If blocked or missing a required fact, say so in one sentence and ask the single most useful clarifying question - do not stall silently or invent filler.\n\n` +
+      executionRulesBlock(modelClass) + `\n` +
       `Response Rules:\n` +
       `- Match the user's language when they write in something other than English; keep code, commands, and technical terms unchanged.\n\n` +
       `Tool Calling Rules (CRITICAL):\n` +
@@ -1864,8 +1770,8 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       const trimmed = args?.trim();
 
       if (trimmed === "list") {
-        const lines = Object.entries(PERSONAS).map(([k, v]) => `• ${k}: ${v.desc}`);
-        ctx.ui?.notify?.(`Available personas:\n${lines.join("\n")}`, "info");
+        const lines = Object.entries(_getPersonas()).map(([k, v]) => `• ${k}: ${v.desc}`);
+        ctx.ui?.notify?.(`Available personas:\n${lines.join("\n")}\n(personas/*.md — edit or add files to customise)`, "info");
         return;
       }
 
@@ -1880,31 +1786,31 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
         return;
       }
 
-      if (trimmed && PERSONAS[trimmed.toLowerCase()]) {
+      if (trimmed && _getPersonas()[trimmed.toLowerCase()]) {
         const key = trimmed.toLowerCase();
         savePersona({ current: key });
-        ctx.ui?.notify?.(`Persona switched to: ${PERSONAS[key].label}`, "info");
+        ctx.ui?.notify?.(`Persona switched to: ${_getPersonas()[key].label}`, "info");
         return;
       }
 
-      if (trimmed && !PERSONAS[trimmed.toLowerCase()]) {
-        const available = Object.keys(PERSONAS).join(", ");
+      if (trimmed && !_getPersonas()[trimmed.toLowerCase()]) {
+        const available = Object.keys(_getPersonas()).join(", ");
         ctx.ui?.notify?.(`Unknown persona "${trimmed}". Available: ${available} (or /persona list)`, "error");
         return;
       }
 
       // If no args provided, show interactive selector if UI available
       if (ctx.ui?.select) {
-        const options = Object.entries(PERSONAS).map(([k, v]) => `${k} - ${v.desc}`);
+        const options = Object.entries(_getPersonas()).map(([k, v]) => `${k} - ${v.desc}`);
         const selected = await ctx.ui.select("Choose MykyAgent Persona:", options);
         if (selected) {
           const chosenKey = selected.split(" - ")[0].trim();
           savePersona({ current: chosenKey });
-          ctx.ui?.notify?.(`Persona switched to: ${PERSONAS[chosenKey].label}`, "info");
+          ctx.ui?.notify?.(`Persona switched to: ${_getPersonas()[chosenKey].label}`, "info");
         }
       } else {
         const current = loadPersona().current;
-        const available = Object.keys(PERSONAS).join(", ");
+        const available = Object.keys(_getPersonas()).join(", ");
         ctx.ui?.notify?.(`Current persona: ${current}. Available: ${available}`, "info");
       }
     },

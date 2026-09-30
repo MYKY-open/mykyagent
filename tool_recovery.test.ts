@@ -278,6 +278,21 @@ const res16 = extractToolCallsFromText(normalProse);
 t("false positive: no tool calls extracted from English prose", res16.toolCalls.length === 0);
 t("false positive: text unchanged", res16.cleanedText === normalProse);
 
-// --- Summary -----------------------------------------------------------------
+// --- 17. Regression: prose with CONFIG flag must not become a tool call ------
+// (real incident: `raviole_defconfig` + KernelSU(`CONFIG_KSU=y`) in a build
+// summary was "recovered" as a phantom KernelSU tool call and executed)
+const configProse =
+  "- **Source**: `guacamole_sickness/` branch `86hm`, Linux **6.1.176**, `raviole_defconfig` + KernelSU(`CONFIG_KSU=y`)";
+const res17 = extractToolCallsFromText(configProse, { isThinking: false });
+
+t("regression: prose `KernelSU(CONFIG_KSU=y)` extracts no call", res17.toolCalls.length === 0);
+t("regression: prose left fully intact", res17.cleanedText === configProse);
+
+// Explicit Action: marker still recovers unknown names
+const actionUnknown = "Action: mystery_tool(alpha=1)";
+const res18 = extractToolCallsFromText(actionUnknown, { isThinking: false });
+t("regression: Action: prefix still recovers unknown tool", res18.toolCalls.length === 1 && res18.toolCalls[0].name === "mystery_tool");
+
+// --- Summary ---
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

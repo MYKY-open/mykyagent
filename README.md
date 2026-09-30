@@ -1,13 +1,15 @@
 # MykyAgent 🦍
 
-A lightweight, crash-proof agent overlay for small local reasoning models (like `ling-3.0-tiny` or `qwen2.5-coder-7b`) running on `llama-server`. Built on top of `@earendil-works/pi-coding-agent`.
+A crash-proof agent overlay that scales from small local reasoning models (like `ling-3.0-tiny` or `qwen2.5-coder-7b` on `llama-server`) up to big API models (Claude/GPT/70B+ via OpenRouter). Built on top of `@earendil-works/pi-coding-agent`.
 
 ## Features
 - **Seamless `llm` Integration**: Supported natively in the `llm` orchestrator (Mode 12) with automatic context probing and model configuration.
 - **Reranked Web Research**: Multi-engine fan-out with reciprocal-rank fusion, authoritative API lookups (GitHub, Modrinth, PyPI, npm, NeoForge Maven), BM25 block extraction, and domain-authority ranking. Engine failover means one throttled search backend cannot kill a query.
 - **Token-Disciplined Distillation**: Per-page character budgets, cross-page duplicate-block removal, and hard caps on fallback dumps. A typical search spends ~2k tokens, not ~4k, and bad pages are dropped instead of summarised.
 - **Safe Local Code Inspection**: Guardrailed `read` tool enforcing 250-line chunks (max 15KB) to prevent 10,000-line files or logs from flooding local context. Automatic `grep`, `find`, and `ls` activation.
-- **Customizable Personas**: In-chat `/persona` slash command with presets (`caveman`, `senior`, `cyberpunk`, `pirate`, `butler`, `academic`, or `custom`) saved to `~/.config/mykyagent/persona.json`.
+- **Customizable Personas**: In-chat `/persona` slash command with presets (`caveman`, `senior`, `cyberpunk`, `pirate`, `butler`, `academic`, `tsundere`, `chuunibyou`, `oneesan`, or `custom`) saved to `~/.config/mykyagent/persona.json`. Persona prompts live in `personas/*.md` (frontmatter `label`/`desc` + body) so you can edit or add personas without touching TypeScript; builtins stay as fallback.
+- **Big/small model adaptation**: The system prompt auto-tunes by model class (`MYKYAGENT_MODEL_CLASS=small|big|auto`, default `auto` → small-safe). Small/local models get serial-bash discipline + terse rules; big/API models may batch up to 3 independent tool calls and get richer planning prose. Tool-call recovery + output sanitiser stay on for both.
+- **RP subsystem (kept, modular)**: `/mode code|rp|rp-creator`, `/character`, `/rp`, `/rp-creator`, `/an` plus dice/state/time tools. Prompt assembly lives in `rp_prompt.ts` (unit-tested); toggle the whole subsystem with `/mykyagent off rp`.
 - **Persistent Memory (index + on-demand)**: Topic files under `~/.config/mykyagent/memory/`. Only a one-line summary per topic is injected into the system prompt; bodies load via `memory_read` when relevant. `memory_write` / `memory_read` / `memory_forget` / `memory_list`.
 - **Background Tasks**: Long-running commands (builds, downloads, servers, test suites) launched detached with `task_start`; the agent keeps working and polls `task_status` / bounded `task_output` tails, or kills with `task_stop`. `/tasks` lists them; metadata survives restarts under `~/.config/mykyagent/tasks/`.
 - **Ultra Portable**: Clean TypeScript overlay with zero local `node_modules`.
