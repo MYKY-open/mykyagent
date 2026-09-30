@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -55,7 +56,32 @@ const { systemPrompt } = await hooks.before_agent_start({}, { cwd: DIR });
 t("prompt mentions image paths", systemPrompt.includes("image paths"));
 t("prompt covers text-only fallback", systemPrompt.includes("lacks vision"));
 
-delete process.env.MYKYAGENT_IMAGE_MAX_BYTES;
+delete process.env.MYKYAGENT_IMAGE_MAX_BYTES; // restore default 3MB cap for conversion tests
+// Modern formats: real fixtures via magick when available, else skip positives.
+let haveMagick = false;
+try { execFileSync("magick", ["-version"], { stdio: "ignore" }); haveMagick = true; } catch {}
+t("magick backend detected (info)", true, haveMagick ? "present" : "absent - positives skipped");
+if (haveMagick) {
+  // 64x64 red square -> keeps converted PNG well under the default 3MB cap.
+  execFileSync("magick", ["-size", "64x64", "xc:red", join(DIR, "sq.png")]);
+  for (const fmt of ["avif", "jxl"]) {
+    try {
+      execFileSync("magick", [join(DIR, "sq.png"), join(DIR, `sq.${fmt}`)], { stdio: "ignore" });
+    } catch { /* encoder missing - skip this format */ }
+    if (!existsSync(join(DIR, `sq.${fmt}`))) continue;
+    const r: any = await read.execute("c", { path: join(DIR, `sq.${fmt}`) }, undefined, undefined, { cwd: DIR });
+    t(`${fmt} converts to png image block`,
+      r?.content?.some((c: any) => c.type === "image" && c.mimeType === "image/png") === true,
+      r?.content?.[0]?.text?.slice(0, 120) || "");
+    t(`${fmt} note names source format`,
+      r?.content?.some((c: any) => c.type === "text" && c.text.includes(`.${fmt}`)) === true);
+  }
+}
+// Corrupt modern-format file: must fail gracefully with install hint, never throw.
+writeFileSync(join(DIR, "bad.avif"), Buffer.alloc(512, 3));
+const badRes: any = await read.execute("d", { path: join(DIR, "bad.avif") }, undefined, undefined, { cwd: DIR });
+t("corrupt avif rejected gracefully", badRes?.isError === true);
+t("corrupt avif names a converter", /magick|ffmpeg/i.test(badRes?.content?.[0]?.text || ""));
 rmSync(DIR, { recursive: true, force: true });
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);

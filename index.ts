@@ -1067,7 +1067,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       toolLines.push("- memory_write / memory_forget / memory_list: store, delete, or list persistent memory topics (one-line summary + on-demand body).");
     }
     if (isToolEnabled("read")) {
-      toolLines.push("- read: text paths return chunked text; image paths (.png/.jpg/.jpeg/.gif/.webp/.bmp) return the picture for vision-capable models. If the image comes back unavailable, the active model lacks vision — say so and continue from text context.");
+      toolLines.push("- read: text paths return chunked text; image paths (.png/.jpg/.webp/.gif/.bmp, plus .avif/.jxl/.heic/.heif/.tiff auto-converted to PNG) return the picture for vision-capable models. If the image comes back unavailable, the active model lacks vision — say so and continue from text context.");
     }
 
     let skillsSection = "";
@@ -1682,12 +1682,49 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     },
   });
 
+  // --- Image conversion for formats vision servers can't ingest ----------------
+  // llama.cpp (stb_image) and most vision APIs take png/jpg/gif/webp/bmp.
+  // Modern formats (avif/jxl/heic/heif/tiff) are converted to PNG in memory
+  // via ImageMagick (`magick`) with an ffmpeg fallback. First frame only —
+  // vision takes one frame anyway. Throws when no backend can decode it.
+  const DIRECT_IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp"]);
+  const CONVERT_IMAGE_EXTS = new Set(["avif", "jxl", "heic", "heif", "tif", "tiff"]);
+
+  function execFileBuf(file: string, args: string[], timeoutMs: number): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+      execFile(file, args, { timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024, encoding: "buffer" } as any,
+        (err: any, stdout: any, stderr: any) => {
+          if (err) return reject(new Error(String(stderr || err?.message || err).slice(0, 300)));
+          resolve(stdout as Buffer);
+        });
+    });
+  }
+
+  async function convertImageToPng(absPath: string): Promise<{ buf: Buffer; via: string }> {
+    const tried: string[] = [];
+    try {
+      const buf = await execFileBuf("magick", [absPath, "png:-"], 30000);
+      if (buf && buf.length > 8) return { buf, via: "magick" };
+      tried.push("magick(empty output)");
+    } catch (e: any) {
+      tried.push(`magick(${e?.message || e})`);
+    }
+    try {
+      const buf = await execFileBuf("ffmpeg", ["-nostats", "-loglevel", "error", "-y", "-i", absPath, "-frames:v", "1", "-f", "image2", "-vcodec", "png", "pipe:1"], 30000);
+      if (buf && buf.length > 8) return { buf, via: "ffmpeg" };
+      tried.push("ffmpeg(empty output)");
+    } catch (e: any) {
+      tried.push(`ffmpeg(${e?.message || e})`);
+    }
+    throw new Error(tried.length ? tried.join("; ") : "no converter found");
+  }
+
   // 9. Safe Read Tool (Protected chunk reading: default 250 lines, max 500 lines or 15KB per call)
   pi.registerTool({
     name: "read",
     label: "read",
     description:
-      "Read the contents of a file in safe chunks. Defaults to 250 lines max (capped at 500 lines or 15KB) to prevent context flooding. Use offset and limit for large files. Pass an image path (.png/.jpg/.jpeg/.gif/.webp/.bmp) to look at it — vision-capable models receive the image, up to a size cap.",
+      "Read the contents of a file in safe chunks. Defaults to 250 lines max (capped at 500 lines or 15KB) to prevent context flooding. Use offset and limit for large files. Pass an image path (.png/.jpg/.jpeg/.gif/.webp/.bmp, or .avif/.jxl/.heic/.heif/.tiff which are auto-converted to PNG) to look at it — vision-capable models receive the image, up to a size cap.",
     parameters: Type.Object({
       path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
       offset: Type.Optional(Type.Number({ description: "Line number to start reading from (1-indexed, default: 1)" })),
@@ -1699,9 +1736,31 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
         await access(absPath, constants.R_OK);
 
         const ext = path.split(".").pop()?.toLowerCase();
-        if (["png", "jpg", "jpeg", "gif", "webp", "bmp"].includes(ext || "")) {
-          const mimeType = ext === "jpg" ? "image/jpeg" : `image/${ext}`;
-          const buf = await readFile(absPath);
+        if (DIRECT_IMAGE_EXTS.has(ext || "") || CONVERT_IMAGE_EXTS.has(ext || "")) {
+          let buf: Buffer;
+          let mimeType: string;
+          let note = "";
+          if (DIRECT_IMAGE_EXTS.has(ext || "")) {
+            mimeType = ext === "jpg" ? "image/jpeg" : `image/${ext}`;
+            buf = await readFile(absPath);
+          } else {
+            try {
+              const converted = await convertImageToPng(absPath);
+              buf = converted.buf;
+              mimeType = "image/png";
+              note = ` (converted from .${ext} via ${converted.via})`;
+            } catch (e: any) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Cannot decode image "${path}" (.${ext}): ${e?.message || e}. Install ImageMagick or ffmpeg, or convert it by hand (e.g. magick "${path}" /tmp/img.png) and read the PNG.`,
+                  },
+                ],
+                isError: true,
+              };
+            }
+          }
           // Vision payloads bypass the 15KB text cap (base64), so they get
           // their own byte cap — one raw phone photo would otherwise nuke a
           // small local model's context. Env: MYKYAGENT_IMAGE_MAX_BYTES.
@@ -1721,7 +1780,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
           }
           return {
             content: [
-              { type: "text", text: `Read image file [${mimeType}] (${Math.round(buf.length / 1024)}KB)` },
+              { type: "text", text: `Read image file [${mimeType}] (${Math.round(buf.length / 1024)}KB)${note}` },
               { type: "image", data: buf.toString("base64"), mimeType },
             ],
           };
