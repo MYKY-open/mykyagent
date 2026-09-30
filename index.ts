@@ -1066,6 +1066,9 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     if (!memoryOff && (isToolEnabled("memory_write") || isToolEnabled("memory_forget") || isToolEnabled("memory_list"))) {
       toolLines.push("- memory_write / memory_forget / memory_list: store, delete, or list persistent memory topics (one-line summary + on-demand body).");
     }
+    if (isToolEnabled("read")) {
+      toolLines.push("- read: text paths return chunked text; image paths (.png/.jpg/.jpeg/.gif/.webp/.bmp) return the picture for vision-capable models. If the image comes back unavailable, the active model lacks vision — say so and continue from text context.");
+    }
 
     let skillsSection = "";
     if (isSkillsMasterEnabled()) {
@@ -1684,7 +1687,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     name: "read",
     label: "read",
     description:
-      "Read the contents of a file in safe chunks. Defaults to 250 lines max (capped at 500 lines or 15KB) to prevent context flooding. Use offset and limit for large files.",
+      "Read the contents of a file in safe chunks. Defaults to 250 lines max (capped at 500 lines or 15KB) to prevent context flooding. Use offset and limit for large files. Pass an image path (.png/.jpg/.jpeg/.gif/.webp/.bmp) to look at it — vision-capable models receive the image, up to a size cap.",
     parameters: Type.Object({
       path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
       offset: Type.Optional(Type.Number({ description: "Line number to start reading from (1-indexed, default: 1)" })),
@@ -1699,6 +1702,23 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
         if (["png", "jpg", "jpeg", "gif", "webp", "bmp"].includes(ext || "")) {
           const mimeType = ext === "jpg" ? "image/jpeg" : `image/${ext}`;
           const buf = await readFile(absPath);
+          // Vision payloads bypass the 15KB text cap (base64), so they get
+          // their own byte cap — one raw phone photo would otherwise nuke a
+          // small local model's context. Env: MYKYAGENT_IMAGE_MAX_BYTES.
+          const maxImg = Number(process.env.MYKYAGENT_IMAGE_MAX_BYTES) || 3 * 1024 * 1024;
+          if (buf.length > maxImg) {
+            const kb = Math.round(buf.length / 1024);
+            const capKb = Math.round(maxImg / 1024);
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Image "${path}" is ${kb}KB, over the ${capKb}KB vision cap. Shrink it with bash first (e.g. ffmpeg -nostats -loglevel error -y -i "${path}" -vf "scale=1600:-1" /tmp/small.jpg) then read the smaller file. Raise the cap with MYKYAGENT_IMAGE_MAX_BYTES.`,
+                },
+              ],
+              isError: true,
+            };
+          }
           return {
             content: [
               { type: "text", text: `Read image file [${mimeType}] (${Math.round(buf.length / 1024)}KB)` },
