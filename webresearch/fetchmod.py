@@ -128,8 +128,9 @@ def fetch(
             status = resp.status_code
             ct = (resp.headers.get("content-type") or "").lower()
             if status >= 400:
-                # EXPERIMENTAL: bot-walled pages (403s incl. tweets) get one
-                # Jina reader attempt before admitting defeat.
+                # Bot-walled pages (403s incl. tweets/ebay): Jina reader first
+                # when enabled, then the browser engine (hardcore included) —
+                # static rejection says nothing about what renders.
                 try:
                     from .backends import JINA_FALLBACK, jina_fetch
                     if JINA_FALLBACK and not out_of_time(35):
@@ -138,6 +139,17 @@ def fetch(
                             return {"url": url, "text": jr["text"], "links": [], "title": jr["title"], "via": "jina"}
                 except Exception:
                     pass
+                if not NO_BROWSER and not out_of_time(30):
+                    br = _fetch_helium_or_browser(url, query, eff_budget, enum_mode)
+                    if br.get("text"):
+                        final_u = getattr(resp, "url", url) or url
+                        fx = {} if final_u == url else {"final_url": final_u}
+                        res = {"url": url, "text": br["text"], "links": br.get("links") or [],
+                               "title": br.get("title") or "", **fx}
+                        if br.get("browser"):
+                            res["browser"] = br["browser"]
+                        cache_put("page", url, {**res, "_q": query})
+                        return res
                 return {"url": url, "error": f"HTTP {status}"}
 
             # A redirect means the canonical URL is not the one we asked for.
@@ -205,8 +217,8 @@ def fetch(
             dbg(f"trafilatura hook failed: {e}")
 
         if (should_force_browser or _is_js_gated(html, text)) and not NO_BROWSER and not out_of_time(8):
-            br = _fetch_browser(
-                url, query, browser=_browser, budget=eff_budget, enum_mode=enum_mode
+            br = _fetch_helium_or_browser(
+                url, query, eff_budget, enum_mode, browser=_browser
             )
             if br.get("text") and (should_force_browser or len(br["text"]) > len(text)):
                 res = {
@@ -275,9 +287,41 @@ def _ensure_browsers() -> bool:
         return r.returncode == 0
     except Exception:
         return False
+def _chrome_exe() -> str | None:
+    """Existing full-Chromium binary (any revision) — avoids a ~150MB
+    download and survives playwright-vs-cache version drift. Prefers the
+    full build over headless-shell (more bot-visible)."""
+    try:
+        base = Path.home() / ".cache" / "ms-playwright"
+        if not base.exists():
+            return None
+        full, shell = [], []
+        for p in sorted(base.glob("*"), reverse=True):
+            c = p / "chrome-linux" / "chrome"
+            if c.exists():
+                full.append(str(c))
+                continue
+            c = p / "chrome-linux64" / "chrome"
+            if c.exists():
+                full.append(str(c))
+                continue
+            h = p / "chrome-headless-shell-linux64" / "chrome-headless-shell"
+            if h.exists():
+                shell.append(str(h))
+                continue
+            h = p / "chrome-linux" / "headless_shell"
+            if h.exists():
+                shell.append(str(h))
+        return (full + shell or [None])[0]
+    except Exception:
+        return None
+
+
 def _launch(pw):
+    exe = _chrome_exe()
     return pw.chromium.launch(
         headless=True,
+        **({"executable_path": exe} if exe else {}),
         args=[
             "--no-sandbox",
             "--disable-dev-shm-usage",
@@ -285,6 +329,230 @@ def _launch(pw):
             "--block-new-web-contents",
         ],
     )
+
+
+# ---------------------------------------------------------------------------
+# Hardcore browser engine (MYKYAGENT_BROWSER=hardcore)
+#
+# The standard path above is fast but bot-visible: headless-shell binary,
+# JS-readable headless UA, navigator.webdriver=true, cold launch per fetch,
+# fixed 1.2s wait. Hardcore trades speed for reach: one warm full-Chromium
+# (new headless mode, NOT headless-shell), persistent profile (cookies +
+# consent survive across runs), automation flags stripped, and a settle-wait
+# so async prices/content finish rendering. Serialized behind a lock —
+# Playwright sync objects must not cross threads.
+# ---------------------------------------------------------------------------
+
+HARDCORE = os.environ.get("MYKYAGENT_BROWSER", "standard").lower() == "hardcore"
+
+_HARDCORE_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+# Runs before any page script: hides the automation tells most bot checks read.
+_HARDCORE_INIT_SCRIPT = """() => {
+  Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+  Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+  window.chrome = window.chrome || { runtime: {} };
+}"""
+
+
+def hardcore_context_options(profile_dir: str | None = None) -> dict:
+    """Pure builder (unit-testable): context kwargs for a desktop Chrome look."""
+    return {
+        "user_agent": _HARDCORE_UA,
+        "viewport": {"width": 1366, "height": 768},
+        "locale": "en-US",
+        "timezone_id": "America/New_York",
+        "device_scale_factor": 1,
+        "is_mobile": False,
+        "has_touch": False,
+        "accept_downloads": False,
+    }
+
+
+_hc_lock = threading.Lock()
+_hc = {"pw": None, "browser": None, "context": None}
+
+
+def _hc_profile_dir() -> str:
+    base = Path(os.environ.get("MYKYAGENT_CACHE_DIR", str(Path.home() / ".cache" / "mykyagent")))
+    d = base / "browser-profile"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return str(d)
+
+
+def _hc_ensure() -> bool:
+    """Launch (once) the shared hardcore browser. Must hold _hc_lock."""
+    if _hc["browser"] is not None:
+        try:
+            if _hc["browser"].is_connected():
+                return True
+        except Exception:
+            pass
+        _hc_teardown_locked()
+    try:
+        from playwright.sync_api import sync_playwright
+        pw = sync_playwright().start()
+        exe = _chrome_exe()
+        # MYKYAGENT_HEADED=1: real headed window (needs a display, e.g.
+        # xvfb-run) — stealthier than any headless mode for bot-walled hosts.
+        headed = os.environ.get("MYKYAGENT_HEADED") == "1"
+        hc_args = [
+            *([] if headed else ["--headless=new"]),
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-blink-features=AutomationControlled",
+            "--block-new-web-contents",
+        ]
+        browser = pw.chromium.launch_persistent_context(
+            _hc_profile_dir(),
+            headless=False,  # headed, or full-Chromium new headless via flag
+            **({"executable_path": exe} if exe else {}),
+            ignore_default_args=["--enable-automation"],
+            args=hc_args,
+            **hardcore_context_options(),
+        )
+        # launch_persistent_context returns a context acting as browser root
+        browser.add_init_script(_HARDCORE_INIT_SCRIPT)
+        _hc["pw"] = pw
+        _hc["browser"] = browser
+        _hc["context"] = browser
+        return True
+    except Exception as e:
+        dbg(f"hardcore launch failed: {e}")
+        _hc_teardown_locked()
+        return False
+
+
+def _hc_teardown_locked() -> None:
+    for k in ("context", "browser"):
+        try:
+            if _hc[k] is not None:
+                _hc[k].close()
+        except Exception:
+            pass
+        _hc[k] = None
+    try:
+        if _hc["pw"] is not None:
+            _hc["pw"].stop()
+    except Exception:
+        pass
+    _hc["pw"] = None
+
+
+def _hc_settle_wait(page, timeout_ms: int = 9000) -> None:
+    """Wait until rendered text length stabilizes (async prices etc)."""
+    try:
+        last, stable, t0 = -1, 0, time.monotonic()
+        while (time.monotonic() - t0) * 1000 < timeout_ms:
+            try:
+                cur = len(page.evaluate("() => document.body ? document.body.innerText.length : 0"))
+            except Exception:
+                break
+            if cur == last:
+                stable += 1
+                if stable >= 3 and cur > 0:
+                    break
+            else:
+                stable = 0
+            last = cur
+            page.wait_for_timeout(400)
+    except Exception:
+        pass
+
+
+def hardcore_unit() -> list[dict]:
+    """Offline checks for the hardcore engine config (no browser launch)."""
+    checks: list[dict] = []
+
+    def ck(name, cond, extra=""):
+        checks.append({"name": name, "ok": bool(cond), "extra": "" if cond else str(extra)})
+
+    opts = hardcore_context_options()
+    ua = opts.get("user_agent", "")
+    ck("hardcore ua looks like desktop chrome",
+       "Chrome/" in ua and "Safari/" in ua and "Headless" not in ua, ua)
+    ck("hardcore ua is http-header consistent", ua == _HARDCORE_UA)
+    ck("hardcore viewport desktop", opts.get("viewport") == {"width": 1366, "height": 768})
+    ck("hardcore locale/tz set", opts.get("locale") == "en-US" and opts.get("timezone_id") == "America/New_York")
+    ck("hardcore not mobile", opts.get("is_mobile") is False and opts.get("has_touch") is False)
+    ck("hardcore init hides webdriver", "webdriver" in _HARDCORE_INIT_SCRIPT and "undefined" in _HARDCORE_INIT_SCRIPT)
+    ck("hardcore init fakes chrome runtime", "window.chrome" in _HARDCORE_INIT_SCRIPT)
+    ck("hardcore off by default", HARDCORE is False or os.environ.get("MYKYAGENT_BROWSER") == "hardcore")
+    return checks
+
+
+def _fetch_helium_or_browser(url: str, query: str | None, budget: int, enum_mode: bool,
+                               browser=None) -> dict:
+    """Real user browser (background tab) first when opted in, else local engine.
+    MYKYAGENT_HELIUM=1. Never touches the visible tab."""
+    try:
+        from .helium import HELIUM_ON, helium_fetch
+        if HELIUM_ON and not out_of_time(40):
+            hr = helium_fetch(url, query, budget=budget, enum_mode=enum_mode)
+            if hr and hr.get("text"):
+                return hr
+    except Exception as e:
+        dbg(f"helium hook failed: {e}")
+    if browser is None:
+        return _fetch_browser(url, query, budget=budget, enum_mode=enum_mode)
+    return _fetch_browser(url, query, browser=browser, budget=budget, enum_mode=enum_mode)
+
+
+def _fetch_hardcore(url: str, query: str | None, budget: int, enum_mode: bool) -> dict:
+    """One page via the shared hardcore browser. Serialized; fail-soft."""
+    import atexit
+    with _hc_lock:
+        atexit.register(lambda: (_hc_lock.acquire(), _hc_teardown_locked(), _hc_lock.release()))
+        if not _hc_ensure():
+            return {"url": url, "error": "[hardcore] browser unavailable"}
+        page = None
+        try:
+            page = _hc["context"].new_page()
+            try:
+                page.route(
+                    "**/*",
+                    lambda route: route.abort()
+                    if route.request.resource_type in ("media", "font")
+                    else route.continue_(),
+                )
+            except Exception:
+                pass
+            # NOTE: images NOT blocked — some lazy loaders gate text on them.
+            try:
+                page.goto(url, wait_until="networkidle", timeout=25000)
+            except Exception:
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                except Exception:
+                    pass  # partial render is still useful
+            _hc_settle_wait(page)
+            try:
+                _interact(page)
+                _hc_settle_wait(page, 4000)
+            except Exception:
+                pass
+            html = page.content()
+        except Exception as e:
+            return {"url": url, "error": f"[hardcore] {e}"}
+        finally:
+            try:
+                if page is not None:
+                    page.close()
+            except Exception:
+                pass
+    text, links, title = html_to_markdown(html, url)
+    text = select_blocks(text, query, budget, enum_mode)
+    if len(text.strip()) < 200:
+        return {"url": url, "error": "[hardcore] page rendered no usable text (bot-wall?)"}
+    return {"url": url, "text": text, "links": links, "title": title, "browser": "hardcore"}
 def _new_page(browser):
     page = browser.new_page()
     page.set_extra_http_headers({"User-Agent": UA_BROWSER, "Accept-Language": "en-US,en;q=0.9"})
@@ -360,6 +628,9 @@ def _fetch_browser(
 ) -> dict:
     if NO_BROWSER:
         return {"url": url, "error": "browser disabled"}
+    # Hardcore engine replaces the per-fetch cold launch when selected.
+    if HARDCORE:
+        return _fetch_hardcore(url, query, budget, enum_mode)
     try:
         from playwright.sync_api import sync_playwright
     except Exception as e:

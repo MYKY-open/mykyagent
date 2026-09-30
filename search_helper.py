@@ -6,6 +6,7 @@
 #     "requests>=2.31.0",
 #     "playwright>=1.47.0",
 #     "pypdf>=4.0.0",
+#     "websocket-client>=1.7.0",
 # ]
 # ///
 """

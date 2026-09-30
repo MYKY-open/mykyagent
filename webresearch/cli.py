@@ -249,6 +249,16 @@ def unit() -> dict:
         checks.extend(backends_unit())
     except Exception as e:
         checks.append({"name": "backends harness loads", "ok": False, "extra": str(e)})
+    try:
+        from .fetchmod import hardcore_unit
+        checks.extend(hardcore_unit())
+    except Exception as e:
+        checks.append({"name": "hardcore harness loads", "ok": False, "extra": str(e)})
+    try:
+        from .helium import helium_unit
+        checks.extend(helium_unit())
+    except Exception as e:
+        checks.append({"name": "helium harness loads", "ok": False, "extra": str(e)})
 
     passed = sum(1 for c in checks if c["ok"])
     return {
