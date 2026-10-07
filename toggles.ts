@@ -44,6 +44,9 @@ export const BUILTIN_TOOL_DEFS: Record<string, string> = {
   mcp_connect: "Connect to MCP server and register tools",
   mcp_disconnect: "Disconnect MCP server and unregister tools",
   mcp_list: "List connected MCP servers and tools",
+  skill_read: "Read an on-disk skill pack by name",
+  todo: "Tiny task scratch: add/list/done/clear",
+  summarize: "Save a session summary for later /resume",
   character_save: "RP-Creator: write/update a character card",
   character_read: "RP-Creator: read a character card",
   lorebook_save: "RP-Creator: write a lorebook (world info) file",
@@ -56,7 +59,7 @@ export const BUILTIN_TOOL_DEFS: Record<string, string> = {
 export const FEATURE_DEFS: Record<string, string> = {
   memory: "Persistent topic memory index & prompt injection",
   persona: "Persona speaking style in system prompt",
-  tool_recovery: "Auto-recovery for leaked tool calls in think tags",
+  tool_recovery: "Auto-recovery for leaked tool calls (OPT-IN, off by default)",
   output_sanitizer: "Strip terminal progress tickers/ANSI escapes from output",
   web: "Master switch for web research & fetch tools",
   mcp: "Master switch for MCP adapter and all MCP tools",
@@ -97,8 +100,15 @@ export function saveToggles(cfg: TogglesConfig): void {
   writeFileSync(file, JSON.stringify(cfg, null, 2), "utf-8");
 }
 
+/** Features that default OFF (opt-in). Everything else defaults ON. */
+export const OPT_IN_FEATURES: Set<string> = new Set(["tool_recovery"]);
+
 export function isFeatureEnabled(name: string): boolean {
   const cfg = loadToggles();
+  // Opt-in features: off unless explicitly enabled. Recovery executes
+  // things the model didn't properly call — under direct supervision that
+  // must be a deliberate choice, not a default.
+  if (OPT_IN_FEATURES.has(name)) return cfg.features?.[name] === true;
   return cfg.features?.[name] !== false;
 }
 

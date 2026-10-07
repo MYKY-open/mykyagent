@@ -10,6 +10,10 @@ A lightweight, crash-proof agent overlay for small local reasoning models (like 
 - **Customizable Personas**: In-chat `/persona` slash command with presets (`caveman`, `senior`, `cyberpunk`, `pirate`, `butler`, `academic`, or `custom`) saved to `~/.config/mykyagent/persona.json`.
 - **Persistent Memory (index + on-demand)**: Topic files under `~/.config/mykyagent/memory/`. Only a one-line summary per topic is injected into the system prompt; bodies load via `memory_read` when relevant. `memory_write` / `memory_read` / `memory_forget` / `memory_list`.
 - **Background Tasks**: Long-running commands (builds, downloads, servers, test suites) launched detached with `task_start`; the agent keeps working and polls `task_status` / bounded `task_output` tails, or kills with `task_stop`. `/tasks` lists them; metadata survives restarts under `~/.config/mykyagent/tasks/`.
+- **Skills-lite**: On-demand capability packs in `skills/<name>.md` (or `skills/<name>/SKILL.md`). One index line per turn (zero when empty); full text loads via `skill_read` only when relevant. `/skill` lists/shows them.
+- **Todos**: Tiny persistent scratch (`todo` add/list/done/clear) for multi-step work, injected bounded into the prompt only while open.
+- **Checkpoints**: Every `write`/`edit` snapshots pre-write content (ring of 20, 100KB cap). `/rewind` lists, `/rewind <n>` restores. Undo, no gates.
+- **Resume**: `summarize` tool saves a session summary; `session_shutdown` auto-saves machine state (todos, checkpoint count). `/resume` injects both back into a fresh session.
 - **Ultra Portable**: Clean TypeScript overlay with zero local `node_modules`.
 
 ## Quickstart
@@ -103,7 +107,7 @@ Toggle any tool, skill, or agent feature on/off individually:
 **Toggleable categories:**
 * **Tools**: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `memory_read`, `memory_write`, `memory_forget`, `memory_list`, `mcp_connect`, `mcp_disconnect`, `mcp_list`, and any discovered MCP server tools.
 * **Skills**: Master skills toggle (`skills`) and per-skill toggles (e.g. `web-scraping`).
-* **Features**: `memory` (persistent index & tools), `persona` (tone styling in prompt), `tool_recovery` (think-tag tool call recovery), `output_sanitizer` (progress bar/ticker cleaning), `web`, `mcp`.
+* **Features**: `memory` (persistent index & tools), `persona` (tone styling in prompt), `tool_recovery` (think-tag tool call recovery — OPT-IN, off by default: `/mykyagent on tool_recovery`), `output_sanitizer` (progress bar/ticker cleaning), `web`, `mcp`.
 
 Saved to `~/.config/mykyagent/toggles.json` and persists across sessions.
 
@@ -119,43 +123,33 @@ model is told to answer from memory instead of attempting web lookups.
 
 ---
 
-## MCP Adapter (agent-controlled)
+## MCP (agent-controlled session servers over pi native MCP)
 
-The agent can connect to MCP (Model Context Protocol) servers itself:
+pi owns transports, OAuth, retries, logging, and `/mcp`. MykyAgent adds the
+bit pi lacks: the agent registers servers mid-chat itself.
 
-* `mcp_connect` — connect via **stdio** (`{command, args}` — spawn a local
-  server) or **streamable HTTP** (`{host, port, path?}` — remote server).
-  Every discovered tool is registered as `mcp_<server>_<tool>` immediately.
-* `mcp_disconnect` — drop a server, remove its tools, forget its config.
-* `mcp_list` — connected servers + tool inventory + killswitch state.
+* `mcp_connect` — register a session server via `pi.registerMcpServer`:
+  stdio `{command, args?, env?, cwd?}` or HTTP `{url, headers?}`
+  (legacy `{host, port, path?}` auto-migrates to `{url}`).
+  Tools appear as `mcp__<server>__<tool>` once pi connects (background).
+* `mcp_disconnect` — unregister a session server, forget its config.
+* `mcp_list` — session servers + persisted configs + live pi servers.
 
-Connections persist in `~/.config/mykyagent/mcp.json` and auto-reconnect on
-startup. Only servers the user asked for should ever be connected; MCP output
-is treated as untrusted external content and capped at
-`MYKYAGENT_MCP_RESULT_BYTES` (default 8000).
+Session servers persist in `~/.config/mykyagent/mcp.json` and re-register on
+startup. pi's own `mcp.json` servers are managed via `/mcp`, not here.
+Only servers the user asked for should ever be connected; MCP output
+is treated as untrusted external content.
 
 **Global killswitch (user-only):**
 * `/mcp-toggle` — flip the whole adapter on/off
-* `/mcp-toggle off` — removes every `mcp_*` tool AND tears down all server sessions
+* `/mcp-toggle off` — hides every MCP tool from the model AND unregisters
+  all session servers (pi's own `mcp.json` servers stay connected but hidden)
 * `/mcp-toggle status` — current state
 
-Persisted in `~/.config/mykyagent/mcpkill.json`; survives restarts. Disabling
-is total: the three builtins, all discovered tools, and the sessions behind
-them all go away in one flip.
+Persisted in `~/.config/mykyagent/mcpkill.json`; survives restarts.
 
-Transport notes: stdio servers are newline-delimited JSON-RPC child processes
-(chrome-devtools-mcp, filesystem, ...); HTTP servers follow the MCP streamable
-HTTP transport (JSON or SSE responses, `mcp-session-id` header). Server stderr
-is discarded unless `MYKYAGENT_MCP_LOG` names a log file. Tests: `mcp.test.ts`
-(offline, fake transports) + `./run_mcp_smoke.sh` (live, against a real
-chrome-devtools-mcp bridging a browser on `127.0.0.1:9222`).
-
-| Variable | Default | Effect |
-| --- | --- | --- |
-| `MYKYAGENT_MCP_RESULT_BYTES` | `8000` | Cap on a single MCP tool result |
-| `MYKYAGENT_MCP_INIT_TIMEOUT` | `45000` | initialize + tools/list timeout (npx cold starts are slow) |
-| `MYKYAGENT_MCP_CALL_TIMEOUT` | `120000` | Per tools/call timeout (browser automation is slow) |
-| `MYKYAGENT_MCP_LOG` | unset | If set, server stderr appended to this file |
+Tests: `mcp.test.ts` (offline, stub pi) + `./run_mcp_smoke.sh` (offline,
+stub pi). Live transport coverage belongs to pi itself.
 
 ---
 

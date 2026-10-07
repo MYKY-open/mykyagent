@@ -111,6 +111,17 @@ t("items include skills", items.some((i) => i.name === "web-scraping" && i.categ
 const summary = formatTogglesSummary(["web-scraping"]);
 t("summary contains header and sections", summary.includes("Features:") && summary.includes("Skills:") && summary.includes("Tools:"));
 
+// 9. Opt-in features default off
+resetAllToggles();
+t("tool_recovery defaults OFF", isFeatureEnabled("tool_recovery") === false);
+t("regular features still default ON", isFeatureEnabled("memory") === true);
+setFeatureEnabled("tool_recovery", true);
+t("tool_recovery opt-in enables", isFeatureEnabled("tool_recovery") === true);
+setFeatureEnabled("tool_recovery", false);
+t("tool_recovery explicit off stays off", isFeatureEnabled("tool_recovery") === false);
+resetAllToggles();
+t("reset returns tool_recovery to OFF", isFeatureEnabled("tool_recovery") === false);
+
 rmSync(DIR, { recursive: true, force: true });
 console.log(`\ntoggles: ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

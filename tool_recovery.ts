@@ -57,6 +57,10 @@ export const DEFAULT_KNOWN_TOOLS = new Set([
   "memory_write",
   "memory_forget",
   "memory_list",
+  // Workflow tools
+  "skill_read",
+  "todo",
+  "summarize",
   // MCP Builtins
   "mcp_connect",
   "mcp_disconnect",
@@ -72,11 +76,22 @@ const POSITIONAL_ARGS: Record<string, string[]> = {
   character_save: ["slug", "card"],
   lorebook_save: ["slug", "entries"],
   read: ["path", "limit", "offset"],
+  write: ["path", "content"],
+  edit: ["path", "edits"],
   bash: ["command", "timeout"],
+  grep: ["pattern", "path"],
+  find: ["pattern"],
+  ls: ["path"],
   powershell: ["command", "timeout"],
   web_search: ["query"],
   web_fetch: ["url"],
   memory_read: ["topic"],
+  memory_list: [],
+  skill_read: ["name"],
+  todo: ["action", "text"],
+  summarize: ["text"],
+  mcp_disconnect: ["server"],
+  mcp_list: [],
   memory_write: ["topic", "content"],
   memory_forget: ["topic"],
 };
@@ -351,7 +366,7 @@ export function extractToolCallsFromText(
             parsed.args ||
             parsed.parameters ||
             (name ? { ...parsed, name: undefined, function: undefined, tool: undefined } : {});
-          if (name && typeof name === "string") {
+          if (name && typeof name === "string" && (knownTools.has(name.trim()) || name.startsWith("mcp_"))) {
             toolCalls.push({
               id: generateToolCallId(),
               name: name.trim(),
@@ -402,7 +417,7 @@ export function extractToolCallsFromText(
         }
       }
 
-      if (toolName) {
+      if (toolName && (knownTools.has(toolName) || toolName.startsWith("mcp_"))) {
         toolCalls.push({
           id: generateToolCallId(),
           name: toolName,
@@ -430,7 +445,7 @@ export function extractToolCallsFromText(
             name: name.trim(),
             arguments: typeof args === "object" && args !== null ? args : {},
           });
-          return isThinking ? `[Recovered tool call: ${name.trim()}]` : "";
+          return `[Recovered tool call: ${name.trim()}]`;
         }
       } catch {}
     }
@@ -500,13 +515,15 @@ export function extractToolCallsFromText(
 
       const rawArgs = currentText.slice(openParenIdx + 1, closeParenIdx);
 
-      // Validate if this looks like a tool call:
-      // Must be a known tool, or start with mcp_, or have explicit Action: prefix,
-      // or args contain explicit keyword assignments.
+      // Thinking is the model's scratchpad: a bare known-tool call there is
+      // almost always intent. Narrative text is what the user reads: a bare
+      // name(...) there is usually an example or discussion, and executing it
+      // manufactures phantom progress (the model acts on a result nobody
+      // asked for). So text requires explicit intent markers — Action:/Tool:/
+      // Call: prefix, XML tags, or code fences. Unknown names never qualify.
       const isKnown = knownTools.has(toolName) || toolName.startsWith("mcp_");
-      const hasKeywords = /\b[a-zA-Z_][a-zA-Z0-9_-]*\s*=/.test(rawArgs);
 
-      if (hasActionPrefix || isKnown || hasKeywords) {
+      if (hasActionPrefix || (isThinking && isKnown)) {
         functionMatches.push({
           start: startIndex,
           end: endIndex,
@@ -530,7 +547,10 @@ export function extractToolCallsFromText(
       arguments: args,
     });
 
-    const replacement = isThinking ? `[Recovered tool call: ${fm.name}]` : "";
+    // Visible marker in BOTH thinking and text: the supervisor must see
+    // every executed phantom in the transcript. Silent execution is what
+    // let models wander off on unasked-for results.
+    const replacement = `[Recovered tool call: ${fm.name}]`;
     currentText = currentText.slice(0, fm.start) + replacement + currentText.slice(fm.end);
   }
 

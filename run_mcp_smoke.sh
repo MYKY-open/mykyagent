@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Live smoke test for the MCP adapter (see mcp_smoke.ts).
-# Requires: the chrome-devtools-mcp browser bridge target on 127.0.0.1:9222
-# (i.e. a Chromium with --remote-debugging-port=9222 running locally).
+# Smoke test for the MCP bridge (see mcp_smoke.ts).
+# Offline: drives the registry against a stub pi object. No browser needed.
+# For a REAL server end to end: pi mcp add ... ; then inspect /mcp.
 set -euo pipefail
 DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PI_DIR="${PI_DIR:-$HOME/mykysw/pi}"
