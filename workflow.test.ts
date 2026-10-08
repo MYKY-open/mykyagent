@@ -126,7 +126,7 @@ const pi: any = {
 await ext(pi);
 
 t("wiring: workflow tools registered", !!(tools.skill_read && tools.todo && tools.summarize));
-t("wiring: workflow commands registered", !!(commands.skill && commands.rewind && commands.resume));
+t("wiring: workflow commands registered", !!(commands.skill && commands.rewind && commands.restore));
 
 activeTools = ["bash", "read"];
 T.addTodo("Wire it up");
@@ -157,11 +157,11 @@ t("wiring: todo tool adds", String(todoAdd.content?.[0]?.text || "").includes("a
 const todoList = await tools.todo.execute("x", { action: "list" });
 t("wiring: todo tool lists", String(todoList.content?.[0]?.text || "").includes("From tool"));
 
-// summarize tool + /resume command
+// summarize tool + /restore command
 await tools.summarize.execute("x", { text: "Wired everything." });
 const notify: string[] = [];
-await commands.resume.handler("", { ui: { notify: (m: string) => notify.push(m) } });
-t("wiring: /resume injects summary", sent.length === 1 && sent[0].includes("Wired everything"), sent.join("|").slice(0, 120));
+await commands.restore.handler("", { ui: { notify: (m: string) => notify.push(m) } });
+t("wiring: /restore injects summary", sent.length === 1 && sent[0].includes("Wired everything"), sent.join("|").slice(0, 120));
 
 // /rewind command lists + restores
 const ck2 = join(DIR, "rw.txt");

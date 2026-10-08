@@ -9,11 +9,11 @@ A lightweight, crash-proof agent overlay for small local reasoning models (like 
 - **Safe Local Code Inspection**: Guardrailed `read` tool enforcing 250-line chunks (max 15KB) to prevent 10,000-line files or logs from flooding local context. Automatic `grep`, `find`, and `ls` activation.
 - **Customizable Personas**: In-chat `/persona` slash command with presets (`caveman`, `senior`, `cyberpunk`, `pirate`, `butler`, `academic`, or `custom`) saved to `~/.config/mykyagent/persona.json`.
 - **Persistent Memory (index + on-demand)**: Topic files under `~/.config/mykyagent/memory/`. Only a one-line summary per topic is injected into the system prompt; bodies load via `memory_read` when relevant. `memory_write` / `memory_read` / `memory_forget` / `memory_list`.
-- **Background Tasks**: Long-running commands (builds, downloads, servers, test suites) launched detached with `task_start`; the agent keeps working and polls `task_status` / bounded `task_output` tails, or kills with `task_stop`. `/tasks` lists them; metadata survives restarts under `~/.config/mykyagent/tasks/`.
+- **Background Tasks**: Long commands run detached via `task_start`; follow with cursor-based `task_output` (new bytes only), blocking `task_wait`, or kill with `task_stop`. `task_list` / `/tasks` lists them. Max 3 live.
 - **Skills-lite**: On-demand capability packs in `skills/<name>.md` (or `skills/<name>/SKILL.md`). One index line per turn (zero when empty); full text loads via `skill_read` only when relevant. `/skill` lists/shows them.
 - **Todos**: Tiny persistent scratch (`todo` add/list/done/clear) for multi-step work, injected bounded into the prompt only while open.
 - **Checkpoints**: Every `write`/`edit` snapshots pre-write content (ring of 20, 100KB cap). `/rewind` lists, `/rewind <n>` restores. Undo, no gates.
-- **Resume**: `summarize` tool saves a session summary; `session_shutdown` auto-saves machine state (todos, checkpoint count). `/resume` injects both back into a fresh session.
+- **Resume**: `summarize` tool saves a session summary; `session_shutdown` auto-saves machine state (todos, checkpoint count). `/restore` injects both back into a fresh session (`/resume` is pi's own session switcher).
 - **Ultra Portable**: Clean TypeScript overlay with zero local `node_modules`.
 
 ## Quickstart
@@ -360,31 +360,28 @@ log file, and the agent checks back with bounded reads.
 
 | Tool | Purpose |
 | --- | --- |
-| `task_start` | spawn a command detached (own process group), return id + log path immediately |
-| `task_status` | state of one task or all: `running` / `done` (exit 0) / `stopped` (non-zero) / `dead` |
-| `task_output` | tail of the log - last N lines (default 50, max 250), 15KB byte cap, earlier lines summarised away |
-| `task_stop` | SIGTERM the whole process group (`force: true` for SIGKILL); writes a recorded exit code so the state resolves |
+| `task_start` | spawn a command detached, return id immediately (max 3 live — serial discipline) |
+| `task_output` | NEW log bytes since last read (cursor-based, no re-read cost) |
+| `task_wait` | block up to N ms for fresh output or exit (replaces guess-sleeps) |
+| `task_stop` | SIGTERM, then SIGKILL after 3s |
+| `task_list` | list tracked tasks (same as `/tasks`) |
 
 Design notes:
 
-- **Detached + unref'd**: the task survives the tool call, the turn, and even the
-  agent process. `/tasks` lists what is out there after a restart.
-- **Exit code via marker file**: the spawned wrapper writes `~/.config/mykyagent/tasks/<id>.exit`
-  on normal completion, and `task_stop` writes the code for kills - so `done` vs
-  `still running` vs `died hard` stays distinguishable even though nothing keeps
-  a node process attached.
-- **Zombie trap handled**: detached children are only reaped when the spawning
-  agent exits, so `kill(pid, 0)` keeps succeeding on a finished task. `pidAlive`
-  treats a `Z` state in `/proc/<pid>/stat` as dead.
-- **Bounded output**: nothing from a task log reaches the context until the agent
-  asks for a tail, and the tail is capped exactly like the `read` tool.
+- **Cursor-based polls**: each read advances a cursor; re-polls return only new
+  bytes (4KB cap). Watching a build costs tokens once, not every poll.
+- **Detach + reattach**: logs/cursors live in `MYKYAGENT_TASKS_DIR`, so state
+  survives restarts; dead processes are detected via pid liveness.
+- **Exit settle**: `task_wait` yields a tick before reporting, so a
+  just-finished process isn't misreported as still running.
+- **Serial cap**: at most 3 live tasks; starting beyond that errors instead of
+  spawning a fleet.
 
-In-chat: `/tasks` lists all tasks, `/tasks clean` removes finished tasks older
-than 24h (metadata + log + marker).
+In-chat: `/tasks` lists all tasks.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `MYKYAGENT_TASKS_DIR` | `~/.config/mykyagent/tasks` | Task metadata/log/marker location |
+| `MYKYAGENT_TASKS_DIR` | `~/.config/mykyagent/tasks` | Task metadata/log/cursor location |
 
 ## RP Harness (Modes, Characters, Lorebooks)
 

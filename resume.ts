@@ -5,7 +5,7 @@
  *   summary text here. Bounded 6KB.
  * - session_shutdown hook: auto-writes a machine stub (date, cwd, open-todo
  *   count, checkpoint count) to auto_state.md — never touches the summary.
- * - /resume command: summary + stub + open todos, injected via
+ * - /restore command: summary + stub + open todos, injected via
  *   pi.sendUserMessage so the model actually receives it.
  *
  * Pi-free except the todo/checkpoint imports for the stub.

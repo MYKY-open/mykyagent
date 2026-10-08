@@ -18,6 +18,7 @@ import { listSkills, readSkill, skillsPromptLine } from "./skills.ts";
 import { addTodo, clearTodos, doneTodo, loadTodos, openTodos, todoBlock } from "./todo.ts";
 import { listCheckpoints, resolveToolPath, restoreCheckpoint, snapshotFile } from "./checkpoints.ts";
 import { buildResumeText, saveAutoStub, saveSummary } from "./resume.ts";
+import { clearTask, listTasks, pollTask, startTask, stopTask, waitTask } from "./taskman.ts";
 import {
   McpRegistry,
   isMcpToolName,
@@ -1054,6 +1055,11 @@ export default function (pi: any) {
         "skill_read",
         "todo",
         "summarize",
+        "task_start",
+        "task_output",
+        "task_wait",
+        "task_stop",
+        "task_list",
         ...CREATOR_TOOL_NAMES,
         ...RPG_TOOL_NAMES,
       ];
@@ -1140,6 +1146,8 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     const webSearchEnabled = !webOff && isToolEnabled("web_search");
     const webFetchEnabled = !webOff && isToolEnabled("web_fetch");
     const toolLines: string[] = [];
+
+    toolLines.push("- File writes are snapshotted before write/edit; if one goes wrong, tell the user: /rewind <n> restores it.");
 
     if (!webSearchEnabled && !webFetchEnabled) {
       toolLines.push("- (web_search / web_fetch are DISABLED; answer from memory or say you cannot check the web.)");
@@ -1314,7 +1322,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
   pi.on("session_shutdown", async (event: any, ctx: any) => {
     void event;
     // Machine stub only (date, cwd, open todos, checkpoint count). The
-    // model-written summary is never clobbered; /resume merges both.
+    // model-written summary is never clobbered; /restore merges both.
     try {
       saveAutoStub(ctx?.cwd || process.cwd());
     } catch {}
@@ -1788,7 +1796,12 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     }),
     async execute(_id: string, args: any) {
       try {
-        const action = String(args?.action || "list").toLowerCase();
+        let action = String(args?.action || "list").toLowerCase().trim();
+        // Forgiving synonyms: weak models say complete/finish/show/remove.
+        if (["complete", "finish", "check", "resolve"].includes(action)) action = "done";
+        else if (["show", "view"].includes(action)) action = "list";
+        else if (["remove", "delete"].includes(action)) action = "clear";
+        else if (["create", "new"].includes(action)) action = "add";
         if (action === "add") {
           const item = addTodo(String(args?.text ?? ""));
           return { content: [{ type: "text", text: `Todo ${item.id} added: ${item.text}` }] };
@@ -1815,17 +1828,103 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
   pi.registerTool({
     name: "summarize",
     label: "Summarize Session",
-    description: "Save a session summary for later /resume. Call when the user asks to summarize or wrap up.",
+    description: "Save a session summary for later /restore. Call when the user asks to summarize or wrap up.",
     parameters: Type.Object({
       text: Type.String({ description: "Summary: what was done, decided, and what is next" }),
     }),
     async execute(_id: string, { text }: { text: string }) {
       try {
         const n = saveSummary(String(text ?? ""));
-        return { content: [{ type: "text", text: `Session summary saved (${n} chars). Restore anytime with /resume.` }] };
+        return { content: [{ type: "text", text: `Session summary saved (${n} chars). Restore anytime with /restore.` }] };
       } catch (e: any) {
         return { content: [{ type: "text", text: e?.message || String(e) }], isError: true };
       }
+    },
+  });
+
+  // 8d. Serial task runner: detached long commands, cursor-based output.
+  // One wait/poll at a time (serial agent); max 3 live tasks.
+  const fmtTask = (t: any) =>
+    `${t.running ? "RUN" : "END"} ${t.id} [${t.name}] exit=${t.exitCode ?? "-"} log=${t.logBytes}B :: ${t.command.slice(0, 100)}`;
+  pi.registerTool({
+    name: "task_start",
+    label: "Task Start",
+    description: "Start a detached long command (build/test/server). Then ONE task_wait (quiet=true for long builds), not poll loops. Max 3 live.",
+    parameters: Type.Object({
+      command: Type.String({ description: "Shell command to run detached" }),
+      name: Type.Optional(Type.String({ description: "Short label for /tasks" })),
+    }),
+    async execute(_id: string, args: any) {
+      try {
+        const id = startTask(String(args?.command ?? ""), args?.name ? String(args.name) : undefined);
+        return { content: [{ type: "text", text: `Task ${id} started. Use task_wait/task_output to follow it.` }] };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: e?.message || String(e) }], isError: true };
+      }
+    },
+  });
+  pi.registerTool({
+    name: "task_output",
+    label: "Task Output",
+    description: "New log bytes since last read (cursor-based, no re-read cost).",
+    parameters: Type.Object({
+      id: Type.String({ description: "Task id from task_start" }),
+    }),
+    async execute(_id: string, { id }: { id: string }) {
+      try {
+        const p = pollTask(String(id));
+        const head = fmtTask(p.info);
+        return { content: [{ type: "text", text: p.output ? `${head}\n${p.output}` : `${head}\n(no new output)` }] };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: e?.message || String(e) }], isError: true };
+      }
+    },
+  });
+  pi.registerTool({
+    name: "task_wait",
+    label: "Task Wait",
+    description: "Block for fresh output/exit (default) or quiet=true for tail-only at end. Long quiet builds: one call, one bill.",
+    parameters: Type.Object({
+      id: Type.String({ description: "Task id from task_start" }),
+      timeout: Type.Optional(Type.Number({ description: "Max wait ms (default 30000, cap 300000)" })),
+      quiet: Type.Optional(Type.Boolean({ description: "True: say nothing until exit/deadline, then final tail" })),
+    }),
+    async execute(_id: string, args: any) {
+      try {
+        const p = await waitTask(String(args?.id ?? ""), Number(args?.timeout ?? 30000), 30, args?.quiet === true);
+        const head = fmtTask(p.info);
+        return { content: [{ type: "text", text: p.output ? `${head}\n${p.output}` : `${head}\n(no new output)` }] };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: e?.message || String(e) }], isError: true };
+      }
+    },
+  });
+  pi.registerTool({
+    name: "task_stop",
+    label: "Task Stop",
+    description: "SIGTERM then SIGKILL a task. Use before starting replacements.",
+    parameters: Type.Object({
+      id: Type.String({ description: "Task id from task_start" }),
+    }),
+    async execute(_id: string, { id }: { id: string }) {
+      try {
+        const t = await stopTask(String(id));
+        return { content: [{ type: "text", text: `Stopped: ${fmtTask(t)}` }] };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: e?.message || String(e) }], isError: true };
+      }
+    },
+  });
+  pi.registerTool({
+    name: "task_list",
+    label: "Task List",
+    description: "List tracked tasks (running + finished). Same as /tasks.",
+    parameters: Type.Object({}),
+    async execute() {
+      const all = listTasks();
+      return {
+        content: [{ type: "text", text: all.length === 0 ? "No tasks." : all.map(fmtTask).join("\n") }],
+      };
     },
   });
 
@@ -2592,7 +2691,8 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     },
   });
 
-  // 12c. Workflow commands: /skill, /rewind, /resume (all user-only).
+  // 12c. Workflow commands: /skill, /rewind, /restore (all user-only).
+  // NOTE: /resume is pi built-in (session switcher) — ours is /restore.
   pi.registerCommand("skill", {
     description: "List on-disk skill packs or show one (e.g. /skill, /skill commit)",
     getArgumentCompletions: (argumentText: string) => {
@@ -2648,8 +2748,22 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     },
   });
 
-  pi.registerCommand("resume", {
-    description: "Restore the previous session (summary + state) into this one",
+  pi.registerCommand("tasks", {
+    description: "List tracked background tasks (same as task_list)",
+    handler: async (args: string, ctx: any) => {
+      void args;
+      const all = listTasks();
+      ctx.ui?.notify?.(
+        all.length === 0
+          ? "No tasks."
+          : all.map((t) => `${t.running ? "RUN" : "END"} ${t.id} [${t.name}] exit=${t.exitCode ?? "-"} :: ${t.command.slice(0, 80)}`).join("\n"),
+        "info"
+      );
+    },
+  });
+
+  pi.registerCommand("restore", {
+    description: "Restore the previous session summary+state into this one (/resume is pi's session switcher)",
     handler: async (args: string, ctx: any) => {
       void args;
       const text = buildResumeText();
