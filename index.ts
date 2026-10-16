@@ -630,6 +630,26 @@ function makeWebModelRuntimeShim(registry: any): any {
   };
 }
 
+// Some model endpoints wrap completions in a safety-classifier envelope, e.g.
+//   "User Safety: safe"  /  "User Safety: unsafe\nSafety Categories: Profanity"
+// Strip those stamp lines from otherwise-good answers. If NOTHING (or almost
+// nothing) remains, the whole completion was just the stamp -> treat it as a
+// refusal and return null so callers fall back to raw content instead of
+// printing a bare rating as if it were a briefing.
+const SAFETY_STAMP_LINE =
+  /^\s*(user\s*safety|safety\s*categor(?:y|ies)|moderation(?:\s*status)?|content\s*rating)\s*[:\-]/im;
+
+function stripSafetyStamps(text: string): string | null {
+  if (!SAFETY_STAMP_LINE.test(text)) return text;
+  const cleaned = text
+    .split("\n")
+    .filter((l) => !SAFETY_STAMP_LINE.test(l))
+    .join("\n")
+    .trim();
+  if (!cleaned || (cleaned.length < 40 && !cleaned.includes("\n"))) return null;
+  return cleaned;
+}
+
 async function distillWithSubagent(
   query: string,
   content: string,
@@ -714,7 +734,14 @@ async function distillWithSubagent(
           ?.trim();
       }
 
-      if (text) return { text, usage: response?.usage };
+      if (text) {
+        const cleaned = stripSafetyStamps(text);
+        if (cleaned) return { text: cleaned, usage: response?.usage };
+        console.warn(
+          `[MykyAgent] Distillation sub-call via model registry returned only a safety-classifier stamp; treating as refusal.`
+        );
+        // Fall through to the direct-HTTP retry / raw-content fallback below.
+      }
     } catch (err: any) {
       console.warn(`[MykyAgent] Native model completion failed, falling back to direct HTTP: ${err?.message || err}`);
     }
@@ -782,7 +809,8 @@ async function distillWithSubagent(
       const text =
         data?.choices?.[0]?.message?.content?.trim() ||
         data?.choices?.[0]?.message?.reasoning_content?.trim();
-      if (text) {
+      const cleanedText = text ? stripSafetyStamps(text) : null;
+      if (cleanedText) {
         let usage: any;
         if (data?.usage) {
           const input = data.usage.prompt_tokens || 0;
@@ -796,7 +824,12 @@ async function distillWithSubagent(
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
           };
         }
-        return { text, usage };
+        return { text: cleanedText, usage };
+      }
+      if (text && !cleanedText) {
+        console.warn(
+          `[MykyAgent] Distillation sub-call via ${endpoint} returned only a safety-classifier stamp; treating as refusal.`
+        );
       }
     } else {
       const errText = await res.text().catch(() => "");
