@@ -113,6 +113,8 @@ export const CREATOR_TOOL_NAMES = [
   "character_save",
   "character_read",
   "character_delete",
+  "character_duplicate",
+  "character_rename",
   "lorebook_save",
   "lorebook_read",
   "lorebook_list",
@@ -159,6 +161,7 @@ export interface RpPromptOptions {
   userName?: string;
   greetingReminder?: string;
   tagsBlock?: string;
+  styleBlock?: string;
 }
 
 const RP_BASE_RULES = `Planning Rules (Internal):
@@ -190,6 +193,7 @@ export function buildRpSystemPrompt(opts: RpPromptOptions = {}): string {
   if (opts.toolHintsBlock) parts.push(opts.toolHintsBlock);
   if (opts.memoryBlock) parts.push(opts.memoryBlock);
   if (opts.tagsBlock) parts.push(opts.tagsBlock);
+  if (opts.styleBlock) parts.push(opts.styleBlock);
   if (opts.greetingReminder) parts.push(opts.greetingReminder);
   return parts.join("\n\n");
 }
@@ -217,6 +221,7 @@ Tools:
 - character_save(slug, card): write/update ~/.config/mykyagent/characters/<slug>.json (preserves alternate_greetings[])
 - character_read(slug): inspect an existing card
 - character_delete(slug): delete a card file (also clears its game state + character memories with /character reset semantics via the command)
+- character_duplicate(slug, name) / character_rename(slug, name): copy or rename a card
 - lorebook_save(slug, entries): write world info entries (keys + content + priority)
 - lorebook_read(slug) / lorebook_list() / lorebook_delete(slug): inspect and remove world info
 - card_audit(slug): run automated checks (token budget, {{user}}/{{char}} presence, greeting, lorebook trigger overlaps + size)

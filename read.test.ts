@@ -7,6 +7,8 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { execFileSync } from "node:child_process";
+
 const DIR = mkdtempSync(join(tmpdir(), "mykyagent-read-"));
 process.env.MYKYAGENT_TOGGLES_FILE = join(DIR, "toggles.json");
 
@@ -109,6 +111,29 @@ const realFetch = (globalThis as any).fetch;
     t("oversize image refused cleanly", res.isError === true && fetchCalls === 0, String(res.content?.[0]?.text).slice(0, 120));
   } finally {
     (globalThis as any).fetch = realFetch;
+  }
+}
+
+// avif autoconverts straight through (needs an ffmpeg with an avif encoder)
+{
+  const avifPath = join(DIR, "tiny.avif");
+  let haveAvif = false;
+  try {
+    execFileSync("ffmpeg", ["-nostats", "-loglevel", "error", "-y", "-i", imgPath, avifPath], { timeout: 30000 });
+    haveAvif = true;
+  } catch {
+    haveAvif = false;
+  }
+  if (!haveAvif) {
+    t("avif skipped (no ffmpeg avif encoder)", true);
+  } else {
+    const res = await tools["read"].execute("x", { path: avifPath }, undefined, undefined, {
+      cwd: DIR,
+      model: { provider: "test", id: "seer", input: ["text", "image"] },
+    });
+    const text = String(res.content?.[0]?.text || "");
+    const hasImage = Array.isArray(res.content) && res.content.some((c: any) => c?.type === "image" && c?.mimeType === "image/png");
+    t("avif autoconverts to vision blocks", !res.isError && hasImage && text.includes("auto-converted from .avif"), text.slice(0, 140));
   }
 }
 

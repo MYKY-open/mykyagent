@@ -122,6 +122,32 @@ t("tool_recovery explicit off stays off", isFeatureEnabled("tool_recovery") === 
 resetAllToggles();
 t("reset returns tool_recovery to OFF", isFeatureEnabled("tool_recovery") === false);
 
+// 10. Per-mode tool settings
+setToolEnabled("memory_read", false, "rp");
+t("per-mode off in rp", isToolEnabled("memory_read", "rp") === false);
+t("other mode unaffected", isToolEnabled("memory_read", "code") === true);
+t("legacy boolean still global", (() => { setToolEnabled("bash", false); const a = isToolEnabled("bash", "rp") === false && isToolEnabled("bash", "code") === false; setToolEnabled("bash", true); return a; })());
+setToolEnabled("memory_read", true, "rp");
+t("per-mode re-enable", isToolEnabled("memory_read", "rp") === true);
+
+setToolEnabled("grep", false);
+t("bare set hits all modes", isToolEnabled("grep", "rp") === false && isToolEnabled("grep") === false);
+setToolEnabled("grep", true);
+
+const rMode = toggleByName("memory_write", false, [], "rp");
+t("toggleByName mode message", rMode.ok && rMode.enabled === false && rMode.message.includes("rp mode") && isToolEnabled("memory_write", "rp") === false && isToolEnabled("memory_write", "code") === true);
+setToolEnabled("memory_write", true, "rp");
+
+const rpItems = getAllToggleableItems([], ["bash", "dice_roll"], { mode: "rp", isAllowed: (x) => x !== "bash" });
+t("mode-blocked tools hidden", !rpItems.some((i) => i.name === "bash") && rpItems.some((i) => i.name === "dice_roll"));
+setToolEnabled("dice_roll", false, "rp");
+const rpItems2 = getAllToggleableItems([], ["dice_roll"], { mode: "rp" });
+t("listing reflects per-mode value", rpItems2.some((i) => i.name === "dice_roll" && i.enabled === false));
+setToolEnabled("dice_roll", true, "rp");
+const sumMode = formatTogglesSummary([], ["bash"], { mode: "rp", isAllowed: (x) => x !== "bash" });
+t("summary shows mode + hidden note", sumMode.includes("[rp mode]") && sumMode.includes("unavailable in rp mode"));
+t("unfiltered listing unchanged", getAllToggleableItems(["web-scraping"], ["custom_tool"]).some((i) => i.name === "read"));
+
 rmSync(DIR, { recursive: true, force: true });
 console.log(`\ntoggles: ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

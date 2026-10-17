@@ -181,6 +181,31 @@ t("wiring: /skill lists", notify.some((m) => m.includes("commit")));
 await hooks["session_shutdown"]({}, { cwd: DIR });
 t("wiring: shutdown stub keeps summary", (R.loadSummary() || "").includes("Wired everything"));
 
+// --- restore re-applies the stage (mode + character) ------------------------
+const chW = await import("./character.ts");
+const modeW = await import("./mode.ts");
+process.env.MYKYAGENT_CHARACTERS_DIR = join(DIR, "characters");
+chW.saveCharacter({ name: "Evelyn", description: "d", personality: "p", scenario: "s", first_message: "Hello, {{user}}.", mes_example: "m" } as any, "evelyn");
+modeW.setMode("rp");
+modeW.setActiveCharacter("evelyn");
+R.saveAutoStub(DIR);
+t("auto stub records stage", (() => { const st = R.loadAutoState(); return st?.mode === "rp" && st?.activeCharacter === "evelyn"; })());
+t("resume text names the stage", (R.buildResumeText() || "").includes("character=evelyn"));
+modeW.setMode("code");
+modeW.setActiveCharacter(undefined);
+const restoreNotes: string[] = [];
+await commands.restore.handler("", { ui: { notify: (m: string) => restoreNotes.push(m) } });
+t("restore switches mode back to rp", modeW.getEffectiveMode() === "rp");
+t("restore reloads the character", modeW.getActiveCharacterSlug() === "evelyn");
+t("restore announces + greets", restoreNotes.some((m) => m.includes("Evelyn is active")) && restoreNotes.some((m) => m.includes("Hello, User.")));
+modeW.setActiveCharacter("ghost");
+R.saveAutoStub(DIR);
+modeW.setActiveCharacter(undefined);
+modeW.setMode("code");
+const ghostNotes: string[] = [];
+await commands.restore.handler("", { ui: { notify: (m: string) => ghostNotes.push(m) } });
+t("restore handles a vanished character", modeW.getEffectiveMode() === "rp" && ghostNotes.some((m) => m.includes("is gone")));
+
 rmSync(DIR, { recursive: true, force: true });
 console.log(`\n${pass} pass, ${fail} fail`);
 process.exit(fail === 0 ? 0 : 1);

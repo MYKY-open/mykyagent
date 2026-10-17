@@ -6,14 +6,14 @@ A lightweight, crash-proof agent overlay for small local reasoning models (like 
 - **Seamless `llm` Integration**: Supported natively in the `llm` orchestrator (Mode 12) with automatic context probing and model configuration.
 - **Reranked Web Research**: Multi-engine fan-out with reciprocal-rank fusion, authoritative API lookups (GitHub, Modrinth, PyPI, npm, NeoForge Maven), BM25 block extraction, and domain-authority ranking. Engine failover means one throttled search backend cannot kill a query.
 - **Token-Disciplined Distillation**: Per-page character budgets, cross-page duplicate-block removal, and hard caps on fallback dumps. A typical search spends ~2k tokens, not ~4k, and bad pages are dropped instead of summarised.
-- **Safe Local Code Inspection**: Guardrailed `read` tool enforcing 250-line chunks (max 15KB) to prevent 10,000-line files or logs from flooding local context. Automatic `grep`, `find`, and `ls` activation.
+- **Safe Local Code Inspection**: Guardrailed `read` tool enforcing 250-line chunks (max 15KB) to prevent 10,000-line files or logs from flooding local context. Images come back as vision (avif/heic auto-converted via ffmpeg) or, when the model takes no images, as a server-side description. Automatic `grep`, `find`, and `ls` activation.
 - **Customizable Personas**: In-chat `/persona` slash command with presets (`caveman`, `senior`, `cyberpunk`, `pirate`, `butler`, `academic`, or `custom`) saved to `~/.config/mykyagent/persona.json`.
 - **Persistent Memory (index + on-demand)**: Topic files under `~/.config/mykyagent/memory/`. Only a one-line summary per topic is injected into the system prompt; bodies load via `memory_read` when relevant. `memory_write` / `memory_read` / `memory_forget` / `memory_list`.
 - **Background Tasks**: Long commands run detached via `task_start`; follow with cursor-based `task_output` (new bytes only), blocking `task_wait`, or kill with `task_stop`. `task_list` / `/tasks` lists them. Max 3 live.
 - **Skills-lite**: On-demand capability packs in `skills/<name>.md` (or `skills/<name>/SKILL.md`). One index line per turn (zero when empty); full text loads via `skill_read` only when relevant. `/skill` lists/shows them.
 - **Todos**: Tiny persistent scratch (`todo` add/list/done/clear) for multi-step work, injected bounded into the prompt only while open.
 - **Checkpoints**: Every `write`/`edit` snapshots pre-write content (ring of 20, 100KB cap). `/rewind` lists, `/rewind <n>` restores. Undo, no gates.
-- **Resume**: `summarize` tool saves a session summary; `session_shutdown` auto-saves machine state (todos, checkpoint count). `/restore` injects both back into a fresh session (`/resume` is pi's own session switcher).
+- **Resume**: `summarize` tool saves a session summary; `session_shutdown` auto-saves machine state (mode, active character, todos, checkpoint count). `/restore` injects both back into a fresh session **and re-applies the saved stage** — mode plus character with greeting (or an honest note if the card is gone). Personas, tags, style, author's note, and toggles persist in their own files already. (`/resume` is pi's own session switcher).
 - **Ultra Portable**: Clean TypeScript overlay with zero local `node_modules`.
 
 ## Quickstart
@@ -97,7 +97,7 @@ The current session model is unchanged; new models show up in `/model-web list`
 and pi's picker immediately.
 
 ## Universal Toggles (`/mykyagent`)
-Toggle any tool, skill, or agent feature on/off individually:
+Toggle any tool, skill, or agent feature on/off individually. The picker is **mode-aware**: it shows `[code]`, `[rp]`, or `[rp-creator]` in its title, hides tools the current mode cannot use at all (with a "(N hidden — unavailable in X mode)" note), and every tool flip lands on **that mode's own setting** — turning `bash` off in RP leaves code mode untouched. Features and skills stay global. `/mykyagent reset` clears everything across all modes.
 * `/mykyagent` — Open interactive Settings picker (scroll with arrow keys, toggle with Enter/Space/arrows)
 * `/mykyagent status` — Print status summary of all tools, skills, and features
 * `/mykyagent toggle <name>` — Flip a tool, skill, or feature on/off (e.g. `/mykyagent toggle bash`)
@@ -410,6 +410,7 @@ Cards are JSON in `~/.config/mykyagent/characters/<slug>.json` with fields `name
 | `/character import <path\|url>` | Import a `.png` (chara/ccv3 tEXt chunk) or `.json` card from a local path or URL |
 | `/character delete <name>` | Delete the card file (keeps game state + memories; run `/character reset` first for a full wipe) |
 | `/character unload` | Clear character, return to code mode |
+| `/characters [slug]` | Management board: load, greeting, duplicate, rename, export to file, delete, or full nuke (card + memories + state) |
 
 **Import** is SillyTavern-compatible: handles V1 flat cards (`first_mes`, `creatorcomment`), V2/V3 nested `{ spec, data }` payloads (base64 in the PNG `chara`/`ccv3` chunk — V3 preferred when both exist — including the UTF-16LE legacy encoding). `alternate_greetings` are preserved (up to 10; use `/character greeting <n>`); an embedded `character_book` is auto-converted to a lorebook `<slug>-book` and linked via `card.lorebook` (or the card's existing `lorebook` slug); `extensions` are still dropped with a warning (samplers live on the server/orchestrator, never in cards). Runs the same validation as `character_save`. Import does not auto-load — follow with `/character load <slug>`. The agent can also do it for you: "import the card at ~/Downloads/x.png" in creator mode just calls the same machinery via file reading + `character_save`.
 
@@ -419,11 +420,13 @@ In `rp` mode the system prompt is rebuilt each turn as structured XML (`<charact
 
 Agent memory is one global store in `~/.config/mykyagent/memory/`, but in `rp` mode with a loaded character it is **namespaced**: writes land in `char-<slug>-<topic>` files, the prompt index and `memory_list` show only that character's topics, and `memory_read` resolves the character's topics first (global topics remain readable by exact name for OOC questions). Switching characters or unloading switches namespaces automatically; `code` and `rp-creator` modes always see the global store.
 
+Manage it with the `/memories [all|<query>]` browser (read, rename, move between global and character namespaces, delete) and the `memory_edit` (replace/append), `memory_rename`, `memory_move`, and `memory_search` (substring over names, summaries, and bodies) tools — all namespace-aware, so the agent can tidy up in chat too.
+
 ### RP-Creator Studio
 
 `/mode rp-creator` turns the agent into a character architect with dedicated tools:
 
-- `character_save(slug, card)` / `character_read(slug)` / `character_delete(slug)` — card CRUD
+- `character_save(slug, card)` / `character_read(slug)` / `character_delete(slug)` / `character_duplicate(slug, name)` / `character_rename(slug, name)` — card CRUD
 - `lorebook_save(slug, entries)` / `lorebook_read(slug)` / `lorebook_list()` / `lorebook_delete(slug)` — world info files in `~/.config/mykyagent/lore/`
 - `card_audit(slug)` — token budget, `{{user}}`/`{{char}}` presence, missing greeting, lorebook trigger overlaps + size
 
@@ -437,11 +440,15 @@ Workflows: `/rp-creator new` (interactive interview), `/rp-creator card <concept
 
 ### Ghost Whisperer (`/ghost`, `/gh`)
 
-Blank-brain rescue: `/ghost` drafts **your** next message in your voice, fitting the scene and character — take it, steal from it, or abort and write manually. Add a rough steer and it polishes instead of invents: `/ghost i do as im told`. Identity-guarded: the prompt denies the character's identity (`You are NOT Evelyn`), scene history uses real names, a character-voiced draft gets one stern retry, and a twice-leaking draft is shown flagged — never sneaked into your mouth. Flow per call: draft shown → **send** (posted as your message) / **again** (regenerate, up to 3) / **abort**. Headless (no picker UI): the draft is printed for manual copy. Uses your conversation's own model via pi's registry first, then direct HTTP as fallback for OpenAI-compatible endpoints only (llama-server/OpenRouter, like web distillation; max ~256 tokens, warmer temperature for creative writing). Providers that don't speak raw HTTP (google, anthropic, azure, bedrock, vertex) are registry-only — the ghost never sends them raw requests. Accepts text and thinking-block replies; failures report the true cause instead of a bare empty message.
+Blank-brain rescue: `/ghost` drafts **your** next message in your voice, fitting the scene and character — take it, steal from it, or abort and write manually. Add a rough steer and it polishes instead of invents: `/ghost i do as im told`. Identity-guarded: the prompt denies the character's identity (`You are NOT Evelyn`), scene history uses real names, a character-voiced draft gets one stern retry, and a twice-leaking draft is shown flagged — never sneaked into your mouth. Flow per call: draft shown → **send** (posted as your message) / **again** (regenerate, up to 3) / **abort**. A status-bar lantern (*Ghost is listening…* / *whispering again…*) burns while it drafts and goes out the moment the draft lands. Headless (no picker UI): the draft is printed for manual copy. Uses your conversation's own model via pi's registry first, then direct HTTP as fallback for OpenAI-compatible endpoints only (llama-server/OpenRouter, like web distillation; max ~256 tokens, warmer temperature for creative writing). Providers that don't speak raw HTTP (google, anthropic, azure, bedrock, vertex) are registry-only — the ghost never sends them raw requests. Accepts text and thinking-block replies; failures report the true cause instead of a bare empty message.
 
 ### Conversation Tints (`/tags`)
 
 Additive flavor that works in **every** mode without replacing your persona or character — e.g. `/tags add noir, terse` or `/tags add cozy`. One line in the prompt, zero tax when empty (max 10 tags, 24 chars each). Manage with `/tags [add <a, b> | remove <a> | list | clear]`; master toggle `/mykyagent toggle tags`. Tints are explicitly subordinate: they can tint wording but never override character voice, persona, or task rules.
+
+### Narrative Dials (`/style`)
+
+WBU-inspired structure without the bloat: 23 dials (mode, momentum, tone, length, density, rhythm, figurative, tense, pov, distance, showtell, dialogue, depth, speech, heat, intimacy, profanity, combat, consequences, change, vocab, volatility, thoughts), each with fixed validated levels — **every one unset by default**, unset dials cost zero prompt tax. Set ones compile into one tight rules line (`/style tense past`, `/style pov 3rd`, `/style dialogue sparse`). Manage with `/style [list | clear | <dial> <level> | clear <dial>]`; master toggle `/mykyagent toggle style`. Bare `/style` opens an interactive dial-board like `/mykyagent`: master switch on top, one row per dial — **→ steps a level up, ← steps down**, Enter/Space cycles, **c disables the dial**, Esc closes. (Custom tones still via `/style tone <...>`.) Every dial carries a manual: `/style <dial>` (e.g. `/style heat`) explains what it does, lists its levels with their effects, and shows its current value. `/tags` stays for freeform mood; `/style` is the machinery models can actually obey.
 
 ### RPG Tools
 
@@ -460,10 +467,12 @@ Everything here runs without a network:
 | Suite | Assertions | Covers |
 | --- | --- | --- |
 | `rp.test.ts` | 90 | mode persistence/gating, card validation/rendering, lorebook scanning, author's note, dice/state/time, card audit |
-| `rp_wiring.test.ts` | 56 | registration, mode-gated toolset, RP/creator prompt dispatch, cross-mode card flow, fresh-session greeting |
-| `read.test.ts` | 5 | vision blocks for capable models, server-side description fallback, honest errors, oversize guard |
+| `rp_wiring.test.ts` | 59 | registration, mode-gated toolset, RP/creator prompt dispatch, cross-mode card flow, fresh-session greeting, per-mode tools |
+| `read.test.ts` | 6 | vision blocks for capable models, server-side description fallback, honest errors, oversize guard, avif autoconvert |
 | `tags.test.ts` | 13 | tint store limits, normalization, prompt block, toggle gating |
-| `ghost.test.ts` | 26 | ghost draft cleanup, named history, hint pass-through, Send/Abort flow, thinking-only + HTTP fallback + error cause + model-leak guards + ctx.model + char-voice guard |
+| `manage.test.ts` | 32 | character duplicate/rename, memory edit/rename/move/search, tools, /characters + /memories board flows |
+| `style.test.ts` | 38 | all-off defaults, level validation, freeform tone, persistence filter, prompt block, toggle gating, picker rows + apply, per-dial manuals + explainer, WBU gap dials, intimacy/profanity, Esc-crash regression |
+| `ghost.test.ts` | 28 | ghost draft cleanup, named history, hint pass-through, Send/Abort flow, thinking-only + HTTP fallback + error cause + model-leak guards + ctx.model + char-voice guard + status lantern |
 | `memory.test.ts` | 34 | slug/path safety, caps, index, migration, injection guard |
 | `background_tasks.test.ts` | 31 | real-process lifecycle: start returns before completion, exit markers, kill, bounded tails, clean |
 | `search_hops.test.ts` | 22 | multi-hop control flow, `FOLLOWUP` parsing |

@@ -158,6 +158,37 @@ export function deleteCharacter(slug: string): boolean {
   return true;
 }
 
+/** Copy a card under a new name (same world, new slug). Refuses collisions. */
+export function duplicateCharacter(slug: string, newName: string): { slug: string; path: string } {
+  const card = loadCharacter(slug);
+  if (!card) throw new Error(`No character card "${slug}".`);
+  const clean = (newName || "").trim().slice(0, 120);
+  if (!clean) throw new Error("new name must not be empty");
+  const newSlug = slugify(clean);
+  if (!newSlug) throw new Error("could not derive a slug from the new name");
+  if (loadCharacter(newSlug)) throw new Error(`"${newSlug}" already exists — pick another name`);
+  return saveCharacter({ ...card, name: clean }, newSlug);
+}
+
+/** Rename a card (moves the file; lorebook link travels with it). */
+export function renameCharacter(slug: string, newName: string): { slug: string; path: string; oldSlug: string } {
+  const clean = slugify(slug);
+  const card = loadCharacter(clean);
+  if (!card) throw new Error(`No character card "${slug}".`);
+  const name = (newName || "").trim().slice(0, 120);
+  if (!name) throw new Error("new name must not be empty");
+  const newSlug = slugify(name);
+  if (!newSlug) throw new Error("could not derive a slug from the new name");
+  if (newSlug === clean) {
+    const saved = saveCharacter({ ...card, name }, clean);
+    return { slug: saved.slug, path: saved.path, oldSlug: clean };
+  }
+  if (loadCharacter(newSlug)) throw new Error(`"${newSlug}" already exists — pick another name`);
+  const saved = saveCharacter({ ...card, name }, newSlug);
+  deleteCharacter(clean);
+  return { slug: saved.slug, path: saved.path, oldSlug: clean };
+}
+
 export function listCharacters(): { slug: string; card: CharacterCard }[] {
   const dir = getCharactersDir();
   if (!existsSync(dir)) return [];

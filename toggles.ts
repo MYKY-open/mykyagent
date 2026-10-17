@@ -10,7 +10,8 @@ export function getTogglesFile(): string {
 }
 
 export interface TogglesConfig {
-  tools?: Record<string, boolean>;
+  /** boolean = every mode (legacy); per-mode map = separate settings per mode. */
+  tools?: Record<string, boolean | Record<string, boolean>>;
   skills?: {
     enabled?: boolean;
     disabled?: string[];
@@ -54,7 +55,11 @@ export const BUILTIN_TOOL_DEFS: Record<string, string> = {
   task_list: "List tracked tasks",
   character_save: "RP-Creator: write/update a character card",
   character_read: "RP-Creator: read a character card",
+  character_delete: "RP-Creator: delete a character card",
   lorebook_save: "RP-Creator: write a lorebook (world info) file",
+  lorebook_read: "RP-Creator: read a lorebook file",
+  lorebook_list: "RP-Creator: list lorebooks",
+  lorebook_delete: "RP-Creator: delete a lorebook file",
   card_audit: "RP-Creator: audit a character card",
   dice_roll: "RPG: cryptographically fair dice rolls",
   game_state: "RPG: persistent game state get/set",
@@ -74,6 +79,7 @@ export const FEATURE_DEFS: Record<string, string> = {
   rp_creator: "RP-Creator card/lore authoring tools",
   rpg_tools: "RPG tools (dice_roll, game_state, advance_time)",
   tags: "Additive conversation tints (/tags) in prompt",
+  style: "Structured narrative dials (/style) in prompt",
 };
 
 export function loadToggles(): TogglesConfig {
@@ -161,20 +167,34 @@ export function setSkillEnabled(name: string, enabled: boolean): void {
   saveToggles(cfg);
 }
 
-export function isToolEnabled(name: string): boolean {
+export function isToolEnabled(name: string, mode?: string): boolean {
   const cfg = loadToggles();
   // Master feature switches
   if (name.startsWith("web_") && cfg.features?.web === false) return false;
   if (name.startsWith("mcp_") && cfg.features?.mcp === false) return false;
   if (name.startsWith("memory_") && cfg.features?.memory === false) return false;
 
-  return cfg.tools?.[name] !== false;
+  const v = cfg.tools?.[name];
+  if (typeof v === "boolean") return v; // legacy global: applies to every mode
+  if (v && typeof v === "object") {
+    if (!mode) return true;
+    const mv = (v as Record<string, boolean>)[mode];
+    return typeof mv === "boolean" ? mv : true;
+  }
+  return true;
 }
 
-export function setToolEnabled(name: string, enabled: boolean): void {
+export function setToolEnabled(name: string, enabled: boolean, mode?: string): void {
   const cfg = loadToggles();
   cfg.tools = cfg.tools || {};
-  cfg.tools[name] = enabled;
+  if (!mode) {
+    cfg.tools[name] = enabled;
+  } else {
+    const cur = cfg.tools[name];
+    const obj = cur && typeof cur === "object" ? { ...(cur as Record<string, boolean>) } : {};
+    obj[mode] = enabled;
+    cfg.tools[name] = obj;
+  }
   saveToggles(cfg);
 }
 
@@ -186,9 +206,17 @@ export function resetAllToggles(): void {
   });
 }
 
+export interface ToggleListOptions {
+  /** Current mode: tool `enabled` reflects it, and mode-blocked tools hide. */
+  mode?: string;
+  /** Returns false for tools unavailable right now (mode gating). */
+  isAllowed?: (tool: string) => boolean;
+}
+
 export function getAllToggleableItems(
   discoveredSkills: string[] = [],
-  registeredTools: string[] = []
+  registeredTools: string[] = [],
+  opts: ToggleListOptions = {}
 ): ToggleItem[] {
   const items: ToggleItem[] = [];
 
@@ -231,12 +259,13 @@ export function getAllToggleableItems(
     });
   }
 
-  // 3. Tools
+  // 3. Tools (mode-blocked tools hide when an isAllowed gate is given)
   const allToolNames = Array.from(
     new Set([...Object.keys(BUILTIN_TOOL_DEFS), ...registeredTools, ...Object.keys(cfg.tools || {})])
   ).sort();
 
   for (const t of allToolNames) {
+    if (opts.isAllowed && !opts.isAllowed(t)) continue;
     const desc = BUILTIN_TOOL_DEFS[t] || (t.startsWith("mcp_") ? "Discovered MCP tool" : "Registered tool");
     items.push({
       id: `tool:${t}`,
@@ -244,17 +273,29 @@ export function getAllToggleableItems(
       category: "tool",
       label: `Tool: ${t}`,
       description: desc,
-      enabled: isToolEnabled(t),
+      enabled: isToolEnabled(t, opts.mode),
     });
   }
 
   return items;
 }
 
+/** Tools hidden by the mode gate (for the "N hidden" note). Features/skills never hide. */
+export function modeHiddenTools(
+  registeredTools: string[] = [],
+  isAllowed?: (tool: string) => boolean
+): string[] {
+  if (!isAllowed) return [];
+  const cfg = loadToggles();
+  const all = new Set([...Object.keys(BUILTIN_TOOL_DEFS), ...registeredTools, ...Object.keys(cfg.tools || {})]);
+  return Array.from(all).filter((t) => !isAllowed(t)).sort();
+}
+
 export function toggleByName(
   target: string,
   explicitState?: boolean,
-  discoveredSkills: string[] = []
+  discoveredSkills: string[] = [],
+  mode?: string
 ): { ok: boolean; name: string; enabled: boolean; category: string; message: string } {
   const norm = target.trim().toLowerCase();
 
@@ -304,17 +345,20 @@ export function toggleByName(
     };
   }
 
+  const toolMsg = (toolName: string, next: boolean) =>
+    `Tool "${toolName}" is now ${next ? "ENABLED" : "DISABLED"}${mode ? ` in ${mode} mode` : ""}.`;
+
   // 4. Match tool (with or without 'tool:' prefix)
   const toolName = norm.startsWith("tool:") ? norm.slice(5) : norm;
   if (toolName in BUILTIN_TOOL_DEFS || toolName.startsWith("mcp_") || toolName in (cfg.tools || {})) {
-    const next = explicitState !== undefined ? explicitState : !isToolEnabled(toolName);
-    setToolEnabled(toolName, next);
+    const next = explicitState !== undefined ? explicitState : !isToolEnabled(toolName, mode);
+    setToolEnabled(toolName, next, mode);
     return {
       ok: true,
       name: toolName,
       enabled: next,
       category: "tool",
-      message: `Tool "${toolName}" is now ${next ? "ENABLED" : "DISABLED"}.`,
+      message: toolMsg(toolName, next),
     };
   }
 
@@ -331,34 +375,35 @@ export function toggleByName(
     };
   }
   if (norm.startsWith("tool:")) {
-    const next = explicitState !== undefined ? explicitState : !isToolEnabled(toolName);
-    setToolEnabled(toolName, next);
+    const next = explicitState !== undefined ? explicitState : !isToolEnabled(toolName, mode);
+    setToolEnabled(toolName, next, mode);
     return {
       ok: true,
       name: toolName,
       enabled: next,
       category: "tool",
-      message: `Tool "${toolName}" is now ${next ? "ENABLED" : "DISABLED"}.`,
+      message: toolMsg(toolName, next),
     };
   }
 
   // Generic fallback: treat as tool
-  const next = explicitState !== undefined ? explicitState : !isToolEnabled(toolName);
-  setToolEnabled(toolName, next);
+  const next = explicitState !== undefined ? explicitState : !isToolEnabled(toolName, mode);
+  setToolEnabled(toolName, next, mode);
   return {
     ok: true,
     name: toolName,
     enabled: next,
     category: "tool",
-    message: `Tool "${toolName}" is now ${next ? "ENABLED" : "DISABLED"}.`,
+    message: toolMsg(toolName, next),
   };
 }
 
 export function formatTogglesSummary(
   discoveredSkills: string[] = [],
-  registeredTools: string[] = []
+  registeredTools: string[] = [],
+  opts: ToggleListOptions = {}
 ): string {
-  const items = getAllToggleableItems(discoveredSkills, registeredTools);
+  const items = getAllToggleableItems(discoveredSkills, registeredTools, opts);
 
   const features = items.filter((i) => i.category === "feature");
   const skills = items.filter((i) => i.category === "skill");
@@ -368,7 +413,7 @@ export function formatTogglesSummary(
     `  ${item.enabled ? "🟢 [ON] " : "🔴 [OFF]"} ${item.name.padEnd(18)} - ${item.description}`;
 
   const lines: string[] = [
-    "=== MykyAgent Toggles Status ===",
+    `=== MykyAgent Toggles Status${opts.mode ? ` [${opts.mode} mode]` : ""} ===`,
     "",
     "Features:",
     ...features.map(fmt),
@@ -378,9 +423,12 @@ export function formatTogglesSummary(
     "",
     "Tools:",
     ...tools.map(fmt),
-    "",
-    "Usage: /mykyagent [toggle <name> | on <name> | off <name> | reset | status]",
   ];
+  const hidden = modeHiddenTools(registeredTools, opts.isAllowed);
+  if (hidden.length && opts.mode) {
+    lines.push("", `(${hidden.length} tools hidden — unavailable in ${opts.mode} mode: ${hidden.slice(0, 8).join(", ")}${hidden.length > 8 ? ", …" : ""})`);
+  }
+  lines.push("", "Usage: /mykyagent [toggle <name> | on <name> | off <name> | reset | status]");
 
   return lines.join("\n");
 }

@@ -141,7 +141,8 @@ t(
 // Disable a tool via /mykyagent off bash
 await commands["mykyagent"].handler("off bash", cmdCtx);
 const { isToolEnabled, isFeatureEnabled, isSkillEnabled } = await import("./toggles.ts");
-t("/mykyagent off bash disables bash", isToolEnabled("bash") === false);
+t("/mykyagent off bash disables bash", isToolEnabled("bash", "code") === false);
+t("/mykyagent off bash leaves other modes alone", isToolEnabled("bash", "rp") === true);
 t("/mykyagent off bash removes bash from live active tools", !activeTools.includes("bash"));
 
 // before_agent_start keeps bash disabled
@@ -154,7 +155,7 @@ t("tool_call blocks disabled bash", blockedCall?.block === true && blockedCall?.
 
 // Re-enable bash via /mykyagent on bash
 await commands["mykyagent"].handler("on bash", cmdCtx);
-t("/mykyagent on bash re-enables bash", isToolEnabled("bash") === true);
+t("/mykyagent on bash re-enables bash", isToolEnabled("bash", "code") === true);
 await hooks["before_agent_start"]({}, { cwd: DIR });
 t("before_agent_start restores enabled bash", activeTools.includes("bash"));
 
@@ -208,6 +209,30 @@ await commands["mykyagent"].handler("reset", cmdCtx);
 t("reset restores memory feature", isFeatureEnabled("memory") === true);
 t("reset restores skill", isSkillEnabled("web-scraping") === true);
 t("reset restores tool", isToolEnabled("bash") === true);
+
+// Picker overlay must render only strings: a hole (e.g. a stray `,,` in the
+// header array) crashes pi's overlay compositing with "cannot read 'includes'".
+{
+  const piReal = await import("@earendil-works/pi-coding-agent");
+  (piReal as any).initTheme("dark");
+  let factory: any = null;
+  await commands["mykyagent"].handler("", {
+    cwd: DIR,
+    ui: { notify: () => {}, custom: async (fn: any) => { factory = fn; return undefined; } },
+  });
+  t("picker factory created", typeof factory === "function");
+  let doneCalled = false;
+  const comp = factory({ requestRender: () => {} }, new Proxy({}, { get: (_t, p) => (...a: any[]) => a[a.length - 1] ?? "" }), {}, () => { doneCalled = true; });
+  let bad = 0;
+  for (const w of [20, 80, 120, 217]) {
+    for (const line of comp.render(w)) if (typeof line !== "string") bad++;
+    comp.handleInput("\x1b[B");
+    for (const line of comp.render(w)) if (typeof line !== "string") bad++;
+    comp.handleInput("\x1b");
+  }
+  t("picker renders only strings at every width", bad === 0);
+  t("picker esc closes", doneCalled === true);
+}
 
 rmSync(DIR, { recursive: true, force: true });
 console.log(`\n${pass} pass, ${fail} fail`);

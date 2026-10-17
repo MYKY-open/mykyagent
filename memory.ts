@@ -253,3 +253,89 @@ export function clearCharacterMemories(charSlug: string): number {
   return count;
 }
 
+/** Rewrite a topic's summary and/or body (append or replace). Null when missing. */
+export function editMemoryEntry(
+  name: string,
+  opts: { summary?: string; body?: string; mode?: "replace" | "append" }
+): MemoryEntry | null {
+  const slug = resolveMemoryName(name);
+  if (!slug) return null;
+  const cur = readMemoryEntry(slug);
+  if (!cur) return null;
+  const nextSummary = opts.summary !== undefined ? opts.summary : cur.summary;
+  let nextBody = cur.body;
+  if (opts.body !== undefined) {
+    nextBody = opts.mode === "append" ? `${cur.body}\n\n${opts.body}`.trim() : opts.body;
+  }
+  return writeMemoryEntry(slug, nextSummary, nextBody);
+}
+
+function moveMemoryFile(fromSlug: string, toSlug: string): MemoryEntry {
+  const cur = readMemoryEntry(fromSlug);
+  if (!cur) throw new Error(`No memory topic "${fromSlug}".`);
+  if (toSlug !== fromSlug && existsSync(join(memoryRoot(), `${toSlug}.md`))) {
+    throw new Error(`"${toSlug}" already exists — pick another name`);
+  }
+  const written = writeMemoryEntry(toSlug, cur.summary, cur.body);
+  if (toSlug !== fromSlug) {
+    try {
+      unlinkSync(join(memoryRoot(), `${fromSlug}.md`));
+    } catch {}
+  }
+  return written;
+}
+
+/** Rename a topic in place (namespace prefix travels with it). */
+export function renameMemoryEntry(name: string, newName: string): MemoryEntry | null {
+  const slug = resolveMemoryName(name);
+  if (!slug) return null;
+  const dest = memorySlug(newName);
+  if (!dest) throw new Error("new name needs at least one letter or digit");
+  if (dest === slug) return readMemoryEntry(slug);
+  return moveMemoryFile(slug, dest);
+}
+
+/**
+ * Move a topic between the global store and a character namespace.
+ * target "global" strips any char-<slug>- prefix; otherwise the topic lands
+ * under char-<target>- (prefix segments are normalized, never stacked).
+ */
+export function moveMemoryEntry(name: string, target: string): MemoryEntry | null {
+  const slug = resolveMemoryName(name);
+  if (!slug) return null;
+  const t = (target || "").trim().toLowerCase();
+  const base = memorySlug(slug.replace(/^char-[a-z0-9_]+-/, ""));
+  if (!base) throw new Error("topic has no movable base name");
+  const dest = !t || t === "global" ? base : `${CHAR_MEMORY_PREFIX}${memorySlug(t)}-${base}`;
+  if (dest === slug) return readMemoryEntry(slug);
+  return moveMemoryFile(slug, dest);
+}
+
+export interface MemoryHit {
+  name: string;
+  summary: string;
+  snippet: string;
+}
+
+/** Substring search over names, summaries, and bodies (case-insensitive). */
+export function searchMemories(query: string, opts?: { prefix?: string; limit?: number }): MemoryHit[] {
+  const q = (query || "").toLowerCase().trim();
+  if (!q) return [];
+  const limit = Math.min(Math.max(opts?.limit ?? 20, 1), 50);
+  const out: MemoryHit[] = [];
+  for (const e of listMemoryEntries()) {
+    if (opts?.prefix && !e.name.startsWith(opts.prefix)) continue;
+    const hay = `${e.name}\n${e.summary}\n${e.body}`;
+    const i = hay.toLowerCase().indexOf(q);
+    if (i < 0) continue;
+    const start = Math.max(0, i - 60);
+    out.push({
+      name: e.name,
+      summary: e.summary,
+      snippet: (start > 0 ? "…" : "") + hay.slice(start, start + 160).replace(/\s+/g, " ") + "…",
+    });
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+

@@ -7,8 +7,10 @@
  */
 import {
   deleteCharacter,
+  duplicateCharacter,
   listCharacters,
   loadCharacter,
+  renameCharacter,
   saveCharacter,
   validateCard,
   type CharacterCard,
@@ -179,6 +181,54 @@ export function characterDeleteTool() {
       return ok
         ? { content: [{ type: "text", text: `Deleted character card "${slug}".` }] }
         : { content: [{ type: "text", text: `No character card "${slug}".` }], isError: true };
+    },
+  };
+}
+
+export function characterDuplicateTool() {
+  return {
+    name: "character_duplicate",
+    label: "Character Duplicate",
+    description: "Copy a character card under a new name (same world, new slug). Fails if the target slug already exists.",
+    parameters: {
+      type: "object",
+      properties: {
+        slug: { type: "string", description: "Source card slug or name" },
+        name: { type: "string", description: "Display name for the copy (slug derived from it)" },
+      },
+      required: ["slug", "name"],
+    },
+    async execute(_id: string, { slug, name }: { slug: string; name: string }) {
+      try {
+        const saved = duplicateCharacter(slug, name);
+        return { content: [{ type: "text", text: `Duplicated as "${name}" (slug: ${saved.slug}).` }] };
+      } catch (err: any) {
+        return { content: [{ type: "text", text: `character_duplicate failed: ${err.message}` }], isError: true };
+      }
+    },
+  };
+}
+
+export function characterRenameTool() {
+  return {
+    name: "character_rename",
+    label: "Character Rename",
+    description: "Rename a character card (moves the file; the lorebook link travels with it). Does not touch the active-character setting.",
+    parameters: {
+      type: "object",
+      properties: {
+        slug: { type: "string", description: "Current card slug or name" },
+        name: { type: "string", description: "New display name (new slug derived from it)" },
+      },
+      required: ["slug", "name"],
+    },
+    async execute(_id: string, { slug, name }: { slug: string; name: string }) {
+      try {
+        const saved = renameCharacter(slug, name);
+        return { content: [{ type: "text", text: `Renamed to "${name}" (slug: ${saved.slug}).` }] };
+      } catch (err: any) {
+        return { content: [{ type: "text", text: `character_rename failed: ${err.message}` }], isError: true };
+      }
     },
   };
 }

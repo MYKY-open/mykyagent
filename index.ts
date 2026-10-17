@@ -17,8 +17,9 @@ import { recoverLeakedToolCalls } from "./tool_recovery.ts";
 import { listSkills, readSkill, skillsPromptLine } from "./skills.ts";
 import { addTodo, clearTodos, doneTodo, loadTodos, openTodos, todoBlock } from "./todo.ts";
 import { listCheckpoints, resolveToolPath, restoreCheckpoint, snapshotFile } from "./checkpoints.ts";
-import { buildResumeText, saveAutoStub, saveSummary } from "./resume.ts";
+import { buildResumeText, loadAutoState, saveAutoStub, saveSummary } from "./resume.ts";
 import { addTags, clearTags, getTags, removeTags, renderTagsBlock, setTags } from "./tags.ts";
+import { applyStyleSettingChange, buildStyleSettingItems, clearStyle, describeStyle, getStyles, listStyleDials, renderStyleBlock, setStyle } from "./style.ts";
 import { clearTask, listTasks, pollTask, startTask, stopTask, waitTask } from "./taskman.ts";
 import {
   McpRegistry,
@@ -29,13 +30,17 @@ import {
 import {
   charMemoryPrefix,
   clearCharacterMemories,
+  editMemoryEntry,
   forgetMemoryEntry,
   listMemoryEntries,
   memoryIndexBlock,
   memorySlug,
   migrateLegacyMemory,
+  moveMemoryEntry,
   readMemoryEntry,
+  renameMemoryEntry,
   resolveMemoryName,
+  searchMemories,
   writeMemoryEntry,
 } from "./memory.ts";
 import {
@@ -76,10 +81,12 @@ import {
 } from "./mode.ts";
 import {
   deleteCharacter,
+  duplicateCharacter,
   listCharacters,
   listGreetings,
   importCharacter,
   loadCharacter,
+  renameCharacter,
   renderCharacterBlock,
   renderGreeting,
   saveCharacter,
@@ -106,7 +113,7 @@ import {
   setStateValue,
   getStateValue,
 } from "./rpg_tools.ts";
-import { auditCard, cardAuditTool, characterDeleteTool, characterReadTool, characterSaveTool, lorebookDeleteTool, lorebookListTool, lorebookReadTool, lorebookSaveTool } from "./rp_creator.ts";
+import { auditCard, cardAuditTool, characterDeleteTool, characterDuplicateTool, characterReadTool, characterRenameTool, characterSaveTool, lorebookDeleteTool, lorebookListTool, lorebookReadTool, lorebookSaveTool } from "./rp_creator.ts";
 import {
   constants,
   existsSync,
@@ -115,8 +122,8 @@ import {
   readdirSync,
   writeFileSync,
 } from "node:fs";
-import { access, readFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { access, readFile, rm } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -1069,6 +1076,19 @@ export function isCharLeak(draft: string, charName: string): boolean {
 }
 
 /**
+ * Run an external command, resolving stdout/stderr or rejecting with a short
+ * error. Used for local media conversion (ffmpeg).
+ */
+function runCmd(cmd: string, args: string[], timeoutMs = 60000): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, { timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024, encoding: "utf-8" }, (err: any, stdout: string, stderr: string) => {
+      if (err) return reject(new Error((stderr || err.message || `${cmd} failed`).slice(0, 300)));
+      resolve({ stdout: stdout || "", stderr: stderr || "" });
+    });
+  });
+}
+
+/**
  * Send an image to an OpenAI-compatible vision endpoint (llama-server with
  * --mmproj, OpenRouter) and return a faithful text description. Used by the
  * read tool when the active model has no image input capability: pi would
@@ -1255,7 +1275,7 @@ export default function (pi: any) {
       if (rpCreatorOff && CREATOR_TOOL_NAMES.includes(t)) return false;
       if (rpgOff && RPG_TOOL_NAMES.includes(t)) return false;
       if (!isToolAllowedInMode(t, mode)) return false;
-      return isToolEnabled(t);
+      return isToolEnabled(t, mode);
     };
 
     try {
@@ -1355,6 +1375,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
 
       const rpMemBlock = memoryOff ? "" : memoryIndexBlock(rpMemoryPrefix());
       const rpTagsBlock = isFeatureEnabled("tags") ? renderTagsBlock() : "";
+      const rpStyleBlock = isFeatureEnabled("style") ? renderStyleBlock() : "";
       // Fresh-session self-heal: /new and /clear wipe the visible transcript and
       // pi never emits session_start for them, so the load-time greeting toast
       // is gone for good. Re-post it on the first turn of a session with no
@@ -1368,7 +1389,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
           ctx.ui.notify(`\x1b[22m\x1b[1;97mGreeting:\x1b[0m\n${formatWhiteGreeting(greetNow)}`, "info");
         }
       } catch {}
-      return { systemPrompt: buildRpSystemPrompt({ characterBlock, loreBlock, authorsNoteBlock: anBlock, toolHintsBlock, memoryBlock: rpMemBlock, userName, greetingReminder, tagsBlock: rpTagsBlock }) };
+      return { systemPrompt: buildRpSystemPrompt({ characterBlock, loreBlock, authorsNoteBlock: anBlock, toolHintsBlock, memoryBlock: rpMemBlock, userName, greetingReminder, tagsBlock: rpTagsBlock, styleBlock: rpStyleBlock }) };
     }
 
     // --- rp-creator mode: engineering prompt + Story Studio overlay ----------
@@ -1468,6 +1489,10 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       const tint = renderTagsBlock();
       if (tint) systemPrompt += `\n\n${tint}`;
     }
+    if (isFeatureEnabled("style")) {
+      const sty = renderStyleBlock();
+      if (sty) systemPrompt += `\n\n${sty}`;
+    }
 
     if (mode === "rp-creator") {
       systemPrompt += "\n\n" + buildCreatorSystemPrompt();
@@ -1519,7 +1544,9 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
   // 2b. Block disabled tool calls (defensive guard)
   pi.on("tool_call", async (event: any, ctx: any) => {
     if (!event?.toolName) return;
-    if (!isToolEnabled(event.toolName)) {
+    // Mode first: tool toggles are per-mode settings.
+    const mode = getEffectiveMode();
+    if (!isToolEnabled(event.toolName, mode)) {
       return {
         block: true,
         reason: `Tool "${event.toolName}" is disabled by /mykyagent. Re-enable with: /mykyagent enable ${event.toolName}`,
@@ -1552,7 +1579,6 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       };
     }
     // Mode gating (e.g. coding tools are off in rp mode)
-    const mode = getEffectiveMode();
     if (!isToolAllowedInMode(event.toolName, mode)) {
       return {
         block: true,
@@ -1842,12 +1868,97 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     },
   });
 
+  pi.registerTool({
+    name: "memory_edit",
+    label: "Memory Edit",
+    description:
+      "Rewrite a persistent memory topic's summary and/or body (namespace-aware like memory_read). Mode append adds to the body; replace overwrites.",
+    parameters: Type.Object({
+      name: Type.String({ description: "Topic name" }),
+      summary: Type.Optional(Type.String({ description: "New one-line summary (omit to keep)" })),
+      body: Type.Optional(Type.String({ description: "New body text (omit to keep)" })),
+      mode: Type.Optional(Type.Union([Type.Literal("replace"), Type.Literal("append")])),
+    }),
+    async execute(_id: string, { name, summary, body, mode }: { name: string; summary?: string; body?: string; mode?: "replace" | "append" }) {
+      try {
+        const e = editMemoryEntry(memoryNameForRead(name), { summary, body, mode });
+        if (!e) return { content: [{ type: "text", text: `No memory topic "${name}".` }], isError: true };
+        return { content: [{ type: "text", text: `Updated memory topic "${e.name}" (${e.chars} chars).` }] };
+      } catch (err: any) {
+        return { content: [{ type: "text", text: `Could not edit memory: ${err.message}` }], isError: true };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "memory_rename",
+    label: "Memory Rename",
+    description: "Rename a persistent memory topic (stays in its namespace).",
+    parameters: Type.Object({
+      name: Type.String({ description: "Current topic name" }),
+      new_name: Type.String({ description: "New topic name" }),
+    }),
+    async execute(_id: string, { name, new_name }: { name: string; new_name: string }) {
+      try {
+        const prefix = rpMemoryPrefix() || "";
+        const clean = memorySlug(new_name);
+        if (!clean) throw new Error("new name needs at least one letter or digit");
+        const target = prefix && !clean.startsWith(prefix) ? `${prefix}${clean}` : clean;
+        const e = renameMemoryEntry(memoryNameForRead(name), target);
+        if (!e) return { content: [{ type: "text", text: `No memory topic "${name}".` }], isError: true };
+        return { content: [{ type: "text", text: `Renamed to "${e.name}".` }] };
+      } catch (err: any) {
+        return { content: [{ type: "text", text: `Could not rename memory: ${err.message}` }], isError: true };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "memory_move",
+    label: "Memory Move",
+    description:
+      "Move a memory topic between the global store and a character namespace. Target: \"global\" or a character slug (e.g. \"evelyn\").",
+    parameters: Type.Object({
+      name: Type.String({ description: "Topic name" }),
+      target: Type.String({ description: '"global" or a character slug' }),
+    }),
+    async execute(_id: string, { name, target }: { name: string; target: string }) {
+      try {
+        const e = moveMemoryEntry(memoryNameForRead(name), target);
+        if (!e) return { content: [{ type: "text", text: `No memory topic "${name}".` }], isError: true };
+        return { content: [{ type: "text", text: `Moved to "${e.name}".` }] };
+      } catch (err: any) {
+        return { content: [{ type: "text", text: `Could not move memory: ${err.message}` }], isError: true };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "memory_search",
+    label: "Memory Search",
+    description:
+      "Substring search over memory names, summaries, and bodies (case-insensitive). Defaults to the current namespace; pass all=true for the whole store.",
+    parameters: Type.Object({
+      query: Type.String({ description: "Text to search for" }),
+      all: Type.Optional(Type.Boolean({ description: "Search every namespace, not just the current one" })),
+    }),
+    async execute(_id: string, { query, all }: { query: string; all?: boolean }) {
+      const prefix = all ? undefined : rpMemoryPrefix();
+      const hits = searchMemories(query, prefix ? { prefix } : undefined);
+      if (!hits.length) return { content: [{ type: "text", text: `No memories match "${query}".` }] };
+      const out = hits.map((h) => `• ${h.name}: ${h.summary}\n  ${h.snippet}`).join("\n");
+      return { content: [{ type: "text", text: out }] };
+    },
+  });
+
   // 8a. RP subsystem tools: creator studio (rp-creator mode) + RPG tools
   // (rp mode). Mode + feature gating happens in the toolset merge and the
   // tool_call guard; registration is unconditional so pi always knows them.
   pi.registerTool(characterSaveTool());
   pi.registerTool(characterReadTool());
   pi.registerTool(characterDeleteTool());
+  pi.registerTool(characterDuplicateTool());
+  pi.registerTool(characterRenameTool());
   pi.registerTool(lorebookSaveTool());
   pi.registerTool(lorebookReadTool());
   pi.registerTool(lorebookListTool());
@@ -2179,7 +2290,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     name: "read",
     label: "read",
     description:
-      "Read a file: text comes back in safe chunks (250 lines/15KB max); images (png/jpg/gif/webp/bmp) come back as vision content when your model takes images, otherwise auto-described through the vision server.",
+      "Read a file: text comes back in safe chunks (250 lines/15KB max); images (png/jpg/gif/webp/bmp, avif/heic auto-converted to PNG) come back as vision content when your model takes images, otherwise auto-described through the vision server.",
     parameters: Type.Object({
       path: Type.String({ description: "File path. Images are returned viewable, not as text." }),
       offset: Type.Optional(Type.Number({ description: "Line number to start reading from (1-indexed, default: 1)" })),
@@ -2191,10 +2302,33 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
         await access(absPath, constants.R_OK);
 
         const ext = path.split(".").pop()?.toLowerCase();
-        if (["png", "jpg", "jpeg", "gif", "webp", "bmp"].includes(ext || "")) {
-          const mimeType = ext === "jpg" ? "image/jpeg" : `image/${ext}`;
-          const buf = await readFile(absPath);
-          const note = `Read image file [${mimeType}] (${Math.round(buf.length / 1024)}KB)`;
+        // CONVERT formats need a quick ffmpeg transcode to PNG first
+        // (avif/heic/…) so `read` sees them straight, no manual step.
+        if (["png", "jpg", "jpeg", "gif", "webp", "bmp", "avif", "heic", "heif", "tif", "tiff"].includes(ext || "")) {
+          let mimeType = ext === "jpg" ? "image/jpeg" : `image/${ext}`;
+          let buf: Buffer;
+          let convertedNote = "";
+          if (["avif", "heic", "heif", "tif", "tiff"].includes(ext || "")) {
+            const tmpOut = join(tmpdir(), `mykyagent-img-${Date.now()}-${Math.random().toString(36).slice(2)}.png`);
+            try {
+              await runCmd("ffmpeg", ["-nostats", "-loglevel", "error", "-y", "-i", absPath, "-frames:v", "1", tmpOut]);
+              buf = await readFile(tmpOut);
+              mimeType = "image/png";
+              convertedNote = ` (auto-converted from .${ext})`;
+            } catch (err: any) {
+              return {
+                content: [{ type: "text", text: `Could not read .${ext} image (auto-convert failed: ${err?.message || err}). Install ffmpeg, or convert it to PNG first.` }],
+                isError: true,
+              };
+            } finally {
+              try {
+                await rm(tmpOut, { force: true });
+              } catch {}
+            }
+          } else {
+            buf = await readFile(absPath);
+          }
+          const note = `Read image file [${mimeType}] (${Math.round(buf.length / 1024)}KB)${convertedNote}`;
           const rmodel = (ctx as any)?.model || ctx?.getModel?.();
           const rinput = (rmodel as any)?.input;
           const seesImages = Array.isArray(rinput) && rinput.includes("image");
@@ -2722,6 +2856,154 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     },
   });
 
+  pi.registerCommand("style", {
+    description: "Narrative dials: /style [list | clear | <dial> <level> | clear <dial>] (all off by default)",
+    getArgumentCompletions: (argumentText: string) => {
+      if (argumentText.includes(" ")) return null;
+      const subs: AutocompleteItem[] = [
+        { value: "list", label: "list", description: "show all dials + current values" },
+        ...listStyleDials().map((d) => ({ value: d.key, label: d.key, description: `${d.label} — ${d.levels ? d.levels.join(" | ") : "freeform"}` })),
+        { value: "clear", label: "clear", description: "unset every dial" },
+      ];
+      const trimmed = argumentText.trim();
+      const filtered = trimmed ? fuzzyFilter(subs, trimmed, (s: any) => s.label) : subs;
+      return filtered.length ? filtered : null;
+    },
+    handler: async (args: string, ctx: any) => {
+      const trimmed = args?.trim() || "";
+      // No args + rich UI: interactive dial-board (like /mykyagent).
+      // Theme probe first: headless custom-UI stubs have no theme, and
+      // getSettingsListTheme() would throw there — fall back to the list.
+      let boardTheme: any = null;
+      try {
+        if (typeof getSettingsListTheme === "function") boardTheme = getSettingsListTheme();
+      } catch {
+        boardTheme = null;
+      }
+      if (!trimmed && ctx.ui?.custom && boardTheme) {
+        await ctx.ui.custom(
+          (tui: any, theme: any, _kb: any, done: (val: any) => void) => {
+            const settingsList = new SettingsList(
+              buildStyleSettingItems(),
+              Math.min(listStyleDials().length + 4, 20),
+              boardTheme,
+              (id: string, newValue: string) => {
+                applyStyleSettingChange(id, newValue);
+              },
+              () => done(undefined)
+            );
+            const container = new Container();
+            container.addChild(
+              new (class {
+                render(_width: number) {
+                  return [
+                    theme.fg("accent", theme.bold("MykyAgent: Narrative Style Dials")),
+                    theme.fg("muted", "←/→ step level up/down · Enter/Space cycle · c disables dial · Esc closes"),
+                    theme.fg("muted", "Master switch on top; custom tones via /style tone <...>"),
+                    "",
+                  ];
+                }
+                invalidate() {}
+              })()
+            );
+            container.addChild(settingsList);
+            return {
+              render(width: number) {
+                return container.render(width);
+              },
+              invalidate() {
+                container.invalidate();
+              },
+              handleInput(data: string) {
+                const list: any = settingsList as any;
+                const selected = (() => {
+                  try {
+                    return list.getDisplayItems()?.[list.selectedIndex];
+                  } catch {
+                    return undefined;
+                  }
+                })();
+                // "c" disables the selected dial outright.
+                if (data === "c" || data === "C") {
+                  if (selected && typeof selected.id === "string" && selected.id.startsWith("style:") && !selected.id.endsWith("__master__")) {
+                    list.updateValue(selected.id, "off");
+                    applyStyleSettingChange(selected.id, "off");
+                    tui.requestRender();
+                  }
+                  return;
+                }
+                // → steps up a level, ← steps down (SettingsList ignores these).
+                if (data === "\x1b[C" || data === "\x1b[D") {
+                  const vals: string[] | undefined = selected?.values;
+                  if (selected && vals && vals.length > 0) {
+                    const at = vals.indexOf(selected.currentValue);
+                    const nxt = data === "\x1b[C" ? (at + 1) % vals.length : (at - 1 + vals.length) % vals.length;
+                    const nv = vals[at < 0 ? 0 : nxt];
+                    list.updateValue(selected.id, nv);
+                    applyStyleSettingChange(selected.id, nv);
+                    tui.requestRender();
+                  }
+                  return;
+                }
+                settingsList.handleInput?.(data);
+                tui.requestRender();
+              },
+            };
+          },
+          {
+            overlay: true,
+            overlayOptions: { anchor: "bottom-left", width: "100%", margin: { left: 0, right: 0, bottom: 0 } },
+          }
+        );
+        const after = getStyles();
+        const keys = Object.keys(after);
+        ctx.ui?.notify?.(keys.length ? `Style on: ${keys.map((k) => `${k}=${after[k]}`).join(", ")}.` : "Style: all dials off.", "info");
+        return;
+      }
+      if (!trimmed || trimmed === "list") {
+        const cur = getStyles();
+        const lines = listStyleDials().map((d) => {
+          const v = cur[d.key];
+          return `• ${d.key} (${d.label}): ${v ? `**${v}**` : "—"}${d.levels ? ` [${d.levels.join(" | ")}]` : " [freeform]"}`;
+        });
+        ctx.ui?.notify?.(`Narrative dials (all off unless set; toggle: /mykyagent toggle style):\n${lines.join("\n")}`, "info");
+        return;
+      }
+      if (trimmed === "clear") {
+        clearStyle();
+        ctx.ui?.notify?.("Style dials cleared (all off).", "info");
+        return;
+      }
+      const [sub, ...rest] = trimmed.split(/\s+/);
+      if (sub === "clear" && rest.length) {
+        try {
+          const left = clearStyle(rest.join(" "));
+          const keys = Object.keys(left);
+          ctx.ui?.notify?.(keys.length ? `Unset. Still on: ${keys.join(", ")}.` : "Unset. All dials off.", "info");
+        } catch (err: any) {
+          ctx.ui?.notify?.(err.message, "error");
+        }
+        return;
+      }
+      const dial = listStyleDials().find((d) => d.key === sub.toLowerCase());
+      if (!dial) {
+        ctx.ui?.notify?.(`Unknown dial "${sub}". Try /style list.`, "error");
+        return;
+      }
+      const value = rest.join(" ");
+      if (!value) {
+        ctx.ui?.notify?.(describeStyle(dial.key), "info");
+        return;
+      }
+      try {
+        const r = setStyle(dial.key, value);
+        ctx.ui?.notify?.(`Style: ${dial.key} = ${r.value}.`, "info");
+      } catch (err: any) {
+        ctx.ui?.notify?.(err.message, "error");
+      }
+    },
+  });
+
   pi.registerCommand("tags", {
     description: "Conversation tints: /tags [add <a, b> | remove <a> | list | clear] (additive flavor, works in every mode)",
     getArgumentCompletions: (argumentText: string) => {
@@ -2882,7 +3164,18 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       }
     };
     for (let attempt = 0; attempt < 3; attempt++) {
-      const r = await completeOnce();
+      // Lantern on while the ghost is drafting (cleared the moment it speaks).
+      try {
+        ctx.ui?.setStatus?.("ghost", attempt === 0 ? "Ghost is listening to the scene…" : "Ghost is whispering again…");
+      } catch {}
+      let r;
+      try {
+        r = await completeOnce();
+      } finally {
+        try {
+          ctx.ui?.setStatus?.("ghost", undefined);
+        } catch {}
+      }
       const draft = r.draft;
       if (!draft) {
         ctx.ui?.notify?.(`Ghost came back empty (${r.error || "unknown cause"}) — try again or type manually.`, "error");
@@ -2916,6 +3209,199 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
   pi.registerCommand("gh", {
     description: "Shorthand for /ghost",
     handler: ghostHandler,
+  });
+
+  pi.registerCommand("characters", {
+    description: "Character manager: browse, load, duplicate, rename, export, delete",
+    getArgumentCompletions: () => null,
+    handler: async (args: string, ctx: any) => {
+      seedStarterCharacters();
+      const entries = listCharacters();
+      if (!entries.length) {
+        ctx.ui?.notify?.("No character cards yet. Switch to /mode rp-creator and build one.", "info");
+        return;
+      }
+      const want = (args || "").trim();
+      let slug = want ? slugifyForCharacter(want) : "";
+      if (!slug || !loadCharacter(slug)) {
+        if (!ctx.ui?.select) {
+          ctx.ui?.notify?.(entries.map((e) => characterSummaryLine(e.slug, e.card)).join("\n"), "info");
+          return;
+        }
+        const picked = await ctx.ui.select("Manage characters:", [
+          ...entries.map((e) => `${e.slug} - ${e.card.name}: ${oneLine(e.card.description || "", 50)}`),
+          "❌ Close",
+        ]);
+        if (!picked || picked.startsWith("❌")) return;
+        slug = picked.split(" - ")[0].trim();
+      }
+      const card = loadCharacter(slug);
+      if (!card) {
+        ctx.ui?.notify?.(`No character card "${slug}".`, "error");
+        return;
+      }
+      if (!ctx.ui?.select) {
+        loadCharacterBySlug(slug, ctx);
+        return;
+      }
+      const action = await ctx.ui.select(`Character: ${card.name} (${slug})`, [
+        "Load (rp mode)",
+        "Greeting",
+        "Duplicate",
+        "Rename",
+        "Export to file",
+        "Delete file",
+        "Nuke (card + memories + state)",
+        "❌ Close",
+      ]);
+      if (!action || action.startsWith("❌")) return;
+      try {
+        if (action.startsWith("Load")) {
+          loadCharacterBySlug(slug, ctx);
+          return;
+        }
+        if (action.startsWith("Greeting")) {
+          const cfg = loadModeConfig();
+          const g = renderGreeting(loadCharacter(slug)!, cfg.userName || "User");
+          ctx.ui?.notify?.(g.trim() ? `\x1b[22m\x1b[1;97mGreeting:\x1b[0m\n${formatWhiteGreeting(g)}` : "No first_message on this card.", "info");
+          return;
+        }
+        if (action.startsWith("Duplicate")) {
+          const name = ctx.ui?.input ? await ctx.ui.input("Name for the copy:", `${card.name} (copy)`) : undefined;
+          if (!name?.trim()) return;
+          const saved = duplicateCharacter(slug, name.trim());
+          ctx.ui?.notify?.(`Duplicated as "${name.trim()}" (slug: ${saved.slug}).`, "info");
+          return;
+        }
+        if (action.startsWith("Rename")) {
+          const name = ctx.ui?.input ? await ctx.ui.input("New name:", card.name) : undefined;
+          if (!name?.trim()) return;
+          const saved = renameCharacter(slug, name.trim());
+          const cfg = loadModeConfig();
+          if (cfg.activeCharacter === saved.oldSlug) {
+            cfg.activeCharacter = saved.slug;
+            saveModeConfig(cfg);
+          }
+          ctx.ui?.notify?.(`Renamed to "${name.trim()}" (slug: ${saved.slug}).`, "info");
+          return;
+        }
+        if (action.startsWith("Export")) {
+          const dest = ctx.ui?.input ? await ctx.ui.input("Save card JSON to path:", `./${slug}.json`) : undefined;
+          if (!dest?.trim()) return;
+          const outPath = resolveToolPath(ctx?.cwd || process.cwd(), dest.trim());
+          writeFileSync(outPath, JSON.stringify(loadCharacter(slug), null, 2), "utf-8");
+          ctx.ui?.notify?.(`Exported ${slug} to ${outPath}.`, "info");
+          return;
+        }
+        if (action.startsWith("Nuke")) {
+          const ok = ctx.ui?.confirm ? await ctx.ui.confirm("Nuke character?", `Delete card "${card.name}" plus its game state and ${slug} memories? This cannot be undone (except /rewind for the file).`) : false;
+          if (!ok) return;
+          resetGameState(slug);
+          resetGameState("default");
+          const wiped = clearCharacterMemories(slug);
+          deleteCharacter(slug);
+          const cfg = loadModeConfig();
+          if (cfg.activeCharacter === slug) {
+            cfg.activeCharacter = undefined;
+            if (cfg.mode === "rp") cfg.mode = "code";
+            saveModeConfig(cfg);
+          }
+          ctx.ui?.notify?.(`Nuked "${card.name}": card deleted, ${wiped} memories and game state wiped.`, "info");
+          return;
+        }
+        if (action.startsWith("Delete")) {
+          const ok = ctx.ui?.confirm ? await ctx.ui.confirm("Delete character?", `Delete card "${card.name}"? Game state and memories are kept.`) : false;
+          if (!ok) return;
+          deleteCharacter(slug);
+          const cfg = loadModeConfig();
+          if (cfg.activeCharacter === slug) {
+            cfg.activeCharacter = undefined;
+            if (cfg.mode === "rp") cfg.mode = "code";
+            saveModeConfig(cfg);
+          }
+          ctx.ui?.notify?.(`Deleted character card "${card.name}" (${slug}).`, "info");
+          return;
+        }
+      } catch (err: any) {
+        ctx.ui?.notify?.(`Character action failed: ${err?.message || err}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("memories", {
+    description: "Memory browser: read, rename, move, delete topics (namespace-aware)",
+    getArgumentCompletions: (argumentText: string) => {
+      if (argumentText.includes(" ")) return null;
+      return argumentText.trim() ? null : [{ value: "all", label: "all", description: "browse every namespace" }];
+    },
+    handler: async (args: string, ctx: any) => {
+      const a = (args || "").trim().toLowerCase();
+      const prefix = rpMemoryPrefix();
+      const scopeAll = a === "all" || !prefix;
+      if (a && a !== "all") {
+        // Bare query: quick search, then point at the browser.
+        const hits = searchMemories(a, scopeAll ? undefined : { prefix });
+        ctx.ui?.notify?.(
+          hits.length ? hits.map((h) => `• ${h.name}: ${h.summary}\n  ${h.snippet}`).join("\n") + "\n\nRun /memories to manage these." : `No memories match "${a}".`,
+          "info"
+        );
+        return;
+      }
+      const entries = (scopeAll ? listMemoryEntries() : listMemoryEntries().filter((e) => e.name.startsWith(prefix!))).sort((x, y) => x.name.localeCompare(y.name));
+      const scopeNote = scopeAll ? "all namespaces" : `this character (${prefix}*)`;
+      if (!entries.length) {
+        ctx.ui?.notify?.(`No memory topics (${scopeNote}). Write one with the memory_write tool or /memories all to look wider.`, "info");
+        return;
+      }
+      if (!ctx.ui?.select) {
+        ctx.ui?.notify?.(entries.map((e) => `• ${e.name}: ${e.summary}`).join("\n"), "info");
+        return;
+      }
+      const picked = await ctx.ui.select(`Memories (${scopeNote}):`, [...entries.map((e) => `${e.name} — ${e.summary.slice(0, 60)}`), "❌ Close"]);
+      if (!picked || picked.startsWith("❌")) return;
+      const name = picked.split(" — ")[0].trim();
+      const entry = readMemoryEntry(name);
+      if (!entry) {
+        ctx.ui?.notify?.(`No memory topic "${name}".`, "error");
+        return;
+      }
+      const action = await ctx.ui.select(`Memory: ${entry.name}`, ["Read", "Rename", "Move", "Delete", "❌ Close"]);
+      if (!action || action.startsWith("❌")) return;
+      try {
+        if (action === "Read") {
+          const body = entry.body.length > 2000 ? entry.body.slice(0, 2000) + "\n…(truncated — memory_read shows it all)" : entry.body;
+          ctx.ui?.notify?.(`${entry.name} (${entry.updated || "?"}): ${entry.summary}\n\n${body}`, "info");
+          return;
+        }
+        if (action === "Rename") {
+          const nn = ctx.ui?.input ? await ctx.ui.input("New topic name:", entry.name) : undefined;
+          if (!nn?.trim()) return;
+          const clean = memorySlug(nn.trim());
+          const target = prefix && !clean.startsWith(prefix) ? `${prefix}${clean}` : clean;
+          const moved = renameMemoryEntry(entry.name, target);
+          ctx.ui?.notify?.(moved ? `Renamed to "${moved.name}".` : `No memory topic "${entry.name}".`, moved ? "info" : "error");
+          return;
+        }
+        if (action === "Move") {
+          seedStarterCharacters();
+          const targets = ["global", ...listCharacters().map((c) => c.slug)];
+          const where = await ctx.ui.select("Move to:", [...targets, "❌ Close"]);
+          if (!where || where.startsWith("❌")) return;
+          const moved = moveMemoryEntry(entry.name, where);
+          ctx.ui?.notify?.(moved ? `Moved to "${moved.name}".` : `No memory topic "${entry.name}".`, moved ? "info" : "error");
+          return;
+        }
+        if (action === "Delete") {
+          const ok = ctx.ui?.confirm ? await ctx.ui.confirm("Delete memory?", `Delete topic "${entry.name}"?`) : false;
+          if (!ok) return;
+          const gone = forgetMemoryEntry(entry.name);
+          ctx.ui?.notify?.(gone ? `Deleted "${entry.name}".` : `No memory topic "${entry.name}".`, gone ? "info" : "error");
+          return;
+        }
+      } catch (err: any) {
+        ctx.ui?.notify?.(`Memory action failed: ${err?.message || err}`, "error");
+      }
+    },
   });
 
   pi.registerCommand("rp-creator", {
@@ -3368,9 +3854,48 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
         ctx.ui?.notify?.("Nothing to resume (no session summary saved — use the summarize tool first).", "info");
         return;
       }
+      // Re-apply the saved stage, not just the story: mode + character.
+      // Personas, tags, style, author's note, and toggles persist in their own
+      // files already — mode.json is the only thing that needs re-applying.
+      const staged: string[] = [];
+      try {
+        const st = loadAutoState();
+        if (st?.mode === "rp" && st.activeCharacter) {
+          const card = loadCharacter(st.activeCharacter);
+          if (card) {
+            const cfg = loadModeConfig();
+            cfg.mode = "rp";
+            cfg.activeCharacter = st.activeCharacter;
+            if (st.lorebook) cfg.lorebook = st.lorebook;
+            saveModeConfig(cfg);
+            const g = renderGreeting(card, cfg.userName || "User");
+            staged.push(`Restored RP mode: ${card.name} is active.`);
+            if (g.trim()) staged.push(`\x1b[22m\x1b[1;97mGreeting:\x1b[0m\n${formatWhiteGreeting(g)}`);
+          } else {
+            const cfg = loadModeConfig();
+            cfg.mode = "rp";
+            cfg.activeCharacter = undefined;
+            saveModeConfig(cfg);
+            staged.push(`Restored RP mode, but character "${st.activeCharacter}" is gone — load another with /character.`);
+          }
+        } else if (st?.mode === "rp") {
+          const cfg = loadModeConfig();
+          cfg.mode = "rp";
+          saveModeConfig(cfg);
+          staged.push("Restored RP mode (no character was loaded).");
+        } else if (st?.mode === "rp-creator") {
+          setMode("rp-creator");
+          staged.push("Restored rp-creator mode.");
+        } else if (st?.mode === "code") {
+          setMode("code");
+          staged.push("Restored code mode.");
+        }
+      } catch (err: any) {
+        staged.push(`Stage restore hiccup: ${err?.message || err} (story still restored).`);
+      }
       try {
         (pi as any).sendUserMessage?.(text);
-        ctx.ui?.notify?.("Previous session restored into context.", "info");
+        ctx.ui?.notify?.(["Previous session restored into context.", ...staged].join("\n"), "info");
       } catch (e: any) {
         ctx.ui?.notify?.(text.slice(0, 4000), "info");
       }
@@ -3539,9 +4064,12 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     description: "Toggle tools, skills, and features (e.g. /mykyagent, /mykyagent status, /mykyagent toggle <name>)",
     getArgumentCompletions: (argumentText: string) => {
       const trimmed = argumentText.trim();
+      const modeNow = getEffectiveMode();
+      const allowedNow = (t: string) => isToolAllowedInMode(t, modeNow);
       const allItems = getAllToggleableItems(
         lastDiscoveredSkills,
-        pi.getAllTools?.()?.map((t: any) => t.name) || []
+        pi.getAllTools?.()?.map((t: any) => t.name) || [],
+        { mode: modeNow, isAllowed: allowedNow }
       );
       const subCommands = [
         { value: "status", label: "status", description: "Show status of all tools, skills, and features" },
@@ -3578,26 +4106,30 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       const trimmed = args?.trim();
       const registeredTools = pi.getAllTools?.()?.map((t: any) => t.name) || [];
       const discoveredSkills = lastDiscoveredSkills;
+      // Per-mode settings room: only what this mode may use is shown, and
+      // every tool flip lands on this mode's own setting.
+      const mode = getEffectiveMode();
+      const allowed = (t: string) => isToolAllowedInMode(t, mode);
 
       const applyToolChanges = () => {
         try {
           const current = pi.getActiveTools?.();
           if (Array.isArray(current) && current.length > 0) {
-            const next = current.filter((t: string) => isToolEnabled(t));
+            const next = current.filter((t: string) => isToolEnabled(t, getEffectiveMode()));
             pi.setActiveTools?.(next);
           }
         } catch {}
       };
 
       if (trimmed === "status") {
-        ctx.ui?.notify?.(formatTogglesSummary(discoveredSkills, registeredTools), "info");
+        ctx.ui?.notify?.(formatTogglesSummary(discoveredSkills, registeredTools, { mode, isAllowed: allowed }), "info");
         return;
       }
 
       if (trimmed === "reset") {
         resetAllToggles();
         applyToolChanges();
-        ctx.ui?.notify?.("All tools, skills, and features have been reset to ENABLED.", "info");
+        ctx.ui?.notify?.("All tools, skills, and features have been reset to ENABLED (all modes).", "info");
         return;
       }
 
@@ -3619,7 +4151,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
         if (action === "on" || action === "enable") explicit = true;
         if (action === "off" || action === "disable") explicit = false;
 
-        const res = toggleByName(target, explicit, discoveredSkills);
+        const res = toggleByName(target, explicit, discoveredSkills, mode);
         applyToolChanges();
 
         if (res.name === "web") setWebDisabled(!res.enabled);
@@ -3631,7 +4163,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
 
       // If user typed a bare toggle target name e.g. "/mykyagent bash"
       if (trimmed) {
-        const res = toggleByName(trimmed, undefined, discoveredSkills);
+        const res = toggleByName(trimmed, undefined, discoveredSkills, mode);
         applyToolChanges();
         if (res.name === "web") setWebDisabled(!res.enabled);
         if (res.name === "mcp") setMcpDisabled(!res.enabled);
@@ -3641,7 +4173,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
 
       // Interactive UI mode (no args provided)
       if (ctx.ui?.custom && typeof getSettingsListTheme === "function") {
-        const allItems = getAllToggleableItems(discoveredSkills, registeredTools);
+        const allItems = getAllToggleableItems(discoveredSkills, registeredTools, { mode, isAllowed: allowed });
         const settingItems: SettingItem[] = allItems.map((item) => ({
           id: item.id,
           label: `${item.name} (${item.category})`,
@@ -3656,7 +4188,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
               new (class {
                 render(_width: number) {
                   return [
-                    theme.fg("accent", theme.bold("MykyAgent: Tool, Skill & Feature Toggles")),
+                    theme.fg("accent", theme.bold(`MykyAgent [${mode} mode]: Tool, Skill & Feature Toggles`)),
                     theme.fg("muted", "Arrow keys navigate • Enter/Space/Left/Right toggle • Esc closes"),
                     "",
                   ];
@@ -3686,7 +4218,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
                     setSkillEnabled(name, enabled);
                   }
                 } else if (cat === "tool") {
-                  setToolEnabled(name, enabled);
+                  setToolEnabled(name, enabled, mode);
                 }
                 applyToolChanges();
               },
@@ -3719,7 +4251,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
 
       // Fallback: ctx.ui.select
       if (ctx.ui?.select) {
-        const allItems = getAllToggleableItems(discoveredSkills, registeredTools);
+        const allItems = getAllToggleableItems(discoveredSkills, registeredTools, { mode, isAllowed: allowed });
         const options = [
           ...allItems.map(
             (i) => `${i.enabled ? "🟢 [ON] " : "🔴 [OFF]"} [${i.category.toUpperCase()}] ${i.name} - ${i.description}`
@@ -3727,18 +4259,18 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
           "🔄 Reset all to default",
           "❌ Close",
         ];
-        const selected = await ctx.ui.select("Toggle MykyAgent Items:", options);
+        const selected = await ctx.ui.select(`Toggle MykyAgent Items [${mode} mode]:`, options);
         if (!selected || selected.startsWith("❌")) return;
         if (selected.startsWith("🔄")) {
           resetAllToggles();
           applyToolChanges();
-          ctx.ui?.notify?.("All items reset to ENABLED.", "info");
+          ctx.ui?.notify?.("All items reset to ENABLED (all modes).", "info");
           return;
         }
         const match = selected.match(/\[(TOOL|SKILL|FEATURE)\]\s+([^\s]+)/);
         if (match) {
           const name = match[2];
-          const res = toggleByName(name, undefined, discoveredSkills);
+          const res = toggleByName(name, undefined, discoveredSkills, mode);
           applyToolChanges();
           if (res.name === "web") setWebDisabled(!res.enabled);
           if (res.name === "mcp") setMcpDisabled(!res.enabled);
@@ -3747,7 +4279,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
         return;
       }
 
-      ctx.ui?.notify?.(formatTogglesSummary(discoveredSkills, registeredTools), "info");
+      ctx.ui?.notify?.(formatTogglesSummary(discoveredSkills, registeredTools, { mode, isAllowed: allowed }), "info");
     },
   });
 

@@ -286,6 +286,23 @@ await hooks["before_agent_start"](
 );
 t("lived-in session stays quiet", !livedNotify.some((n) => n.includes("Greeting:")));
 
+// --- 10. per-mode tool settings: memory_read off in rp, on in code --------
+const { setToolEnabled: setTE } = await import("./toggles.ts");
+setTE("memory_read", false, "rp");
+modeMod.setMode("rp");
+modeMod.setActiveCharacter("vex");
+activeTools = ["bash", "read", "memory_read", "dice_roll"];
+await hooks["before_agent_start"]({ prompt: "hi" }, { cwd: DIR });
+t("per-mode off hides tool in rp", !activeTools.includes("memory_read") && activeTools.includes("dice_roll"));
+modeMod.setMode("code");
+activeTools = ["bash", "read", "memory_read", "dice_roll"];
+await hooks["before_agent_start"]({ prompt: "hi" }, { cwd: DIR });
+t("other mode keeps tool", activeTools.includes("memory_read") && activeTools.includes("read"));
+setTE("memory_read", true);
+modeMod.setMode("rp");
+modeMod.setActiveCharacter("vex");
+t("bare reset restores everywhere", (await import("./toggles.ts")).isToolEnabled("memory_read", "rp") === true);
+
 rmSync(DIR, { recursive: true, force: true });
 console.log(`\n${pass} pass, ${fail} fail`);
 process.exit(fail === 0 ? 0 : 1);

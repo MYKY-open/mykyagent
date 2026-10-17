@@ -114,6 +114,33 @@ t("no registry errors cleanly", errNotify.some((m) => m.includes("model registry
   t("thinking-only reply yields draft", sent.length === 1 && sent[0] === "I step forward slowly.", JSON.stringify(sent));
 }
 
+// status lantern: on while drafting, off afterwards (send flow)
+{
+  const statusLog: string[] = [];
+  const ctx = baseCtx(async () => "send - post as my message");
+  const prevUi = ctx.ui;
+  ctx.ui = {
+    ...prevUi,
+    setStatus: (key: string, text: string | undefined) => statusLog.push(`${key}=${text === undefined ? "<cleared>" : text}`),
+  };
+  sent.length = 0;
+  await commands["ghost"].handler("", ctx);
+  t("lantern on then off (send)", statusLog.length === 2 && statusLog[0].startsWith("ghost=Ghost is listening") && statusLog[1] === "ghost=<cleared>", statusLog.join(" | "));
+}
+
+// status lantern clears on the abort path too
+{
+  const statusLog: string[] = [];
+  const ctx = baseCtx(async () => "abort - I'll write it myself");
+  const prevUi2 = ctx.ui;
+  ctx.ui = {
+    ...prevUi2,
+    setStatus: (key: string, text: string | undefined) => statusLog.push(`${key}=${text === undefined ? "<cleared>" : text}`),
+  };
+  await commands["ghost"].handler("", ctx);
+  t("lantern clears on abort", statusLog.length === 2 && statusLog[1] === "ghost=<cleared>", statusLog.join(" | "));
+}
+
 // registry failure falls back to direct HTTP
 {
   const failing = {
