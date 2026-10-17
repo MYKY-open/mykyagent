@@ -24,6 +24,8 @@ export interface CharacterCard {
   tags?: string[];
   creator_notes?: string;
   lorebook?: string;
+  /** Extra opening lines (SillyTavern alternate_greetings). [0] is first_message. */
+  alternate_greetings?: string[];
 }
 
 const CHARACTERS_DIR = join(homedir(), ".config", "mykyagent", "characters");
@@ -97,14 +99,23 @@ export function validateCard(card: any): CardValidation {
   if (card.tags !== undefined && !Array.isArray(card.tags)) {
     errors.push('field "tags" must be an array of strings');
   }
+  if (card.alternate_greetings !== undefined) {
+    if (!Array.isArray(card.alternate_greetings) || !card.alternate_greetings.every((x: any) => typeof x === "string")) {
+      errors.push('field "alternate_greetings" must be an array of strings');
+    }
+  }
 
+  const altTokens = Array.isArray(card.alternate_greetings)
+    ? card.alternate_greetings.reduce((n: number, g: any) => n + estimateTokens(typeof g === "string" ? g : ""), 0)
+    : 0;
   const tokenEstimate =
     estimateTokens(card.description || "") +
     estimateTokens(card.personality || "") +
     estimateTokens(card.scenario || "") +
     estimateTokens(card.first_message || "") +
     estimateTokens(card.mes_example || "") +
-    estimateTokens(card.system_prompt || "");
+    estimateTokens(card.system_prompt || "") +
+    altTokens;
 
   if (tokenEstimate > 1500) warnings.push(`card body is ~${tokenEstimate} tokens (budget: <=1500) — consider trimming`);
   else if (tokenEstimate > 800) warnings.push(`card body is ~${tokenEstimate} tokens — on the heavy side for small local models`);
@@ -192,6 +203,15 @@ export function renderGreeting(card: CharacterCard, userName: string): string {
   return substitutePlaceholders(card.first_message || "", card.name, userName);
 }
 
+/** All greetings: [first_message, ...alternate_greetings] with placeholders resolved. */
+export function listGreetings(card: CharacterCard, userName: string): string[] {
+  const out = [renderGreeting(card, userName)];
+  for (const g of card.alternate_greetings || []) {
+    if (typeof g === "string" && g.trim()) out.push(substitutePlaceholders(g, card.name, userName));
+  }
+  return out.filter((g) => g.trim());
+}
+
 // --- Import: PNG-embedded cards & V1/V2/V3 spec normalization ----------------
 
 const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
@@ -252,7 +272,7 @@ export function decodeCardPayload(raw: string): any | null {
  * Normalize a parsed card JSON (V1 flat, V2/V3 { spec, data }) into the
  * internal flat CharacterCard schema. Tolerant of spec field aliases.
  */
-export function normalizeImportedCard(parsed: any): { card: CharacterCard; spec: string; warnings: string[] } {
+export function normalizeImportedCard(parsed: any): { card: CharacterCard; spec: string; warnings: string[]; characterBook: { keys: string[]; content: string }[] } {
   const warnings: string[] = [];
   let inner = parsed;
   let spec = "v1";
@@ -270,12 +290,26 @@ export function normalizeImportedCard(parsed: any): { card: CharacterCard; spec:
     return "";
   };
 
-  const alts = Array.isArray(inner?.alternate_greetings) ? inner.alternate_greetings.length : 0;
-  if (alts > 0) warnings.push(`dropped ${alts} alternate_greeting(s) (engine uses a single greeting)`);
+  const altList = Array.isArray(inner?.alternate_greetings)
+    ? inner.alternate_greetings.filter((x: any) => typeof x === "string" && x.trim()).slice(0, 10)
+    : [];
+  if (altList.length > 0) warnings.push(`preserved ${altList.length} alternate_greeting(s) (use /character greeting <n>)`);
+  else if (Array.isArray(inner?.alternate_greetings) && inner.alternate_greetings.length > 0) warnings.push("alternate_greetings present but empty — ignored");
   if (inner?.extensions && typeof inner.extensions === "object" && Object.keys(inner.extensions).length) {
-    warnings.push("dropped extensions block (not supported)");
+    warnings.push("dropped extensions block (not supported; samplers live on the server/orchestrator)");
   }
-  if (inner?.character_book) warnings.push("dropped embedded character_book (use lorebook_save to author lore)");
+  // Embedded world book: converted to a lorebook on save (see importCharacter),
+  // not dropped. Collect candidate entries here (IO happens in importCharacter).
+  const characterBook: { keys: string[]; content: string }[] = [];
+  const book = inner?.character_book;
+  const rawEntries: any[] = Array.isArray(book) ? book : Array.isArray(book?.entries) ? book.entries : [];
+  for (const e of rawEntries) {
+    const keys = Array.isArray(e?.keys) ? e.keys.map((k: any) => String(k).toLowerCase().trim()).filter(Boolean)
+      : Array.isArray(e?.key) ? e.key.map((k: any) => String(k).toLowerCase().trim()).filter(Boolean) : [];
+    const content = typeof e?.content === "string" ? e.content.trim() : typeof e?.entry === "string" ? e.entry.trim() : "";
+    if (keys.length && content) characterBook.push({ keys, content });
+  }
+  if (book && !characterBook.length) warnings.push("embedded character_book had no usable entries (keys + content) — skipped");
 
   const card: CharacterCard = {
     name: pick("name", "char_name") || "Unnamed Import",
@@ -293,8 +327,9 @@ export function normalizeImportedCard(parsed: any): { card: CharacterCard; spec:
     card.tags = inner.tags;
   }
   if (typeof inner?.lorebook === "string" && inner.lorebook) card.lorebook = inner.lorebook;
+  if (altList.length) card.alternate_greetings = altList;
 
-  return { card, spec, warnings };
+  return { card, spec, warnings, characterBook };
 }
 
 /**
@@ -342,7 +377,7 @@ export async function importCharacter(source: string): Promise<ImportResult> {
   }
 
   try {
-    const { card, spec, warnings: normWarnings } = normalizeImportedCard(parsed);
+    const { card, spec, warnings: normWarnings, characterBook } = normalizeImportedCard(parsed);
     warnings.push(...normWarnings);
     const v = validateCard(card);
     if (!v.ok) {
@@ -350,6 +385,22 @@ export async function importCharacter(source: string): Promise<ImportResult> {
     }
     warnings.push(...v.warnings);
     const saved = saveCharacter(card);
+    // Auto-convert an embedded character_book into a real lorebook file and
+    // link it, instead of dropping it. Respects a pre-set card.lorebook slug.
+    if (characterBook.length) {
+      try {
+        const { saveLorebook } = await import("./lorebook.ts");
+        const target = (card.lorebook || `${saved.slug}-book`).toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || `${saved.slug}-book`;
+        const res = saveLorebook(target, characterBook.map((e) => ({ keys: e.keys, content: e.content })));
+        if (!card.lorebook) {
+          card.lorebook = res.slug;
+          saveCharacter(card, saved.slug);
+        }
+        warnings.push(`converted embedded character_book (${res.count} entries) to lorebook "${res.slug}"${card.lorebook === res.slug ? " and linked it" : ""}`);
+      } catch (err: any) {
+        warnings.push(`embedded character_book could not be converted: ${err.message}`);
+      }
+    }
     return { ok: true, card, spec, slug: saved.slug, warnings };
   } catch (err: any) {
     return { ok: false, warnings, error: err.message };

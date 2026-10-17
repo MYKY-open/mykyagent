@@ -8,7 +8,7 @@
  * keys; matches are injected into an <active_lore> block in the system prompt
  * for that turn only. No tool calls, no narrative disruption.
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -73,6 +73,19 @@ export function listLorebooks(): { slug: string; entries: number }[] {
     } catch {}
   }
   return out.sort((a, b) => a.slug.localeCompare(b.slug));
+}
+
+export function deleteLorebook(slug: string): boolean {
+  const clean = slugifyLore(slug);
+  if (!clean) return false;
+  const path = join(getLoreDir(), `${clean}.json`);
+  if (!existsSync(path)) return false;
+  try {
+    rmSync(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Detect keyword overlaps across entries (same key in multiple entries). */
@@ -141,9 +154,39 @@ export function renderActiveLore(matches: LoreMatch[]): string {
 /**
  * Collect matches for a turn. Sources: the global "default" book plus any
  * book referenced by the active character card.
+ *
+ * Budget guard for small local models: at most LORE_MAX_MATCHES entries and
+ * LORE_MAX_CHARS of content; lowest-priority matches drop first and the last
+ * kept entry is hard-truncated with an ellipsis marker.
  */
-export function collectActiveLore(prompt: string, bookSlugs: string[]): { block: string; matches: LoreMatch[] } {
+export const LORE_MAX_MATCHES = 10;
+export const LORE_MAX_CHARS = 2000;
+
+export function collectActiveLore(
+  prompt: string,
+  bookSlugs: string[],
+  opts?: { maxMatches?: number; maxChars?: number }
+): { block: string; matches: LoreMatch[]; truncated: boolean } {
+  const maxMatches = Math.max(1, Math.min(50, opts?.maxMatches ?? LORE_MAX_MATCHES));
+  const maxChars = Math.max(200, Math.min(10000, opts?.maxChars ?? LORE_MAX_CHARS));
   const all = bookSlugs.flatMap((s) => loadLorebook(s));
-  const matches = scanLore(prompt, all);
-  return { block: renderActiveLore(matches), matches };
+  const matches = scanLore(prompt, all).slice(0, maxMatches);
+  let truncated = scanLore(prompt, all).length > matches.length;
+  let used = 0;
+  const kept: LoreMatch[] = [];
+  for (const m of matches) {
+    const line = `- (${m.matchedKey}) ${m.entry.content}`;
+    if (used + line.length + 1 > maxChars) {
+      const room = maxChars - used;
+      if (room > 80 && kept.length < maxMatches) {
+        const cut = line.slice(0, room - 20) + "… [lore truncated]";
+        kept.push({ entry: { ...m.entry, content: cut }, matchedKey: m.matchedKey });
+      }
+      truncated = true;
+      break;
+    }
+    kept.push(m);
+    used += line.length + 1;
+  }
+  return { block: renderActiveLore(kept), matches: kept, truncated };
 }

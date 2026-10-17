@@ -1,7 +1,11 @@
 /**
- * Author's Note: a lightweight steering block injected near the bottom of the
- * context (RP mode) to direct pacing, tone, and plot without breaking
+ * Author's Note: a lightweight steering block appended at the prompt tail
+ * (RP mode) to direct pacing, tone, and plot without breaking
  * character. Managed via the /an command.
+ *
+ * Honesty note: `depth` is stored and displayed but v1 always injects at the
+ * prompt tail — there is no history-depth insertion (pi owns the history).
+ * Depth is kept so cards/notes forward-port cleanly when real depth lands.
  *
  * Storage: ~/.config/mykyagent/authors_note.json  (env: MYKYAGENT_AN_FILE)
  */

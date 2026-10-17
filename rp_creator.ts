@@ -6,12 +6,14 @@
  * audit logic used by both the card_audit tool and tests.
  */
 import {
+  deleteCharacter,
+  listCharacters,
   loadCharacter,
   saveCharacter,
   validateCard,
   type CharacterCard,
 } from "./character.ts";
-import { findTriggerOverlaps, loadLorebook, saveLorebook, type LoreEntry } from "./lorebook.ts";
+import { deleteLorebook, findTriggerOverlaps, listLorebooks, loadLorebook, saveLorebook, type LoreEntry } from "./lorebook.ts";
 
 export interface CardAuditResult {
   slug: string;
@@ -30,11 +32,19 @@ export function auditCard(slug: string): CardAuditResult {
     return { slug, found: false, summary: `No character card "${slug}".` };
   }
   const v = validateCard(card);
-  const overlaps = card.lorebook ? findTriggerOverlaps(loadLorebook(card.lorebook)) : [];
+  const bookSlug = card.lorebook;
+  const bookEntries = bookSlug ? loadLorebook(bookSlug) : [];
+  const overlaps = bookSlug ? findTriggerOverlaps(bookEntries) : [];
   const lines: string[] = [`Card "${card.name}" (slug ${slug}): ~${v.tokenEstimate} tokens`];
   for (const e of v.errors) lines.push(`  ERROR: ${e}`);
   for (const w of v.warnings) lines.push(`  WARN: ${w}`);
   for (const o of overlaps) lines.push(`  LORE OVERLAP: ${o}`);
+  if (bookSlug) {
+    const loreChars = bookEntries.reduce((n, e) => n + (e.content || "").length, 0);
+    if (bookEntries.length > 30) lines.push(`  WARN: lorebook "${bookSlug}" has ${bookEntries.length} entries — only the top ~10 matches inject per turn; split or trim triggers`);
+    else if (loreChars > 12000) lines.push(`  WARN: lorebook "${bookSlug}" is ~${Math.ceil(loreChars / 4)} tokens — per-turn injection is capped at ~500 tokens; trim low-priority entries`);
+    else lines.push(`  lorebook "${bookSlug}": ${bookEntries.length} entries`);
+  }
   if (v.ok && !v.warnings.length && !overlaps.length) lines.push("  all checks passed");
   return {
     slug,
@@ -150,6 +160,75 @@ export function cardAuditTool() {
     async execute(_id: string, { slug }: { slug: string }) {
       const res = auditCard(slug);
       return { content: [{ type: "text", text: res.summary }], ...(res.found ? {} : { isError: true }) };
+    },
+  };
+}
+
+export function characterDeleteTool() {
+  return {
+    name: "character_delete",
+    label: "Character Delete",
+    description: "Delete a character card file in ~/.config/mykyagent/characters/<slug>.json. Does not touch game state or memories (use /character reset first if a clean wipe is needed).",
+    parameters: {
+      type: "object",
+      properties: { slug: { type: "string", description: "Card slug or name" } },
+      required: ["slug"],
+    },
+    async execute(_id: string, { slug }: { slug: string }) {
+      const ok = deleteCharacter(slug);
+      return ok
+        ? { content: [{ type: "text", text: `Deleted character card "${slug}".` }] }
+        : { content: [{ type: "text", text: `No character card "${slug}".` }], isError: true };
+    },
+  };
+}
+
+export function lorebookReadTool() {
+  return {
+    name: "lorebook_read",
+    label: "Lorebook Read",
+    description: "Read a lorebook file from ~/.config/mykyagent/lore/ to inspect entries before revising it.",
+    parameters: {
+      type: "object",
+      properties: { slug: { type: "string", description: "Lorebook slug" } },
+      required: ["slug"],
+    },
+    async execute(_id: string, { slug }: { slug: string }) {
+      const entries = loadLorebook(slug);
+      if (!entries.length) return { content: [{ type: "text", text: `No lorebook "${slug}" (or it has no entries).` }], isError: true };
+      return { content: [{ type: "text", text: JSON.stringify({ slug, entries }, null, 2) }] };
+    },
+  };
+}
+
+export function lorebookListTool() {
+  return {
+    name: "lorebook_list",
+    label: "Lorebook List",
+    description: "List every lorebook slug with its entry count.",
+    parameters: { type: "object", properties: {} },
+    async execute(_id: string) {
+      const books = listLorebooks();
+      return { content: [{ type: "text", text: books.length ? books.map((b) => `• ${b.slug} (${b.entries} entries)`).join("\n") : "No lorebooks yet." }] };
+    },
+  };
+}
+
+export function lorebookDeleteTool() {
+  return {
+    name: "lorebook_delete",
+    label: "Lorebook Delete",
+    description: "Delete a lorebook file in ~/.config/mykyagent/lore/<slug>.json.",
+    parameters: {
+      type: "object",
+      properties: { slug: { type: "string", description: "Lorebook slug" } },
+      required: ["slug"],
+    },
+    async execute(_id: string, { slug }: { slug: string }) {
+      const ok = deleteLorebook(slug);
+      return ok
+        ? { content: [{ type: "text", text: `Deleted lorebook "${slug}".` }] }
+        : { content: [{ type: "text", text: `No lorebook "${slug}".` }], isError: true };
     },
   };
 }

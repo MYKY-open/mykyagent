@@ -18,6 +18,7 @@ import { listSkills, readSkill, skillsPromptLine } from "./skills.ts";
 import { addTodo, clearTodos, doneTodo, loadTodos, openTodos, todoBlock } from "./todo.ts";
 import { listCheckpoints, resolveToolPath, restoreCheckpoint, snapshotFile } from "./checkpoints.ts";
 import { buildResumeText, saveAutoStub, saveSummary } from "./resume.ts";
+import { addTags, clearTags, getTags, removeTags, renderTagsBlock, setTags } from "./tags.ts";
 import { clearTask, listTasks, pollTask, startTask, stopTask, waitTask } from "./taskman.ts";
 import {
   McpRegistry,
@@ -70,10 +71,13 @@ import {
   loadModeConfig,
   saveModeConfig,
   setMode,
+  setUserName,
   type Mode,
 } from "./mode.ts";
 import {
+  deleteCharacter,
   listCharacters,
+  listGreetings,
   importCharacter,
   loadCharacter,
   renderCharacterBlock,
@@ -83,7 +87,7 @@ import {
   validateCard,
   type CharacterCard,
 } from "./character.ts";
-import { collectActiveLore, listLorebooks, loadLorebook, saveLorebook } from "./lorebook.ts";
+import { collectActiveLore, deleteLorebook, listLorebooks, loadLorebook, saveLorebook } from "./lorebook.ts";
 import {
   clearAuthorNote,
   getAuthorNote,
@@ -102,7 +106,7 @@ import {
   setStateValue,
   getStateValue,
 } from "./rpg_tools.ts";
-import { auditCard, cardAuditTool, characterReadTool, characterSaveTool, lorebookSaveTool } from "./rp_creator.ts";
+import { auditCard, cardAuditTool, characterDeleteTool, characterReadTool, characterSaveTool, lorebookDeleteTool, lorebookListTool, lorebookReadTool, lorebookSaveTool } from "./rp_creator.ts";
 import {
   constants,
   existsSync,
@@ -1001,6 +1005,192 @@ function rpMemoryPrefix(): string | undefined {
   return activeCharacterMemoryPrefix() || undefined;
 }
 
+// --- Ghost whisperer (impersonation drafts) -----------------------------------
+// /ghost writes the USER's next message for them: a short draft in the user's
+// voice that fits the scene, optionally steered by a rough hint. Pure helpers
+// (no pi runtime) so they stay unit-testable; the command handler below does
+// the model call + Send/Regenerate/Abort flow.
+
+export function extractGhostHistory(entries: any[], maxChars = 2000, userName = "user", charName = "char"): string {
+  const lines: string[] = [];
+  const msgs = (entries || []).filter((e: any) => e?.type === "message" && e?.message);
+  for (const e of msgs.slice(-10)) {
+    const role = e.message?.role === "assistant" ? charName : userName;
+    let text = "";
+    const c = e.message?.content;
+    if (typeof c === "string") text = c;
+    else if (Array.isArray(c)) text = c.filter((b: any) => b?.type === "text" && b?.text).map((b: any) => b.text).join("\n");
+    text = (text || "").trim().replace(/\s+/g, " ");
+    if (text) lines.push(`${role}: ${text.slice(0, 400)}`);
+  }
+  let out = lines.join("\n");
+  if (out.length > maxChars) out = "…" + out.slice(-maxChars);
+  return out;
+}
+
+export function cleanGhostDraft(raw: string, userName: string): string {
+  let d = (raw || "").trim();
+  // Strip surrounding quotes and a leading speaker prefix ("User:", name + ":").
+  if ((d.startsWith('"') && d.endsWith('"')) || (d.startsWith("'") && d.endsWith("'"))) d = d.slice(1, -1).trim();
+  d = d.replace(/^(user|you|\{\{user\}\})\s*[:>]\s*/i, "");
+  if (userName) d = d.replace(new RegExp(`^${userName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*[:>]\\s*`, "i"), "");
+  return d.trim();
+}
+
+export function buildGhostPrompt(opts: { charName?: string; charLine?: string; userName: string; history: string; hint: string; tints: string[] }): { systemPrompt: string; userContent: string } {
+  const { charName, charLine, userName, history, hint, tints } = opts;
+  const who = charName ? `You are ghostwriting for ${userName}, who is roleplaying with the character ${charName}${charLine ? ` (${charLine})` : ""}.` : `You are ghostwriting for ${userName} in an open roleplay.`;
+  const notYou = charName
+    ? `You are NOT ${charName}. Never write ${charName}'s words, thoughts, or actions — only ${userName}'s. If the last scene message is from ${charName}, respond TO it as ${userName}; do not continue it. `
+    : `Never speak or act for anyone except ${userName}. `;
+  const systemPrompt =
+    `${who} Write ONLY ${userName}'s next message, in first person as ${userName}. ` +
+    notYou +
+    `Rules: 1-3 lines, plain dialogue and/or *actions* only. ` +
+    `Match the scene's tone and ${userName}'s established voice; keep it natural and open so the scene can continue. ` +
+    `Output ONLY the draft message — no quotes, no speaker prefix, no stage directions about who is talking, no commentary.`;
+  const parts = [`Write ${userName}'s next message.`];
+  if (history) parts.push(`Recent scene:\n${history}`);
+  if (tints.length) parts.push(`Flavor (subtle): ${tints.join(", ")}.`);
+  if (hint.trim()) parts.push(`${userName}'s rough idea (expand faithfully into a finished, in-voice message, same intent): "${hint.trim().slice(0, 300)}"`);
+  else parts.push(`No hint given: write the most natural, scene-fitting thing for ${userName} to say or do next.`);
+  return { systemPrompt, userContent: parts.join("\n\n") };
+}
+
+/**
+ * True when the draft speaks as the character (e.g. a leading "Evelyn: ...").
+ * A user merely addressing the character ("Evelyn, wait!") has no colon right
+ * after the name, so it is NOT flagged.
+ */
+export function isCharLeak(draft: string, charName: string): boolean {
+  if (!charName || !draft) return false;
+  const esc = charName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|\\n)\\s*${esc}\\s*:`, "i").test(draft);
+}
+
+/**
+ * Send an image to an OpenAI-compatible vision endpoint (llama-server with
+ * --mmproj, OpenRouter) and return a faithful text description. Used by the
+ * read tool when the active model has no image input capability: pi would
+ * otherwise silently drop the image with "[Current model does not support
+ * images...]". Non-OpenAI providers (google/anthropic/...) are refused, same
+ * as the ghost HTTP fallback.
+ */
+export async function describeImageHttp(
+  buf: Buffer,
+  mimeType: string,
+  model: any,
+  prompt?: string
+): Promise<string | null> {
+  const providerName = String(model?.provider || "");
+  const baseUrl = model?.baseUrl || LLAMA_URL;
+  if (
+    ["google", "gemini", "anthropic", "claude", "azure", "bedrock", "vertex"].includes(providerName.toLowerCase()) ||
+    /googleapis\.|anthropic\.|azure\.com|amazonaws\.|vertex/i.test(baseUrl)
+  ) {
+    throw new Error(`no direct-HTTP vision path for provider "${providerName || "unknown"}"`);
+  }
+  let modelName: string;
+  if (model?.id && model.id !== "remote" && model.id !== "default") {
+    modelName = model.id;
+  } else {
+    modelName = await resolveLocalModelName(baseUrl);
+  }
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const localKey = getLocalApiKey();
+  if (localKey) headers["Authorization"] = `Bearer ${localKey}`;
+  const res = await fetch(`${baseUrl}/chat/completions`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: modelName,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: prompt || "Describe this image in detail: subjects, any text, colors, composition, mood, and anything unusual. Be concrete and faithful." },
+            { type: "image_url", image_url: { url: `data:${mimeType};base64,${buf.toString("base64")}` } },
+          ],
+        },
+      ],
+      max_tokens: 1024,
+      temperature: 0.3,
+    }),
+    signal: AbortSignal.timeout(180000),
+  });
+  if (!res.ok) throw new Error(`vision request failed: HTTP ${res.status} from ${baseUrl}`);
+  const data: any = await res.json();
+  const text =
+    data?.choices?.[0]?.message?.content?.trim() ||
+    data?.choices?.[0]?.message?.reasoning_content?.trim();
+  return text || null;
+}
+
+/**
+ * Direct-HTTP ghost completion (llama-server / OpenRouter), mirroring the web
+ * distillation fallback. Used when the registry path throws or returns no
+ * usable text (e.g. tiny local models that answer in thinking blocks or emit
+ * tool calls instead of text). Warmer temperature than research: the ghost is
+ * creative writing, not extraction.
+ */
+async function fetchGhostHttp(model: any, systemPrompt: string, userContent: string, userName: string): Promise<string | null> {
+  const isCloudOpenRouter =
+    model?.provider === "openrouter" ||
+    model?.id?.includes("deepseek") ||
+    model?.id?.includes("/");
+  const openrouterKey = getOpenRouterKey();
+  const localKey = getLocalApiKey();
+  const baseUrl = model?.baseUrl || LLAMA_URL;
+  let endpoint = `${baseUrl}/chat/completions`;
+  let modelName: string;
+  if (isCloudOpenRouter && openrouterKey) {
+    modelName = model?.id || "deepseek/deepseek-v4-flash-0731";
+  } else if (model?.id && model.id !== "remote" && model.id !== "default") {
+    modelName = model.id;
+  } else {
+    modelName = await resolveLocalModelName(baseUrl);
+  }
+  // Never send raw OpenAI-style HTTP to providers that don't speak it
+  // (google, anthropic, azure, bedrock, vertex): their endpoints need their own
+  // auth/shape, and hitting them raw only produces confusing 4xx. The registry
+  // is the only route for those models.
+  const providerName = String(model?.provider || "");
+  if (
+    ["google", "gemini", "anthropic", "claude", "azure", "bedrock", "vertex"].includes(providerName.toLowerCase()) ||
+    /googleapis\.|anthropic\.|azure\.com|amazonaws\.|vertex/i.test(baseUrl)
+  ) {
+    throw new Error(`no direct-HTTP path for provider "${providerName || "unknown"}" (endpoint ${baseUrl}) — the registry is the only route for this model`);
+  }
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (isCloudOpenRouter && openrouterKey) {
+    endpoint = "https://openrouter.ai/api/v1/chat/completions";
+    headers["Authorization"] = `Bearer ${openrouterKey}`;
+  } else if (localKey) {
+    headers["Authorization"] = `Bearer ${localKey}`;
+  }
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: modelName,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userContent },
+      ],
+      max_tokens: 256,
+      temperature: 0.8,
+    }),
+    signal: AbortSignal.timeout(120000),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status} from ${endpoint}`);
+  const data: any = await res.json();
+  const text =
+    data?.choices?.[0]?.message?.content?.trim() ||
+    data?.choices?.[0]?.message?.reasoning_content?.trim();
+  const cleaned = text ? stripSafetyStamps(text) : null;
+  return cleaned ? cleanGhostDraft(cleaned, userName) || null : null;
+}
+
 function memoryNameForWrite(name: string): string {
   const prefix = activeCharacterMemoryPrefix();
   const clean = memorySlug(name);
@@ -1037,7 +1227,8 @@ export default function (pi: any) {
   // 1. Caveman System Prompt + Memory Injection
   pi.on("before_agent_start", async (event: any, ctx: any) => {
     noteCompletionRegistry(ctx);
-    activeModelInfo = ctx?.getModel?.();
+    const seenModel = (ctx as any)?.model || ctx?.getModel?.();
+    if (seenModel) activeModelInfo = seenModel;
 
     if (Array.isArray(event?.systemPromptOptions?.skills)) {
       for (const s of event.systemPromptOptions.skills) {
@@ -1163,7 +1354,21 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
         : "";
 
       const rpMemBlock = memoryOff ? "" : memoryIndexBlock(rpMemoryPrefix());
-      return { systemPrompt: buildRpSystemPrompt({ characterBlock, loreBlock, authorsNoteBlock: anBlock, toolHintsBlock, memoryBlock: rpMemBlock, userName, greetingReminder }) };
+      const rpTagsBlock = isFeatureEnabled("tags") ? renderTagsBlock() : "";
+      // Fresh-session self-heal: /new and /clear wipe the visible transcript and
+      // pi never emits session_start for them, so the load-time greeting toast
+      // is gone for good. Re-post it on the first turn of a session with no
+      // real messages yet (system/bootstrap entries don't count). Afterwards
+      // the session has messages and this stays quiet forever.
+      try {
+        const sessEntries = ctx?.sessionManager?.getEntries?.() || [];
+        const hasChat = sessEntries.some((e: any) => e?.type === "message" && e?.message);
+        const greetNow = card ? renderGreeting(card, userName) : "";
+        if (!hasChat && greetNow.trim() && typeof ctx?.ui?.notify === "function") {
+          ctx.ui.notify(`\x1b[22m\x1b[1;97mGreeting:\x1b[0m\n${formatWhiteGreeting(greetNow)}`, "info");
+        }
+      } catch {}
+      return { systemPrompt: buildRpSystemPrompt({ characterBlock, loreBlock, authorsNoteBlock: anBlock, toolHintsBlock, memoryBlock: rpMemBlock, userName, greetingReminder, tagsBlock: rpTagsBlock }) };
     }
 
     // --- rp-creator mode: engineering prompt + Story Studio overlay ----------
@@ -1259,6 +1464,10 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     if (skillLine) systemPrompt += `\n\n${skillLine}`;
     const todos = todoBlock();
     if (todos) systemPrompt += `\n\n${todos}`;
+    if (isFeatureEnabled("tags")) {
+      const tint = renderTagsBlock();
+      if (tint) systemPrompt += `\n\n${tint}`;
+    }
 
     if (mode === "rp-creator") {
       systemPrompt += "\n\n" + buildCreatorSystemPrompt();
@@ -1638,7 +1847,11 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
   // tool_call guard; registration is unconditional so pi always knows them.
   pi.registerTool(characterSaveTool());
   pi.registerTool(characterReadTool());
+  pi.registerTool(characterDeleteTool());
   pi.registerTool(lorebookSaveTool());
+  pi.registerTool(lorebookReadTool());
+  pi.registerTool(lorebookListTool());
+  pi.registerTool(lorebookDeleteTool());
   pi.registerTool(cardAuditTool());
 
   pi.registerTool({
@@ -1966,7 +2179,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     name: "read",
     label: "read",
     description:
-      "Read a file: text comes back in safe chunks (250 lines/15KB max); images (png/jpg/gif/webp/bmp) come back as vision content you can directly see and describe.",
+      "Read a file: text comes back in safe chunks (250 lines/15KB max); images (png/jpg/gif/webp/bmp) come back as vision content when your model takes images, otherwise auto-described through the vision server.",
     parameters: Type.Object({
       path: Type.String({ description: "File path. Images are returned viewable, not as text." }),
       offset: Type.Optional(Type.Number({ description: "Line number to start reading from (1-indexed, default: 1)" })),
@@ -1981,12 +2194,51 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
         if (["png", "jpg", "jpeg", "gif", "webp", "bmp"].includes(ext || "")) {
           const mimeType = ext === "jpg" ? "image/jpeg" : `image/${ext}`;
           const buf = await readFile(absPath);
-          return {
-            content: [
-              { type: "text", text: `Read image file [${mimeType}] (${Math.round(buf.length / 1024)}KB)` },
-              { type: "image", data: buf.toString("base64"), mimeType },
-            ],
-          };
+          const note = `Read image file [${mimeType}] (${Math.round(buf.length / 1024)}KB)`;
+          const rmodel = (ctx as any)?.model || ctx?.getModel?.();
+          const rinput = (rmodel as any)?.input;
+          const seesImages = Array.isArray(rinput) && rinput.includes("image");
+          if (seesImages) {
+            return {
+              content: [
+                { type: "text", text: note },
+                { type: "image", data: buf.toString("base64"), mimeType },
+              ],
+            };
+          }
+          // The active model has no image input: pi would silently drop the
+          // image ("[Current model does not support images...]"). Describe it
+          // through the vision server instead, so `read` still answers.
+          if (buf.length > 6 * 1024 * 1024) {
+            return {
+              content: [{ type: "text", text: `${note} — too large for the vision fallback (>6MB). Downscale it first (e.g. ffmpeg -vf scale=1600:-1), or use a model with image input.` }],
+              isError: true,
+            };
+          }
+          try {
+            const desc = await describeImageHttp(buf, mimeType, rmodel);
+            if (desc) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `${note}\n(note: this model takes no images directly, so the vision server described it — faithful description, not direct sight):\n\n${desc}`,
+                  },
+                ],
+              };
+            }
+            return { content: [{ type: "text", text: `${note} — the vision server returned an empty description.` }], isError: true };
+          } catch (err: any) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `${note} — could not see it (${err?.message || err}). Fix: use a model with image input (models.json \"input\": [\"text\", \"image\"]), or serve a vision model with --mmproj.`,
+                },
+              ],
+              isError: true,
+            };
+          }
         }
 
         const raw = await readFile(absPath, "utf-8");
@@ -2119,35 +2371,52 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
   };
 
   pi.registerCommand("mode", {
-    description: "Switch harness mode: /mode [code | rp | rp-creator]",
+    description: "Switch harness mode: /mode [code | rp | rp-creator] | /mode user <name>",
     getArgumentCompletions: (argumentText: string) => {
       if (argumentText.includes(" ")) return null;
       const subs: AutocompleteItem[] = [
         { value: "code", label: "code", description: MODE_LABELS.code },
         { value: "rp", label: "rp", description: MODE_LABELS.rp },
         { value: "rp-creator", label: "rp-creator", description: MODE_LABELS["rp-creator"] },
+        { value: "user", label: "user", description: "set your {{user}} name for RP cards" },
       ];
       const trimmed = argumentText.trim();
       const filtered = trimmed ? fuzzyFilter(subs, trimmed, (s: any) => s.label) : subs;
       return filtered.length ? filtered : null;
     },
     handler: async (args: string, ctx: any) => {
-      const trimmed = args?.trim().toLowerCase();
+      const raw = args?.trim() || "";
+      const trimmed = raw.toLowerCase();
       if (!trimmed) {
         if (ctx.ui?.select) {
           const options = (Object.keys(MODE_LABELS) as Mode[]).map((m) => `${m} - ${MODE_LABELS[m]}`);
           const selected = await ctx.ui.select("Choose MykyAgent mode:", options);
           if (selected) applyMode(selected.split(" - ")[0].trim() as Mode, ctx);
         } else {
-          ctx.ui?.notify?.(`Current mode: ${getEffectiveMode()} (rp master toggle ${isFeatureEnabled("rp") ? "on" : "OFF"}). Use /mode code | rp | rp-creator`, "info");
+          const cfg = loadModeConfig();
+          ctx.ui?.notify?.(`Current mode: ${getEffectiveMode()} (user: ${cfg.userName || "User"}, rp master toggle ${isFeatureEnabled("rp") ? "on" : "OFF"}). Use /mode code | rp | rp-creator | /mode user <name>`, "info");
         }
         return;
       }
       if (trimmed === "code" || trimmed === "rp" || trimmed === "rp-creator") {
         applyMode(trimmed, ctx);
-      } else {
-        ctx.ui?.notify?.(`Unknown mode "${trimmed}". Available: code, rp, rp-creator`, "error");
+        return;
       }
+      if (trimmed === "user" || trimmed.startsWith("user ")) {
+        const name = raw.slice(4).trim();
+        if (!name) {
+          ctx.ui?.notify?.(`Your RP name is "${loadModeConfig().userName || "User"}". Set it with /mode user <name>.`, "info");
+          return;
+        }
+        try {
+          const clean = setUserName(name);
+          ctx.ui?.notify?.(`RP user name set to "${clean}" (used for {{user}}).`, "info");
+        } catch (err: any) {
+          ctx.ui?.notify?.(`Could not set user name: ${err.message}`, "error");
+        }
+        return;
+      }
+      ctx.ui?.notify?.(`Unknown mode "${trimmed}". Available: code, rp, rp-creator, user <name>`, "error");
     },
   });
 
@@ -2239,13 +2508,41 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
         ctx.ui?.notify?.("No character loaded. /character load <name> first.", "error");
         return;
       }
-      const greetingShown = renderGreeting(card, cfg.userName || "User");
-      ctx.ui?.notify?.(
-        greetingShown.trim()
-          ? `\x1b[22m\x1b[1;97mGreeting:\x1b[0m\n${formatWhiteGreeting(greetingShown)}`
-          : `${card.name} has no first_message — the character will open the scene itself.`,
-        "info"
-      );
+      const all = listGreetings(card, cfg.userName || "User");
+      if (!all.length) {
+        ctx.ui?.notify?.(`${card.name} has no first_message — the character will open the scene itself.`, "info");
+        return;
+      }
+      const n = Number.parseInt(rest[0] || "1", 10);
+      if (rest.length && (!Number.isFinite(n) || n < 1 || n > all.length)) {
+        ctx.ui?.notify?.(`${card.name} has ${all.length} greeting(s). Use /character greeting [1-${all.length}].`, "error");
+        return;
+      }
+      const idx = rest.length ? n - 1 : 0;
+      const head = all.length > 1 ? `Greeting ${idx + 1}/${all.length}:` : "Greeting:";
+      ctx.ui?.notify?.(`\x1b[22m\x1b[1;97m${head}\x1b[0m\n${formatWhiteGreeting(all[idx])}`, "info");
+      return;
+    }
+
+    if (sub === "delete") {
+      if (!restStr) {
+        ctx.ui?.notify?.("Usage: /character delete <name>", "error");
+        return;
+      }
+      const clean = slugifyForCharacter(restStr);
+      const found = loadCharacter(clean);
+      if (!found) {
+        ctx.ui?.notify?.(`No character card "${restStr}".`, "error");
+        return;
+      }
+      deleteCharacter(clean);
+      const cfgDel = loadModeConfig();
+      if (cfgDel.activeCharacter === clean) {
+        cfgDel.activeCharacter = undefined;
+        if (cfgDel.mode === "rp") cfgDel.mode = "code";
+        saveModeConfig(cfgDel);
+      }
+      ctx.ui?.notify?.(`Deleted character card "${found.name}" (${clean}). Game state and memories were kept — run /character reset <name> first for a full wipe.`, "info");
       return;
     }
 
@@ -2326,19 +2623,28 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       return;
     }
 
-    ctx.ui?.notify?.('Usage: /character [list | load <name> | reset [name] | greeting | import <path|url> | unload]', "error");
+    // Bare-name fallback: "/character vex" and "/rp vex" load directly.
+    // This is what makes the /rp alias actually work with a name argument.
+    const maybe = loadCharacter(slugifyForCharacter(trimmed));
+    if (maybe) {
+      loadCharacterBySlug(trimmed, ctx);
+      return;
+    }
+
+    ctx.ui?.notify?.('Usage: /character [list | load <name> | delete <name> | reset [name] | greeting [n] | import <path|url> | unload] (or /character <name> to load)', "error");
   };
 
   pi.registerCommand("character", {
-    description: "Character cards: /character [list | load <name> | reset [name] | greeting | import <path|url> | unload]",
+    description: "Character cards: /character [list | load <name> | delete <name> | reset [name] | greeting [n] | import <path|url> | unload]",
     getArgumentCompletions: (argumentText: string) => {
-      if (argumentText.startsWith("load ") || argumentText.startsWith("import ") || argumentText.startsWith("reset ")) return null;
+      if (argumentText.startsWith("load ") || argumentText.startsWith("import ") || argumentText.startsWith("reset ") || argumentText.startsWith("delete ") || argumentText.startsWith("greeting ")) return null;
       if (argumentText.includes(" ")) return null;
       const subs: AutocompleteItem[] = [
         { value: "list", label: "list", description: "show cards with token estimates" },
         { value: "load", label: "load", description: "activate a character (switches to rp mode)" },
+        { value: "delete", label: "delete", description: "delete a card file (keeps state/memories)" },
         { value: "reset", label: "reset", description: "wipe chat history, inventory/game state & memories for character" },
-        { value: "greeting", label: "greeting", description: "re-send the character's greeting" },
+        { value: "greeting", label: "greeting", description: "re-send the character's greeting (greeting [n] for alternates)" },
         { value: "import", label: "import", description: "import a .png/.json card from path or URL (SillyTavern compatible)" },
         { value: "unload", label: "unload", description: "return to neutral/coding mode" },
       ];
@@ -2352,6 +2658,264 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
   pi.registerCommand("rp", {
     description: "Alias for /character — open the character picker (or /rp <name> to load directly)",
     handler: characterHandler,
+  });
+
+  pi.registerCommand("lore", {
+    description: "Lorebooks: /lore [list | read <slug> | delete <slug>]",
+    getArgumentCompletions: (argumentText: string) => {
+      if (argumentText.includes(" ")) return null;
+      const subs: AutocompleteItem[] = [
+        { value: "list", label: "list", description: "show lorebooks with entry counts" },
+        { value: "read", label: "read", description: "show a lorebook's entries" },
+        { value: "delete", label: "delete", description: "delete a lorebook file" },
+      ];
+      const trimmed = argumentText.trim();
+      const filtered = trimmed ? fuzzyFilter(subs, trimmed, (s: any) => s.label) : subs;
+      return filtered.length ? filtered : null;
+    },
+    handler: async (args: string, ctx: any) => {
+      const trimmed = args?.trim() || "";
+      if (!trimmed || trimmed === "list") {
+        const books = listLorebooks();
+        ctx.ui?.notify?.(books.length ? books.map((b) => `• ${b.slug} (${b.entries} entries)`).join("\n") : "No lorebooks yet. Create one in /mode rp-creator with lorebook_save.", "info");
+        return;
+      }
+      const [sub, ...rest] = trimmed.split(/\s+/);
+      const slug = rest.join(" ");
+      if (sub === "read") {
+        if (!slug) {
+          ctx.ui?.notify?.("Usage: /lore read <slug>", "error");
+          return;
+        }
+        const entries = loadLorebook(slug);
+        if (!entries.length) {
+          ctx.ui?.notify?.(`No lorebook "${slug}" (or it has no entries).`, "error");
+          return;
+        }
+        ctx.ui?.notify?.(entries.map((e, i) => `${i + 1}. [${e.keys.join(", ")}] (prio ${e.priority || 0}) ${e.content}`).join("\n\n"), "info");
+        return;
+      }
+      if (sub === "delete") {
+        if (!slug) {
+          ctx.ui?.notify?.("Usage: /lore delete <slug>", "error");
+          return;
+        }
+        const ok = deleteLorebook(slug);
+        ctx.ui?.notify?.(ok ? `Deleted lorebook "${slug}".` : `No lorebook "${slug}".`, ok ? "info" : "error");
+        return;
+      }
+      ctx.ui?.notify?.("Usage: /lore [list | read <slug> | delete <slug>]", "error");
+    },
+  });
+
+  pi.registerCommand("ooc", {
+    description: "Out-of-character: /ooc <message> — talk to the assistant, not the character",
+    handler: async (args: string, ctx: any) => {
+      const trimmed = args?.trim() || "";
+      if (!trimmed) {
+        ctx.ui?.notify?.('Usage: /ooc <message> — or just start a line with "(OOC" / "/ooc" / "[OOC" mid-scene. The next reply answers as the assistant, then the scene resumes.', "info");
+        return;
+      }
+      const cfg = loadModeConfig();
+      const who = cfg.activeCharacter ? ` (scene with ${cfg.activeCharacter} paused)` : "";
+      ctx.ui?.notify?.(`OOC noted${who}: "${trimmed}" — answering as assistant; the scene resumes next turn.`, "info");
+    },
+  });
+
+  pi.registerCommand("tags", {
+    description: "Conversation tints: /tags [add <a, b> | remove <a> | list | clear] (additive flavor, works in every mode)",
+    getArgumentCompletions: (argumentText: string) => {
+      if (argumentText.includes(" ")) return null;
+      const subs: AutocompleteItem[] = [
+        { value: "add", label: "add", description: "add tint(s): /tags add noir, terse" },
+        { value: "remove", label: "remove", description: "drop tint(s)" },
+        { value: "list", label: "list", description: "show active tints" },
+        { value: "clear", label: "clear", description: "remove all tints" },
+      ];
+      const trimmed = argumentText.trim();
+      const filtered = trimmed ? fuzzyFilter(subs, trimmed, (s: any) => s.label) : subs;
+      return filtered.length ? filtered : null;
+    },
+    handler: async (args: string, ctx: any) => {
+      const trimmed = args?.trim() || "";
+      if (!trimmed || trimmed === "list") {
+        const cur = getTags();
+        ctx.ui?.notify?.(cur.length ? `Active tints: ${cur.join(", ")} (toggle: /mykyagent toggle tags)` : "No tints set. Try /tags add noir, terse — or /tags add cozy.", "info");
+        return;
+      }
+      if (trimmed === "clear") {
+        clearTags();
+        ctx.ui?.notify?.("Tints cleared.", "info");
+        return;
+      }
+      const [sub, ...rest] = trimmed.split(/\s+/);
+      const payload = rest.join(" ").split(/[,,]+/).map((s) => s.trim()).filter(Boolean);
+      if (sub === "add") {
+        if (!payload.length) {
+          ctx.ui?.notify?.("Usage: /tags add <tint>[, <tint>...] (e.g. /tags add noir, terse)", "error");
+          return;
+        }
+        const { tags, added } = addTags(payload);
+        ctx.ui?.notify?.(added.length ? `Tints: ${tags.join(", ")} (added ${added.join(", ")}).` : `Nothing added (max 10 tints). Current: ${tags.join(", ") || "none"}.`, "info");
+        return;
+      }
+      if (sub === "remove") {
+        if (!payload.length) {
+          ctx.ui?.notify?.("Usage: /tags remove <tint>[, ...]", "error");
+          return;
+        }
+        const { tags, removed } = removeTags(payload);
+        ctx.ui?.notify?.(removed.length ? `Removed ${removed.join(", ")}. Tints: ${tags.join(", ") || "none"}.` : `None of those tints are active. Current: ${tags.join(", ") || "none"}.`, "info");
+        return;
+      }
+      if (sub === "set") {
+        const tags = setTags(payload);
+        ctx.ui?.notify?.(tags.length ? `Tints set: ${tags.join(", ")}.` : "Tints cleared.", "info");
+        return;
+      }
+      ctx.ui?.notify?.("Usage: /tags [add <tint, ...> | remove <tint, ...> | list | clear]", "error");
+    },
+  });
+
+  const ghostHandler = async (args: string, ctx: any) => {
+    const hint = args?.trim() || "";
+    const registry = ctx?.modelRegistry;
+    if (!registry || typeof registry.complete !== "function") {
+      ctx.ui?.notify?.("Ghost needs a model registry (are you connected to a model?).", "error");
+      return;
+    }
+    // The conversation's own model only. Never fall back to the first available
+    // registry model: that may belong to another provider entirely (and its
+    // baseUrl would send raw HTTP to a foreign endpoint).
+    const model = (ctx as any)?.model || ctx?.getModel?.() || activeModelInfo;
+    if (!model) {
+      ctx.ui?.notify?.("Ghost can't tell which model you're talking to (no active model in this context). Send a message first, then try again.", "error");
+      return;
+    }
+    const cfg = loadModeConfig();
+    const userName = cfg.userName || "User";
+    const card = cfg.activeCharacter ? loadCharacter(cfg.activeCharacter) : null;
+    const entries = ctx?.sessionManager?.getEntries?.() || [];
+    const history = extractGhostHistory(entries, 2000, userName, card?.name || "char");
+    const tints = isFeatureEnabled("tags") ? getTags() : [];
+    const { systemPrompt, userContent } = buildGhostPrompt({
+      charName: card?.name,
+      charLine: card ? `${card.personality || ""} ${card.scenario || ""}`.trim().replace(/\s+/g, " ").slice(0, 300) : undefined,
+      userName,
+      history,
+      hint,
+      tints,
+    });
+    const completeOnce = async (): Promise<{ draft?: string; error?: string; leaked?: boolean }> => {
+      const ghostChar = card?.name;
+      // One stern retry when the draft speaks as the character instead of the
+      // user; a twice-leaking draft is still shown but flagged, never sneaked.
+      let content = userContent;
+      for (let pass = 0; pass < 2; pass++) {
+        const r = await genDraft(content);
+        if (!r.draft) return r;
+        if (ghostChar && isCharLeak(r.draft, ghostChar)) {
+          content = userContent + `\n\nReminder: you are ${userName}, NOT ${ghostChar}. Write ONLY ${userName}'s message.`;
+          if (pass === 1) return { draft: r.draft, leaked: true };
+          continue;
+        }
+        return r;
+      }
+      return { error: "kept speaking as the character" };
+    };
+    const genDraft = async (content: string): Promise<{ draft?: string; error?: string }> => {
+      // 1. Native registry path (same transport as web distillation). Accepts
+      // text blocks, thinking/reasoning blocks (small reasoning models), raw
+      // string content, and records the stop reason when there is no text.
+      let registryNote = "no usable text";
+      try {
+        const res = await registry.complete(
+          model,
+          { systemPrompt, messages: [{ role: "user", content: [{ type: "text", text: content }], timestamp: Date.now() }] },
+          { maxTokens: 256, cacheRetention: "none" }
+        );
+        const blocks = Array.isArray(res?.content) ? res.content : [];
+        let text = blocks
+          .filter((c: any) => c?.type === "text" && c?.text)
+          .map((c: any) => c.text)
+          .join("\n")
+          .trim();
+        if (!text) {
+          text = blocks
+            .filter((c: any) => (c?.type === "thinking" || c?.type === "reasoning") && (c?.thinking || c?.reasoning || c?.text))
+            .map((c: any) => c.thinking || c.reasoning || c.text)
+            .join("\n")
+            .trim();
+        }
+        if (!text && typeof res?.content === "string") text = res.content.trim();
+        if (!text && typeof res?.text === "string") text = res.text.trim();
+        const stopReason = (res as any)?.stopReason;
+        if (!text && stopReason) {
+          registryNote =
+            stopReason === "error"
+              ? `model API error (provider: ${model?.provider || "?"}, id: ${model?.id || "?"}) — check auth/quota for that provider`
+              : `no text (stop: ${stopReason})`;
+        }
+        const cleaned = text ? stripSafetyStamps(text) : null;
+        if (text && !cleaned) registryNote = "refused (safety stamp only)";
+        const draft = cleaned ? cleanGhostDraft(cleaned, userName) : "";
+        if (draft) return { draft };
+      } catch (err: any) {
+        registryNote = err?.message || String(err);
+      }
+      // 2. Direct-HTTP fallback, mirroring web distillation.
+      try {
+        const fb = await fetchGhostHttp(model, systemPrompt, content, userName);
+        if (fb) return { draft: fb };
+        return { error: `registry: ${registryNote}; HTTP fallback: empty reply` };
+      } catch (err: any) {
+        return { error: `registry: ${registryNote}; HTTP fallback: ${err?.message || err}` };
+      }
+    };
+    const send = (draft: string) => {
+      const deliver = (pi as any).sendUserMessage?.bind(pi) || ctx?.sendUserMessage?.bind(ctx);
+      if (typeof deliver === "function") {
+        deliver(draft);
+        ctx.ui?.notify?.(`Sent as ${userName}: "${draft.slice(0, 200)}"`, "info");
+      } else {
+        ctx.ui?.notify?.(`Copy it yourself (auto-send unavailable here):\n${draft}`, "info");
+      }
+    };
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const r = await completeOnce();
+      const draft = r.draft;
+      if (!draft) {
+        ctx.ui?.notify?.(`Ghost came back empty (${r.error || "unknown cause"}) — try again or type manually.`, "error");
+        return;
+      }
+      ctx.ui?.notify?.(`Ghost draft for ${userName}${hint ? ` (from "${hint.slice(0, 80)}")` : ""}:${r.leaked ? `\n(check: this still sounds like ${card?.name} — edit before sending?)` : ""}\n${draft}`, "info");
+      if (!ctx.ui?.select) return; // headless: draft shown above, user copies it
+      const choice = await ctx.ui.select("Ghost draft — send it, whisper again, or abort?", [
+        "send - post as my message",
+        "again - regenerate",
+        "abort - I'll write it myself",
+      ]);
+      if (!choice || choice.startsWith("abort")) {
+        ctx.ui?.notify?.("Ghost dismissed — the scene waits for your words.", "info");
+        return;
+      }
+      if (choice.startsWith("send")) {
+        send(draft);
+        return;
+      }
+      // "again" falls through to the next attempt
+    }
+    ctx.ui?.notify?.("Ghost ran out of whispers (3 tries) — over to you.", "info");
+  };
+
+  pi.registerCommand("ghost", {
+    description: "Ghostwrite my next message: /ghost [rough idea] — Send / Regenerate / Abort",
+    handler: ghostHandler,
+  });
+
+  pi.registerCommand("gh", {
+    description: "Shorthand for /ghost",
+    handler: ghostHandler,
   });
 
   pi.registerCommand("rp-creator", {
@@ -2403,7 +2967,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
   });
 
   pi.registerCommand("an", {
-    description: "Author's Note: /an <text> | /an depth <n> | /an clear | /an show",
+    description: "Author's Note: /an <text> | /an depth <n> | /an clear | /an show (v1: always appended at prompt tail)",
     handler: async (args: string, ctx: any) => {
       const trimmed = args?.trim();
       if (!trimmed || trimmed === "show") {
@@ -2423,7 +2987,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
           return;
         }
         setAuthorNoteDepth(n);
-        ctx.ui?.notify?.(`Author's Note depth set to ${n}.`, "info");
+        ctx.ui?.notify?.(`Author's Note depth set to ${n} (stored; v1 always injects at the prompt tail).`, "info");
         return;
       }
       setAuthorNote(trimmed);

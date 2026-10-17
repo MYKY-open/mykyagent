@@ -98,9 +98,27 @@ export function setActiveCharacter(slug: string | undefined): void {
   saveModeConfig(cfg);
 }
 
+export function setUserName(name: string): string {
+  const clean = (name || "").trim().slice(0, 40);
+  if (!clean) throw new Error("user name must not be empty");
+  const cfg = loadModeConfig();
+  cfg.userName = clean;
+  saveModeConfig(cfg);
+  return clean;
+}
+
 // --- Per-mode tool gating ----------------------------------------------------
 // Coding tools: disabled in rp mode (plan section 3). Kept in rp-creator.
-export const CREATOR_TOOL_NAMES = ["character_save", "character_read", "lorebook_save", "card_audit"];
+export const CREATOR_TOOL_NAMES = [
+  "character_save",
+  "character_read",
+  "character_delete",
+  "lorebook_save",
+  "lorebook_read",
+  "lorebook_list",
+  "lorebook_delete",
+  "card_audit",
+];
 export const RPG_TOOL_NAMES = ["dice_roll", "game_state", "advance_time"];
 const CODING_TOOLS = new Set(["bash", "write", "edit", "grep", "find", "ls", "web_search", "web_fetch"]);
 const CREATOR_TOOLS = new Set(CREATOR_TOOL_NAMES);
@@ -140,11 +158,12 @@ export interface RpPromptOptions {
   memoryBlock?: string;
   userName?: string;
   greetingReminder?: string;
+  tagsBlock?: string;
 }
 
 const RP_BASE_RULES = `Planning Rules (Internal):
 - This is immersive roleplay: do NOT narrate plan steps, do NOT produce engineering output.
-- Stay fully in character unless the user sends an out-of-character (OOC) line marked (OOC).
+- Stay fully in character unless the user sends an out-of-character (OOC) line: a message starting with "(OOC", "/ooc", or "[OOC". Answer OOC lines briefly as the assistant (no roleplay voice), then resume the scene next turn without commenting on it.
 
 Response Rules:
 - Stay in character at all times. Never mention being an AI or a language model.
@@ -170,6 +189,7 @@ export function buildRpSystemPrompt(opts: RpPromptOptions = {}): string {
   if (opts.authorsNoteBlock) parts.push(opts.authorsNoteBlock);
   if (opts.toolHintsBlock) parts.push(opts.toolHintsBlock);
   if (opts.memoryBlock) parts.push(opts.memoryBlock);
+  if (opts.tagsBlock) parts.push(opts.tagsBlock);
   if (opts.greetingReminder) parts.push(opts.greetingReminder);
   return parts.join("\n\n");
 }
@@ -194,10 +214,12 @@ Card File Format (Character Card V2, JSON):
 }
 
 Tools:
-- character_save(slug, card): write/update ~/.config/mykyagent/characters/<slug>.json
+- character_save(slug, card): write/update ~/.config/mykyagent/characters/<slug>.json (preserves alternate_greetings[])
 - character_read(slug): inspect an existing card
+- character_delete(slug): delete a card file (also clears its game state + character memories with /character reset semantics via the command)
 - lorebook_save(slug, entries): write world info entries (keys + content + priority)
-- card_audit(slug): run automated checks (token budget, {{user}}/{{char}} presence, greeting, lorebook trigger overlaps)
+- lorebook_read(slug) / lorebook_list() / lorebook_delete(slug): inspect and remove world info
+- card_audit(slug): run automated checks (token budget, {{user}}/{{char}} presence, greeting, lorebook trigger overlaps + size)
 
 Workflows:
 - /rp-creator new — interactive interview (ask 3-4 targeted questions: genre, tone, core conflict, relationship), then draft the card.
@@ -205,5 +227,5 @@ Workflows:
 - /rp-creator lore <world description> — generate structured lorebook entries with clean, low-overlap triggers.
 - Play evolution: after an RP session, apply what happened to the card ("Evelyn now trusts the user, carries the silver amulet").
 
-Never touch sampler settings — they are managed by the server/orchestrator.`;
+Never touch sampler settings — they are managed by the server/orchestrator (temperature / top-p / repeat penalty live outside cards and tools).`;
 }

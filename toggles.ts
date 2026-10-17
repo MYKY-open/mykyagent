@@ -73,6 +73,7 @@ export const FEATURE_DEFS: Record<string, string> = {
   authors_note: "Author's Note steering block (/an) in RP mode",
   rp_creator: "RP-Creator card/lore authoring tools",
   rpg_tools: "RPG tools (dice_roll, game_state, advance_time)",
+  tags: "Additive conversation tints (/tags) in prompt",
 };
 
 export function loadToggles(): TogglesConfig {

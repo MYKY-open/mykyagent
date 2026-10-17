@@ -399,18 +399,19 @@ MykyAgent runs as a tri-mode harness. Samplers are never touched — mode switch
 
 ### Character Cards (Character Card V2 / Tavern-compatible)
 
-Cards are JSON in `~/.config/mykyagent/characters/<slug>.json` with fields `name`, `description`, `personality`, `scenario`, `first_message`, `mes_example`, optional `system_prompt`/`tags`/`lorebook`. `{{char}}`/`{{user}}` placeholders are substituted at render time. Only `name` is required — every other field is optional and simply omitted from the prompt when absent (real-world cards often ship without `scenario` or `personality`); validation reports the gaps as warnings.
+Cards are JSON in `~/.config/mykyagent/characters/<slug>.json` with fields `name`, `description`, `personality`, `scenario`, `first_message`, `mes_example`, optional `system_prompt`/`tags`/`lorebook`/`alternate_greetings[]`. `{{char}}`/`{{user}}` placeholders are substituted at render time. Only `name` is required — every other field is optional and simply omitted from the prompt when absent (real-world cards often ship without `scenario` or `personality`); validation reports the gaps as warnings. Set your `{{user}}` name once with `/mode user <name>` (default "User").
 
 | Command | Effect |
 | --- | --- |
 | `/character` or `/rp` | Interactive picker (seeds bundled starters: evelyn, narrator, tutor-ada on first use) |
-| `/character load <name>` | Activate a card (auto-switches to `rp` mode, prints the greeting) |
+| `/character load <name>` or `/character <name>` or `/rp <name>` | Activate a card (auto-switches to `rp` mode, prints the greeting) |
 | `/character list` | Cards with token estimates |
-| `/character greeting` | Re-send the character's opening message |
+| `/character greeting [n]` | Re-send the character's opening message (`n` picks an alternate greeting; also auto-reposted on the first turn of any fresh session, since `/new`/`/clear` wipe the transcript) |
 | `/character import <path\|url>` | Import a `.png` (chara/ccv3 tEXt chunk) or `.json` card from a local path or URL |
+| `/character delete <name>` | Delete the card file (keeps game state + memories; run `/character reset` first for a full wipe) |
 | `/character unload` | Clear character, return to code mode |
 
-**Import** is SillyTavern-compatible: handles V1 flat cards (`first_mes`, `creatorcomment`), V2/V3 nested `{ spec, data }` payloads (base64 in the PNG `chara`/`ccv3` chunk — V3 preferred when both exist — including the UTF-16LE legacy encoding). Drops `alternate_greetings`, `extensions`, and embedded `character_book` with a warning; runs the same validation as `character_save`. Import does not auto-load — follow with `/character load <slug>`. The agent can also do it for you: "import the card at ~/Downloads/x.png" in creator mode just calls the same machinery via file reading + `character_save`.
+**Import** is SillyTavern-compatible: handles V1 flat cards (`first_mes`, `creatorcomment`), V2/V3 nested `{ spec, data }` payloads (base64 in the PNG `chara`/`ccv3` chunk — V3 preferred when both exist — including the UTF-16LE legacy encoding). `alternate_greetings` are preserved (up to 10; use `/character greeting <n>`); an embedded `character_book` is auto-converted to a lorebook `<slug>-book` and linked via `card.lorebook` (or the card's existing `lorebook` slug); `extensions` are still dropped with a warning (samplers live on the server/orchestrator, never in cards). Runs the same validation as `character_save`. Import does not auto-load — follow with `/character load <slug>`. The agent can also do it for you: "import the card at ~/Downloads/x.png" in creator mode just calls the same machinery via file reading + `character_save`.
 
 In `rp` mode the system prompt is rebuilt each turn as structured XML (`<character>`, `<scenario>`, `<dialogue_examples>`) that small local models follow well.
 
@@ -422,16 +423,25 @@ Agent memory is one global store in `~/.config/mykyagent/memory/`, but in `rp` m
 
 `/mode rp-creator` turns the agent into a character architect with dedicated tools:
 
-- `character_save(slug, card)` / `character_read(slug)` — card CRUD
-- `lorebook_save(slug, entries)` — world info files in `~/.config/mykyagent/lore/`
-- `card_audit(slug)` — token budget, `{{user}}`/`{{char}}` presence, missing greeting, lorebook trigger overlaps
+- `character_save(slug, card)` / `character_read(slug)` / `character_delete(slug)` — card CRUD
+- `lorebook_save(slug, entries)` / `lorebook_read(slug)` / `lorebook_list()` / `lorebook_delete(slug)` — world info files in `~/.config/mykyagent/lore/`
+- `card_audit(slug)` — token budget, `{{user}}`/`{{char}}` presence, missing greeting, lorebook trigger overlaps + size
 
 Workflows: `/rp-creator new` (interactive interview), `/rp-creator card <concept>`, `/rp-creator lore <world>`, `/rp-creator audit <slug>`. Post-session evolution: switch to creator mode and describe what happened ("Update Evelyn: she now trusts the user...").
 
 ### Auto-Lorebook & Author's Note
 
-- **Lorebook**: each turn, the user's message is scanned for entry `keys`; matches are injected as an `<active_lore>` block for that turn only. Books load from the character's `lorebook` reference plus a global `default` book. Toggle: `/mykyagent toggle lorebook`.
-- **Author's Note**: `/an <text>` sets a steering block, `/an depth <n>` sets insertion depth (default 1), `/an clear` removes it, `/an show` displays it. Toggle: `/mykyagent toggle authors_note`.
+- **Lorebook**: each turn, the user's message is scanned for entry `keys`; matches are injected as an `<active_lore>` block for that turn only (budget: top ~10 matches, ~500 tokens — lowest priority drops first). Books load from the character's `lorebook` reference plus a global `default` book. Manage with `/lore [list | read <slug> | delete <slug>]`. Toggle: `/mykyagent toggle lorebook`.
+- **Author's Note**: `/an <text>` sets a steering block, `/an depth <n>` stores insertion depth (default 1; v1 always appends at the prompt tail — depth is kept for forward-compat), `/an clear` removes it, `/an show` displays it. Toggle: `/mykyagent toggle authors_note`.
+- **OOC**: start a line with `(OOC`, `/ooc`, or `[OOC`, or use `/ooc <message>` — the next reply answers as the assistant, then the scene resumes.
+
+### Ghost Whisperer (`/ghost`, `/gh`)
+
+Blank-brain rescue: `/ghost` drafts **your** next message in your voice, fitting the scene and character — take it, steal from it, or abort and write manually. Add a rough steer and it polishes instead of invents: `/ghost i do as im told`. Identity-guarded: the prompt denies the character's identity (`You are NOT Evelyn`), scene history uses real names, a character-voiced draft gets one stern retry, and a twice-leaking draft is shown flagged — never sneaked into your mouth. Flow per call: draft shown → **send** (posted as your message) / **again** (regenerate, up to 3) / **abort**. Headless (no picker UI): the draft is printed for manual copy. Uses your conversation's own model via pi's registry first, then direct HTTP as fallback for OpenAI-compatible endpoints only (llama-server/OpenRouter, like web distillation; max ~256 tokens, warmer temperature for creative writing). Providers that don't speak raw HTTP (google, anthropic, azure, bedrock, vertex) are registry-only — the ghost never sends them raw requests. Accepts text and thinking-block replies; failures report the true cause instead of a bare empty message.
+
+### Conversation Tints (`/tags`)
+
+Additive flavor that works in **every** mode without replacing your persona or character — e.g. `/tags add noir, terse` or `/tags add cozy`. One line in the prompt, zero tax when empty (max 10 tags, 24 chars each). Manage with `/tags [add <a, b> | remove <a> | list | clear]`; master toggle `/mykyagent toggle tags`. Tints are explicitly subordinate: they can tint wording but never override character voice, persona, or task rules.
 
 ### RPG Tools
 
@@ -449,8 +459,11 @@ Everything here runs without a network:
 
 | Suite | Assertions | Covers |
 | --- | --- | --- |
-| `rp.test.ts` | 70 | mode persistence/gating, card validation/rendering, lorebook scanning, author's note, dice/state/time, card audit |
-| `rp_wiring.test.ts` | 37 | registration, mode-gated toolset, RP/creator prompt dispatch, cross-mode card flow |
+| `rp.test.ts` | 90 | mode persistence/gating, card validation/rendering, lorebook scanning, author's note, dice/state/time, card audit |
+| `rp_wiring.test.ts` | 56 | registration, mode-gated toolset, RP/creator prompt dispatch, cross-mode card flow, fresh-session greeting |
+| `read.test.ts` | 5 | vision blocks for capable models, server-side description fallback, honest errors, oversize guard |
+| `tags.test.ts` | 13 | tint store limits, normalization, prompt block, toggle gating |
+| `ghost.test.ts` | 26 | ghost draft cleanup, named history, hint pass-through, Send/Abort flow, thinking-only + HTTP fallback + error cause + model-leak guards + ctx.model + char-voice guard |
 | `memory.test.ts` | 34 | slug/path safety, caps, index, migration, injection guard |
 | `background_tasks.test.ts` | 31 | real-process lifecycle: start returns before completion, exit markers, kill, bounded tails, clean |
 | `search_hops.test.ts` | 22 | multi-hop control flow, `FOLLOWUP` parsing |

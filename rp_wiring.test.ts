@@ -64,7 +64,7 @@ t("rpg tools registered", !!(tools.dice_roll && tools.game_state && tools.advanc
 t("mode commands registered", !!(commands["mode"] && commands["rp-creator"] && commands["character"] && commands["rp"] && commands["an"]));
 
 const modeComp = commands["mode"].getArgumentCompletions("");
-t("mode completions list all three modes", Array.isArray(modeComp) && modeComp.map((c: any) => c.value).join(",") === "code,rp,rp-creator");
+t("mode completions list all three modes", Array.isArray(modeComp) && modeComp.map((c: any) => c.value).join(",").startsWith("code,rp,rp-creator") && modeComp.some((c: any) => c.value === "user"));
 
 // --- 2. code mode (default): no rp/rpg/creator tools active -----------------
 activeTools = ["bash", "read"];
@@ -271,6 +271,20 @@ const memListCode = await tools.memory_list.execute("x", {});
 t("code memory_list shows global topics", String(memListCode.content[0].text).includes("kernel_build") && String(memListCode.content[0].text).includes("char-vex-trust"));
 await tools.memory_write.execute("x", { name: "global_note", summary: "global", body: "g" });
 t("code write lands unnamespaced", existsSync(join(memDir, "global_note.md")));
+
+// --- 10. fresh-session greeting self-heal (/new + /clear wipe the transcript;
+// pi never emits session_start for them, so before_agent_start re-posts) -------
+modeMod.setMode("rp");
+modeMod.setActiveCharacter("vex");
+const freshNotify: string[] = [];
+await hooks["before_agent_start"]({ prompt: "hello?" }, { cwd: DIR, sessionManager: { getEntries: () => [] }, ui: { notify: (m: string) => freshNotify.push(m) } });
+t("fresh session re-posts greeting", freshNotify.some((n) => n.includes("Greeting:") && n.includes("Good news")));
+const livedNotify: string[] = [];
+await hooks["before_agent_start"](
+  { prompt: "hello again" },
+  { cwd: DIR, sessionManager: { getEntries: () => [{ type: "message", message: { role: "user", content: "hi" } }] }, ui: { notify: (m: string) => livedNotify.push(m) } }
+);
+t("lived-in session stays quiet", !livedNotify.some((n) => n.includes("Greeting:")));
 
 rmSync(DIR, { recursive: true, force: true });
 console.log(`\n${pass} pass, ${fail} fail`);
