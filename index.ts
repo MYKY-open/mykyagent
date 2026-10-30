@@ -661,6 +661,23 @@ function stripSafetyStamps(text: string): string | null {
   return cleaned;
 }
 
+/**
+ * Resolve pi's current session id from an arbitrary context-ish object
+ * (extension ctx, { sessionManager }, or anything). Providers that route
+ * requests per conversation — notably the opencode-go gateway, which 400s
+ * with MissingSessionID without x-opencode-session — key their routing on
+ * pi-ai's request sessionId option, so every sub-call must carry it.
+ */
+export function resolvePiSessionId(ctxish: any): string | undefined {
+  try {
+    const sm = ctxish?.sessionManager;
+    const id = typeof sm?.getSessionId === "function" ? sm.getSessionId() : undefined;
+    return id ? String(id) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function distillWithSubagent(
   query: string,
   content: string,
@@ -669,6 +686,7 @@ async function distillWithSubagent(
 ): Promise<DistillationResult> {
   let model = ctxOrModel?.model || ctxOrModel || activeModelInfo;
   const modelRegistry = ctxOrModel?.modelRegistry;
+  const sessionId = resolvePiSessionId(ctxOrModel);
 
   // Web model override (/model-web): route this summariser sub-call to a
   // dedicated model instead of the main conversation model. Silently falls
@@ -728,6 +746,7 @@ async function distillWithSubagent(
         {
           maxTokens: 4096,
           cacheRetention: "none",
+          ...(sessionId ? { sessionId } : {}),
         }
       );
 
@@ -790,6 +809,13 @@ async function distillWithSubagent(
   } else if (localKey) {
     headers["Authorization"] = `Bearer ${localKey}`;
   }
+  // Same per-conversation routing header pi-ai adds on the registry path:
+  // the opencode-go gateway hard-400s this fallback without x-opencode-session.
+  try {
+    if (sessionId && new URL(endpoint).hostname.endsWith("opencode.ai")) {
+      headers["x-opencode-session"] = sessionId;
+    }
+  } catch {}
 
   try {
     const payload = JSON.stringify({
@@ -3128,7 +3154,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
         const res = await registry.complete(
           model,
           { systemPrompt, messages: [{ role: "user", content: [{ type: "text", text: content }], timestamp: Date.now() }] },
-          { maxTokens: 256, cacheRetention: "none" }
+          { maxTokens: 256, cacheRetention: "none", ...(resolvePiSessionId(ctx) ? { sessionId: resolvePiSessionId(ctx) } : {}) }
         );
         const blocks = Array.isArray(res?.content) ? res.content : [];
         let text = blocks
