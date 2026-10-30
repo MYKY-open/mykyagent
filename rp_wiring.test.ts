@@ -52,6 +52,8 @@ const pi: any = {
 await ext(pi);
 
 const notify: string[] = [];
+const sent: string[] = [];
+pi.sendUserMessage = (m: string) => sent.push(m);
 const cmdCtx = {
   ui: {
     notify: (msg: string) => notify.push(msg),
@@ -115,6 +117,17 @@ await tools.lorebook_save.execute("x", {
 });
 const anOk = commands["an"].handler("Keep the tension high; short dialogue.", cmdCtx);
 t("/an sets author's note", true);
+
+// --- 5b. /ooc actually reaches the model (command lines are otherwise eaten) --
+sent.length = 0;
+notify.length = 0;
+await commands["ooc"].handler("why is the door locked", cmdCtx);
+t("/ooc delivers an (OOC) user turn to the model", sent.length === 1 && sent[0].startsWith("(OOC) ") && sent[0].includes("why is the door locked"), sent.join(" | "));
+t("/ooc confirms delivery", notify.some((n) => n.includes("OOC sent") && /vex/i.test(n)), notify.join(" | "));
+sent.length = 0;
+notify.length = 0;
+await commands["ooc"].handler("", cmdCtx);
+t("/ooc without args only prints usage", sent.length === 0 && notify.some((n) => n.startsWith("Usage: /ooc")));
 
 notify.length = 0;
 const lore = await import("./lorebook.ts");

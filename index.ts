@@ -2852,7 +2852,21 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       }
       const cfg = loadModeConfig();
       const who = cfg.activeCharacter ? ` (scene with ${cfg.activeCharacter} paused)` : "";
-      ctx.ui?.notify?.(`OOC noted${who}: "${trimmed}" — answering as assistant; the scene resumes next turn.`, "info");
+      // The extension-command path swallows the line: nothing reaches the model
+      // unless we re-send it. Prefix with "(OOC" so the RP prompt's OOC rule
+      // fires (answer as the assistant, then resume the scene next turn).
+      const payload = `(OOC) ${trimmed}`;
+      const deliver = (pi as any).sendUserMessage?.bind(pi) || ctx?.sendUserMessage?.bind(ctx);
+      if (typeof deliver === "function") {
+        try {
+          deliver(payload);
+          ctx.ui?.notify?.(`OOC sent${who}: "${trimmed}" — answering as assistant; the scene resumes next turn.`, "info");
+        } catch (err: any) {
+          ctx.ui?.notify?.(`OOC not sent (${err?.message || String(err)}). Send this yourself:\n${payload}`, "error");
+        }
+      } else {
+        ctx.ui?.notify?.(`OOC noted${who} (auto-send unavailable here). Send this yourself:\n${payload}`, "info");
+      }
     },
   });
 
