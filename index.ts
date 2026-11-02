@@ -537,7 +537,7 @@ async function researchOnce(query: string, signal?: AbortSignal): Promise<Resear
   }
 }
 
-function renderResearchBundle(
+export function renderResearchBundle(
   query: string,
   raw: ResearchPayload,
   opts: { note?: string; head?: string[] } = {}

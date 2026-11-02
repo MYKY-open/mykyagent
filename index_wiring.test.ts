@@ -318,6 +318,27 @@ t("reset restores tool", isToolEnabled("bash") === true);
   setFeatureEnabled("effort", true);
 }
 
+// --- 13. research bundle rendering (helper output contract) ----------------
+{
+  const { renderResearchBundle } = await import("./index.ts");
+  const bundle = renderResearchBundle("q", {
+    nav_domain: "artificialanalysis.ai",
+    warnings: ["escalated once for missing field(s): price"],
+    conflicts: [
+      { entity: "GPT-X", values: [{ value: "1.2", sources: ["a.com"] }, { value: "3.4", sources: ["b.com", "c.com"] }] },
+    ],
+  } as any, { note: "" });
+  t("research: nav_domain line rendered", bundle.includes("Source named by the query: artificialanalysis.ai"));
+  t("research: warnings block rendered", bundle.includes("RETRIEVAL WARNINGS") && bundle.includes("escalated once for missing field(s): price"));
+  t(
+    "research: conflict values rendered with sources",
+    bundle.includes("GPT-X: 1.2 (a.com)  vs  3.4 (b.com, c.com)"),
+    bundle.slice(0, 300)
+  );
+  const plain = renderResearchBundle("q", { queries_used: ["q"] } as any, {});
+  t("research: no nav/warnings/conflicts → no blocks", !plain.includes("RETRIEVAL WARNINGS") && !plain.includes("CONFLICTING SOURCES") && !plain.includes("Source named"));
+}
+
 rmSync(DIR, { recursive: true, force: true });
 console.log(`\n${pass} pass, ${fail} fail`);
 process.exit(fail === 0 ? 0 : 1);

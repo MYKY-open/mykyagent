@@ -14,6 +14,9 @@ export interface ResearchPayload {
   structured?: Record<string, unknown>;
   search_snippets?: any[];
   queries_used?: string[];
+  nav_domain?: string | null;
+  warnings?: string[];
+  conflicts?: { entity: string; values: { value: string; sources: string[] }[] }[];
   error?: string;
 }
 
