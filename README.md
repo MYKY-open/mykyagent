@@ -7,7 +7,7 @@ A lightweight, crash-proof agent overlay for small local reasoning models (like 
 - **Reranked Web Research**: Multi-engine fan-out with reciprocal-rank fusion, authoritative API lookups (GitHub, Modrinth, PyPI, npm, NeoForge Maven), BM25 block extraction, and domain-authority ranking. Engine failover means one throttled search backend cannot kill a query.
 - **Token-Disciplined Distillation**: Per-page character budgets, cross-page duplicate-block removal, and hard caps on fallback dumps. A typical search spends ~2k tokens, not ~4k, and bad pages are dropped instead of summarised.
 - **Safe Local Code Inspection**: Guardrailed `read` tool enforcing 250-line chunks (max 15KB) to prevent 10,000-line files or logs from flooding local context. Images come back as vision (avif/heic auto-converted via ffmpeg) or, when the model takes no images, as a server-side description. Automatic `grep`, `find`, and `ls` activation.
-- **Customizable Personas**: In-chat `/persona` slash command with presets (`caveman`, `senior`, `cyberpunk`, `pirate`, `butler`, `academic`, or `custom`) saved to `~/.config/mykyagent/persona.json`.
+- **Customizable Personas**: In-chat `/persona` slash command with presets (`caveman`, `senior`, `cyberpunk`, `academic`, `qa`, `maintainer`, `pm`, `speedrunner`, `gremlin`, or `custom`) saved to `~/.config/mykyagent/persona.json`.
 - **Persistent Memory (index + on-demand)**: Topic files under `~/.config/mykyagent/memory/`. Only a one-line summary per topic is injected into the system prompt; bodies load via `memory_read` when relevant. `memory_write` / `memory_read` / `memory_forget` / `memory_list`.
 - **Background Tasks**: Long commands run detached via `task_start`; follow with cursor-based `task_output` (new bytes only), blocking `task_wait`, or kill with `task_stop`. `task_list` / `/tasks` lists them. Max 3 live.
 - **Skills-lite**: On-demand capability packs in `skills/<name>.md` (or `skills/<name>/SKILL.md`). One index line per turn (zero when empty); full text loads via `skill_read` only when relevant. `/skill` lists/shows them.
@@ -57,10 +57,16 @@ MYKYAGENT_BASE_URL="http://192.168.1.50:8080/v1" mykyagent
 ## In-Chat Personas
 Switch the agent's tone and speaking style at any time in chat:
 * `/persona` — Open interactive picker
-* `/persona pirate` — Switch to pirate mode
 * `/persona senior` — Switch to Senior Staff Engineer mode
 * `/persona caveman` — Switch back to default caveman mode
 * `/persona set <instructions>` — Set a custom persona prompt
+* `/persona qa` — **QA Breaker**: repro steps, attacks its own work, PASS only with proof
+* `/persona maintainer` — **Grumpy Maintainer**: nacks sloppy patches, small diffs, no dead code, no shims
+* `/persona pm` — **Ruthless PM**: cuts scope, ships the smallest thing that works, names the cut list
+* `/persona speedrunner` — **Speedrunner (any%)**: shortest route to a working build, calls the skips
+* `/persona gremlin` — **Gremlin**: pokes the weird edge case, cackles at failures
+
+Personas are **voice**, not effort. The five above also happen to bias behaviour (testing, diff discipline, scope, time-to-result), but depth is controlled by `/effort` — see below. Built-ins: `caveman`, `senior`, `cyberpunk`, `academic`, `qa`, `maintainer`, `pm`, `speedrunner`, `gremlin`, `tsundere`, `chuunibyou`, `oneesan`.
 
 ## In-Chat Web Model
 Route only the `web_search` / `web_fetch` distillation sub-calls to a dedicated
