@@ -58,6 +58,30 @@ const wq = await T.waitTask(idq, 15000, 30, true);
 t("quiet wait exits with tail", wq.info.exitCode === 0 && wq.output.includes("two"), JSON.stringify({ exit: wq.info.exitCode, out: wq.output }));
 const pq = T.pollTask(idq);
 t("quiet wait consumed cursor", pq.output === "");
+
+// interrupt: a waiting call must return promptly when its signal aborts,
+// without consuming output, so the task keeps running and task_output still has it.
+for (const quiet of [false, true]) {
+  const idA = T.startTask("sleep 60", `abort-${quiet}`);
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), 300);
+  const t0 = Date.now();
+  const wa = await T.waitTask(idA, 60000, 30, quiet, ac.signal);
+  const took = Date.now() - t0;
+  t(`abort returns promptly (quiet=${quiet})`, took < 3000, `${took}ms`);
+  t(`abort leaves task running (quiet=${quiet})`, wa.info.running === true && wa.output === "");
+  await T.stopTask(idA).catch(() => {});
+  T.clearTask(idA);
+}
+const idB = T.startTask("sleep 1; echo late-line; sleep 60", "abort-keeps-output");
+const acB = new AbortController();
+setTimeout(() => acB.abort(), 200);
+await T.waitTask(idB, 60000, 30, false, acB.signal);
+await new Promise((r) => setTimeout(r, 1800));
+const pB = T.pollTask(idB);
+t("interrupted wait keeps output for task_output", pB.output.includes("late-line"), JSON.stringify(pB.output));
+await T.stopTask(idB).catch(() => {});
+T.clearTask(idB);
 T.clearTask(idq);
 
 // list + clear
@@ -127,6 +151,17 @@ await commands.tasks.handler("", { ui: { notify: (m: string) => notify.push(m) }
 t("wiring: /tasks notifies", notify.some((m) => m.includes(toolId)));
 await T.stopTask(toolId).catch(() => {});
 T.clearTask(toolId);
+
+// The tool must forward pi's abort signal (execute's 3rd argument) and report an interrupt as a normal result.
+const toolRun = T.startTask("sleep 60", "tool-interrupt");
+const acT = new AbortController();
+setTimeout(() => acT.abort(), 300);
+const toolRes = await tools.task_wait.execute("call-1", { id: toolRun, timeout: 60000 }, acT.signal);
+const toolText = toolRes?.content?.[0]?.text || "";
+t("task_wait returns on interrupt", toolText.startsWith("Wait interrupted.") && toolRes.isError !== true, toolText.slice(0, 120));
+t("task_wait interrupt says the task is still running", toolText.includes(`RUN ${toolRun}`), toolText.slice(0, 160));
+await T.stopTask(toolRun).catch(() => {});
+T.clearTask(toolRun);
 
 rmSync(DIR, { recursive: true, force: true });
 console.log(`\n${pass} pass, ${fail} fail`);

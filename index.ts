@@ -2309,9 +2309,12 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       timeout: Type.Optional(Type.Number({ description: "Max wait ms (default 30000, cap 300000)" })),
       quiet: Type.Optional(Type.Boolean({ description: "True: say nothing until exit/deadline, then final tail" })),
     }),
-    async execute(_id: string, args: any) {
+    async execute(_id: string, args: any, signal?: AbortSignal) {
       try {
-        const p = await waitTask(String(args?.id ?? ""), Number(args?.timeout ?? 30000), 30, args?.quiet === true);
+        const p = await waitTask(String(args?.id ?? ""), Number(args?.timeout ?? 30000), 30, args?.quiet === true, signal);
+        if (signal?.aborted) {
+          return { content: [{ type: "text", text: `Wait interrupted. ${fmtTask(p.info)} Output kept: read it with task_output.` }] };
+        }
         const head = fmtTask(p.info);
         return { content: [{ type: "text", text: p.output ? `${head}\n${p.output}` : `${head}\n(no new output)` }] };
       } catch (e: any) {

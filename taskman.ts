@@ -198,6 +198,13 @@ export function pollTask(id: string, tailLines = TAIL_LINES): TaskPoll {
   return { info: refreshState(id)!, output, truncated };
 }
 
+/** Status without touching the output cursor: an interrupted wait must leave the output for task_output. */
+export function statusTask(id: string) {
+  const info = refreshState(id);
+  if (!info) throw new Error(`Unknown task "${id}".`);
+  return info;
+}
+
 /** Final tail of a task (last N lines, cursor to end). For quiet waits. */
 export function tailTask(id: string, tailLines = TAIL_LINES): TaskPoll {
   const info = refreshState(id);
@@ -218,19 +225,40 @@ export function tailTask(id: string, tailLines = TAIL_LINES): TaskPoll {
   return { info: refreshState(id)!, output: tail, truncated: lines.length > tailLines };
 }
 
+/** Sleep that ends early when the signal aborts, so an interrupt is never stuck behind a timer. */
+function pause(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    const finish = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    signal?.addEventListener("abort", finish, { once: true });
+  });
+}
+
 /** Block up to timeoutMs for fresh output or exit. Returns a poll.
  *  Settles briefly when the process just died so exitCode is populated.
- *  quiet=true: ignore intermediate output, return only the final tail. */
-export async function waitTask(id: string, timeoutMs = 30000, tailLines = TAIL_LINES, quiet = false): Promise<TaskPoll> {
+ *  quiet=true: ignore intermediate output, return only the final tail.
+ *  An aborted signal returns the status with no output and no cursor move. */
+export async function waitTask(
+  id: string,
+  timeoutMs = 30000,
+  tailLines = TAIL_LINES,
+  quiet = false,
+  signal?: AbortSignal
+): Promise<TaskPoll> {
   const deadline = Date.now() + Math.max(1000, Math.min(300000, timeoutMs));
+  const interrupted = (): TaskPoll => ({ info: statusTask(id), output: "", truncated: false });
   if (quiet) {
     // One bill: say nothing until exit or deadline, then the tail.
-    while (Date.now() < deadline) {
-      const p = pollTask(id, tailLines);
-      if (!p.info.running) return tailTask(id, tailLines);
-      await new Promise((r) => setTimeout(r, 2000));
+    while (Date.now() < deadline && !signal?.aborted) {
+      if (!statusTask(id).running) return tailTask(id, tailLines);
+      await pause(2000, signal);
     }
-    return tailTask(id, tailLines);
+    return signal?.aborted ? interrupted() : tailTask(id, tailLines);
   }
   // Fast path: already-new output or already dead. A 250ms grace lets a
   // just-finished process deliver SIGCHLD before we report it running.
@@ -243,11 +271,13 @@ export async function waitTask(id: string, timeoutMs = 30000, tailLines = TAIL_L
     first = { ...second, output: first.output + second.output };
   }
   if (first.output.length > 0 || !first.info.running) return settleExit(id, first, tailLines);
-  while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 1000));
+  while (Date.now() < deadline && !signal?.aborted) {
+    await pause(1000, signal);
+    if (signal?.aborted) break;
     const p = pollTask(id, tailLines);
     if (p.output.length > 0 || !p.info.running) return settleExit(id, p, tailLines);
   }
+  if (signal?.aborted) return interrupted();
   return settleExit(id, pollTask(id, tailLines), tailLines);
 }
 
