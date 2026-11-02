@@ -245,10 +245,7 @@ export function clearCharacterMemories(charSlug: string): number {
   const prefix = `char-${charSlug}-`;
   let count = 0;
   for (const entry of listMemoryEntries()) {
-    if (entry.name.startsWith(prefix)) {
-      forgetMemory(entry.name);
-      count++;
-    }
+    if (entry.name.startsWith(prefix) && forgetMemoryEntry(entry.name)) count++;
   }
   return count;
 }

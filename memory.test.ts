@@ -123,6 +123,22 @@ const nsBlock = M.memoryIndexBlock("char-evelyn-");
 t("prefix filter: excludes global topics", !nsBlock.includes("alpha"));
 t("prefix filter: includes matching topic", nsBlock.includes("char-evelyn-trust"));
 
+// --- character wipe (Nuke / restart) must delete namespaced topics only -----
+M.writeMemoryEntry("char-wipeme-note", "a", "b");
+M.writeMemoryEntry("char-wipeme-other", "a", "b");
+M.writeMemoryEntry("char-keepme-note", "a", "b");
+M.writeMemoryEntry("global-note", "a", "b");
+let wiped = -1;
+try {
+  wiped = M.clearCharacterMemories("wipeme");
+} catch (err: any) {
+  t("clearCharacterMemories does not throw", false, err.message);
+}
+t("clearCharacterMemories deletes its own namespace", wiped === 2, String(wiped));
+t("wiped topics are gone", M.readMemoryEntry("char-wipeme-note") === null && M.readMemoryEntry("char-wipeme-other") === null);
+t("other character namespace survives", M.readMemoryEntry("char-keepme-note") !== null);
+t("global topic survives", M.readMemoryEntry("global-note") !== null);
+
 rmSync(DIR, { recursive: true, force: true });
 rmSync(legacyDir, { recursive: true, force: true });
 rmSync(emptyDir, { recursive: true, force: true });
