@@ -4,7 +4,7 @@
  * mcpkill.json killswitch, and the /mcp-toggle command. The live-transport
  * coverage lives in mcp.test.ts + run_mcp_smoke.sh.
  */
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,6 +15,8 @@ process.env.MYKYAGENT_WEBKILL_FILE = join(DIR, "webkill.json");
 process.env.MYKYAGENT_WEBBROWSER_FILE = join(DIR, "webbrowser.json");
 process.env.MYKYAGENT_TOGGLES_FILE = join(DIR, "toggles.json");
 process.env.MYKYAGENT_MODE_FILE = join(DIR, "mode.json");
+process.env.MYKYAGENT_EFFORT_FILE = join(DIR, "effort.json");
+process.env.MYKYAGENT_STYLE_FILE = join(DIR, "style.json");
 // Keep the startup auto-reconnect pointed at the empty temp config.
 
 const ext = (await import("./index.ts")).default;
@@ -36,8 +38,10 @@ const tools: Record<string, any> = {};
 const commands: Record<string, any> = {};
 const hooks: Record<string, any> = {};
 let activeTools: string[] = [];
+const sentMessages: string[] = [];
 const pi: any = {
   on: (n: string, f: any) => (hooks[n] = f),
+  sendUserMessage: (content: string) => sentMessages.push(content),
   registerTool: (def: any) => (tools[def.name] = def),
   registerCommand: (n: string, def: any) => (commands[n] = def),
   getActiveTools: () => [...activeTools],
@@ -232,6 +236,86 @@ t("reset restores tool", isToolEnabled("bash") === true);
   }
   t("picker renders only strings at every width", bad === 0);
   t("picker esc closes", doneCalled === true);
+}
+
+// --- 12. effort levels (/effort) -------------------------------------------
+{
+  const { setEffort } = await import("./effort.ts");
+  t("/effort registered as a user command", !!commands["effort"]);
+  const ec = commands["effort"].getArgumentCompletions("");
+  t(
+    "effort completions cover every level",
+    Array.isArray(ec) && ["low", "high", "max"].every((l) => ec.some((c: any) => c.value === l))
+  );
+
+  setEffort("high");
+  const start = await hooks["before_agent_start"]({}, { cwd: DIR });
+  const prompt: string = start?.systemPrompt || "";
+  t("effort=high block injected into prompt", prompt.includes("Work standard (effort=high)"), prompt.slice(0, 120));
+  t("effort=high demands evidence", prompt.includes("Never claim success without evidence"));
+  t("effort header line present", /Effort: high\./.test(prompt));
+  t("persona voice untouched by effort", prompt.includes("Caveman") || prompt.includes("MykyAgent"));
+
+  const notes: string[] = [];
+  await commands["effort"].handler("", { cwd: DIR, ui: { notify: (m: string) => notes.push(m) } });
+  t("/effort reports current level", notes.join(" ").includes("Effort: high"), notes.join(" ").slice(0, 120));
+
+  await commands["effort"].handler("low", { cwd: DIR, ui: { notify: (m: string) => notes.push(m) } });
+  const lowStart = await hooks["before_agent_start"]({}, { cwd: DIR });
+  t("/effort low swaps the block", (lowStart?.systemPrompt || "").includes("Work standard (effort=low)"));
+  t("/effort low drops high rules", !(lowStart?.systemPrompt || "").includes("never claim success without evidence".replace("never", "Never")));
+  t("/verify registered as a user command", !!commands["verify"]);
+  await commands["verify"].handler("the effort dial", { cwd: DIR, ui: { notify: () => {} } });
+  const vmsg = sentMessages.at(-1) || "";
+  t("/verify points at the verification skill", vmsg.includes("skill_read verification"), vmsg.slice(0, 120));
+  t("/verify demands a PASS/FAIL verdict", vmsg.includes("PASS / PARTIAL / FAIL / UNVERIFIED"));
+  t("/verify carries the scope", vmsg.includes("the effort dial"));
+  t("/verify bans gut-feel proof", vmsg.includes('No "should work"'));
+
+  // --- 12b. personas -------------------------------------------------------
+  {
+    const personaFile = join(DIR, "persona.json");
+    process.env.MYKYAGENT_PERSONA_FILE = personaFile;
+    const notes: string[] = [];
+    const pctx = { cwd: DIR, ui: { notify: (m: string) => notes.push(m) } };
+    await commands["persona"].handler("qa", pctx);
+    t("/persona qa switches", readFileSync(personaFile, "utf-8").includes('"qa"'));
+    const qaStart = await hooks["before_agent_start"]({}, { cwd: DIR });
+    const qaPrompt: string = qaStart?.systemPrompt || "";
+    t("qa persona voice in prompt", qaPrompt.includes("QA test engineer"));
+    t("qa persona keeps the effort block separate", qaPrompt.includes("Work standard (effort="));
+    await commands["persona"].handler("", { cwd: DIR, ui: { notify: (m: string) => notes.push(m) } });
+    t("/persona list names the new voices", ["qa", "maintainer", "pm", "speedrunner", "gremlin"].every((k) => notes.join(" ").includes(k)));
+    await commands["persona"].handler("gremlin", pctx);
+    const gPrompt = (await hooks["before_agent_start"]({}, { cwd: DIR }))?.systemPrompt || "";
+    t("gremlin voice in prompt", gPrompt.includes("a gremlin"));
+    t("gremlin voice carries no depth rules", !gPrompt.includes("half-chewed"));
+    t("gremlin asks before destructive moves", gPrompt.includes("destructive or irreversible gets a question"));
+    // retired persona in an old config must not resurrect
+    writeFileSync(join(DIR, "persona.json"), JSON.stringify({ current: "pirate" }), "utf-8");
+    const retired = (await hooks["before_agent_start"]({}, { cwd: DIR }))?.systemPrompt || "";
+    t("retired persona falls back to caveman", retired.includes("Caveman") && !retired.includes("Scurvy"));
+    await commands["persona"].handler("caveman", pctx);
+  }
+
+  setEffort("high");
+  // One message overrides the stored level for that turn only.
+  const pre = await hooks["before_agent_start"]({ messageType: "user", prompt: "low: rename the var" }, { cwd: DIR });
+  const prePrompt: string = pre?.systemPrompt || "";
+  t("prefix low: injects the low block", prePrompt.includes("Work standard (effort=low)"));
+  t("prefix low: header names the turn level", /Effort: low\./.test(prePrompt));
+  t("prefix leaves the stored level alone", (await import("./effort.ts")).getEffort() === "high");
+  const plain = await hooks["before_agent_start"]({ messageType: "user", prompt: "rename the var" }, { cwd: DIR });
+  t("no prefix uses stored level", (plain?.systemPrompt || "").includes("Work standard (effort=high)"));
+
+  // Feature toggled off: no block, no header, persona + goal still there.
+  const { setFeatureEnabled } = await import("./toggles.ts");
+  setFeatureEnabled("effort", false);
+  const offPrompt: string = (await hooks["before_agent_start"]({ messageType: "user", prompt: "max: x" }, { cwd: DIR }))?.systemPrompt || "";
+  t("feature off injects no block even with prefix", !offPrompt.includes("Work standard (effort="), offPrompt.slice(0, 200));
+  t("feature off injects no effort header", !/Effort:/.test(offPrompt));
+  t("feature off keeps persona + goal", offPrompt.includes("Goal: do the user task completely."));
+  setFeatureEnabled("effort", true);
 }
 
 rmSync(DIR, { recursive: true, force: true });

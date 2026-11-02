@@ -84,6 +84,10 @@ Persona owns **voice**. Effort owns **depth**. A terse caveman persona ("no fluf
 - RP modes stay quiet unless you stored a level or typed a prefix. No build pipeline in the middle of a scene.
 - Stored in `~/.config/mykyagent/effort.json`. Old `auto` / `normal` / `off` values read as `high`; use the toggle for "no steering".
 
+### Verification Pass (`/verify`)
+
+Separates judge from author: `/verify [scope]` kicks off a fresh turn that reads `skills/verification.md` and runs the protocol — collect the claims you made, one command per claim, probe boundary/state/honesty, then a per-claim verdict of `PASS` / `PARTIAL` / `FAIL` / `UNVERIFIED` with the deciding output line. "Should work" is an auto-FAIL; so is re-reading your own diff and calling it proof. Costs nothing until invoked.
+
 ## In-Chat Web Model
 Route only the `web_search` / `web_fetch` distillation sub-calls to a dedicated
 model; the main conversation model (pi's `/model`) is untouched:

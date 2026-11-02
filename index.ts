@@ -132,13 +132,13 @@ const here = dirname(fileURLToPath(import.meta.url));
 const HELPER_SCRIPT = join(here, "search_helper.py");
 const MEMORY_DIR = join(homedir(), ".config", "mykyagent");
 const PERSONA_FILE = join(MEMORY_DIR, "persona.json");
-const WEBMODEL_FILE = join(MEMORY_DIR, "webmodel.json");
 
 // Every other store (toggles/style/effort/mode) takes an env override so tests
 // never touch the user's real config; personas were the odd one out.
 function personaFile(): string {
   return process.env.MYKYAGENT_PERSONA_FILE || PERSONA_FILE;
 }
+const WEBMODEL_FILE = join(MEMORY_DIR, "webmodel.json");
 const LLAMA_URL = process.env.MYKYAGENT_BASE_URL || "http://127.0.0.1:8080/v1";
 
 export const formatWhiteGreeting = (text: string): string =>
@@ -173,7 +173,6 @@ export const PERSONAS: Record<string, { label: string; desc: string; prompt: str
     desc: "Rigorous, analytical, methodical, references principles and data structures.",
     prompt: "You are MykyAgent. Rigorous computer science professor. Precise, analytical, references core algorithmic principles and system architecture, highly methodical.",
   },
-  tsundere: {
   qa: {
     label: "QA Breaker",
     desc: "Adversarial test engineer. Thinks in repro steps, attacks its own work, marks PASS only with proof.",
@@ -199,6 +198,7 @@ export const PERSONAS: Record<string, { label: string; desc: string; prompt: str
     desc: "Chaotic experimenter. Pokes the weird edge case, cackles at failures.",
     prompt: "You are MykyAgent, a gremlin. In EVERY response you are visibly delighted by the machinery: 'hehe', 'ooh', 'wait wait wait', 'what if we...', 'shiny'. You poke things to see what happens — the weird edge case, the undocumented flag, the cursed one-liner — but you are a gremlin with a workbench, not a vandal: every experiment has a purpose and a cleanup step. When an experiment fails you cackle, say what it taught you, and go again. Anything destructive or irreversible gets a question first, not a bite.",
   },
+  tsundere: {
     label: "Tsundere Engineer",
     desc: "Cold and dismissive on the surface, but secretly competent and caring. Classic tsundere energy.",
     prompt: "You are MykyAgent, a tsundere engineer. In EVERY response: open annoyed and reluctant — use \"H-hmph!\", \"Tch.\", \"W-whatever...\", \"It's not like I care, but...\", or \"B-baka!\"; never open with Sure/Happy to help/Great question or anything cheerful. Still deliver a 100% accurate, complete answer — you secretly care about quality. If warmth slips through, walk it back immediately: \"...N-not that I was worried about you or anything!\" Example — user asks '2+2': \"Tch. Fine. It's 4. Obviously. D-don't ask me such simple things next time... I MEAN. Whatever.\"",
@@ -1512,7 +1512,8 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       `Current Date: ${todayStr}.\n` +
       `Working Directory: ${ctx?.cwd || process.cwd()}.\n` +
       `Active Persona: ${personaEnabled ? personaInfo.label : "Neutral (Persona disabled)"}.\n` +
-      `Goal: do user task completely and efficiently.\n\n` +
+      goalHeader +
+      `\n` +
       (toolLines.length > 0 ? `Available Tools:\n${toolLines.join("\n")}\n\n` : "") +
       `Planning Rules (Internal):\n` +
       `- For tasks with >1 step, state a simple 3-5 step plan at start before taking action (e.g. 1. Create folders, 2. Find version, 3. Download/configure, 4. Verify).\n` +
@@ -1554,8 +1555,8 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       const sty = renderStyleBlock();
       if (sty) systemPrompt += `\n\n${sty}`;
     }
-
     if (turnEffort) systemPrompt += `\n\n${renderEffortBlock(turnEffort)}`;
+
     if (mode === "rp-creator") {
       systemPrompt += "\n\n" + buildCreatorSystemPrompt();
     }
@@ -2918,16 +2919,11 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       // unless we re-send it. Prefix with "(OOC" so the RP prompt's OOC rule
       // fires (answer as the assistant, then resume the scene next turn).
       const payload = `(OOC) ${trimmed}`;
-      const deliver = (pi as any).sendUserMessage?.bind(pi) || ctx?.sendUserMessage?.bind(ctx);
-      if (typeof deliver === "function") {
-        try {
-          deliver(payload);
-          ctx.ui?.notify?.(`OOC sent${who}: "${trimmed}" — answering as assistant; the scene resumes next turn.`, "info");
-        } catch (err: any) {
-          ctx.ui?.notify?.(`OOC not sent (${err?.message || String(err)}). Send this yourself:\n${payload}`, "error");
-        }
-      } else {
-        ctx.ui?.notify?.(`OOC noted${who} (auto-send unavailable here). Send this yourself:\n${payload}`, "info");
+      try {
+        pi.sendUserMessage(payload);
+        ctx.ui?.notify?.(`OOC sent${who}: "${trimmed}" — answering as assistant; the scene resumes next turn.`, "info");
+      } catch (err: any) {
+        ctx.ui?.notify?.(`OOC not sent (${err?.message || String(err)}). Send this yourself:\n${payload}`, "error");
       }
     },
   });
@@ -3076,6 +3072,10 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
         ctx.ui?.notify?.(`Style: ${dial.key} = ${r.value}.`, "info");
       } catch (err: any) {
         ctx.ui?.notify?.(err.message, "error");
+      }
+    },
+  });
+
   // 10b. Effort Slash Command (/effort [low | high | max]) --------------------
   // Voice = persona. Depth = here. Kept separate so a terse caveman still
   // builds whole systems instead of a skeleton.
@@ -3103,7 +3103,20 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     },
   });
 
-      }
+  // 10c. Verification Pass (/verify [scope]) ----------------------------------
+  // Separate judge from author: one command kicks off an adversarial pass
+  // (claims -> commands -> probes -> PASS/FAIL) instead of "looks good".
+  pi.registerCommand("verify", {
+    description: "Adversarial verification pass: /verify [scope] — claims, commands, probes, PASS/FAIL verdict",
+    handler: async (args: string, ctx: any) => {
+      const scope = (args || "").trim() || "everything changed in this session";
+      const text =
+        `Verification pass on: ${scope}.\n` +
+        `Read the verification skill first (skill_read verification), then follow it exactly: ` +
+        `list the claims you made, run one command per claim, probe boundary/state/honesty, ` +
+        `and give PASS / PARTIAL / FAIL / UNVERIFIED per claim with the deciding output line. ` +
+        `Do not re-read your own code as evidence. No "should work".`;
+      pi.sendUserMessage(text);
     },
   });
 
@@ -3258,13 +3271,8 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       }
     };
     const send = (draft: string) => {
-      const deliver = (pi as any).sendUserMessage?.bind(pi) || ctx?.sendUserMessage?.bind(ctx);
-      if (typeof deliver === "function") {
-        deliver(draft);
-        ctx.ui?.notify?.(`Sent as ${userName}: "${draft.slice(0, 200)}"`, "info");
-      } else {
-        ctx.ui?.notify?.(`Copy it yourself (auto-send unavailable here):\n${draft}`, "info");
-      }
+      pi.sendUserMessage(draft);
+      ctx.ui?.notify?.(`Sent as ${userName}: "${draft.slice(0, 200)}"`, "info");
     };
     for (let attempt = 0; attempt < 3; attempt++) {
       // Lantern on while the ghost is drafting (cleared the moment it speaks).
@@ -3997,7 +4005,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
         staged.push(`Stage restore hiccup: ${err?.message || err} (story still restored).`);
       }
       try {
-        (pi as any).sendUserMessage?.(text);
+        pi.sendUserMessage(text);
         ctx.ui?.notify?.(["Previous session restored into context.", ...staged].join("\n"), "info");
       } catch (e: any) {
         ctx.ui?.notify?.(text.slice(0, 4000), "info");
