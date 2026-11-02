@@ -68,6 +68,22 @@ Switch the agent's tone and speaking style at any time in chat:
 
 Personas are **voice**, not effort. The five above also happen to bias behaviour (testing, diff discipline, scope, time-to-result), but depth is controlled by `/effort` — see below. Built-ins: `caveman`, `senior`, `cyberpunk`, `academic`, `qa`, `maintainer`, `pm`, `speedrunner`, `gremlin`, `tsundere`, `chuunibyou`, `oneesan`.
 
+## Effort Levels (`/effort`)
+
+Persona owns **voice**. Effort owns **depth**. A terse caveman persona ("no fluff, code first") reads as "minimum code, stop early" if the two are mixed, so the work standard lives in its own block.
+
+| Level | What it means |
+| --- | --- |
+| `low` | Smallest correct change. One command proves it. No new tests. |
+| `high` (default) | Done-criteria before code, bug reports reproduced before fixing, real verification output, one DONE / NOT DONE line per ask. |
+| `max` | Spec + architecture, tests, manual pass (play the game), polish pass, acceptance report. |
+
+- `/effort` shows the current level and all three. `/effort max` stores a level.
+- **One message at a time:** start a message with `low:`, `high:` or `max:` to override the stored level for that turn only, e.g. `max: build a tower defence with save/load`. Nothing to switch before every start.
+- Master toggle: `/mykyagent toggle effort` turns the whole block off. `/effort` says when it is disabled.
+- RP modes stay quiet unless you stored a level or typed a prefix. No build pipeline in the middle of a scene.
+- Stored in `~/.config/mykyagent/effort.json`. Old `auto` / `normal` / `off` values read as `high`; use the toggle for "no steering".
+
 ## In-Chat Web Model
 Route only the `web_search` / `web_fetch` distillation sub-calls to a dedicated
 model; the main conversation model (pi's `/model`) is untouched:
@@ -477,6 +493,7 @@ Everything here runs without a network:
 | `read.test.ts` | 6 | vision blocks for capable models, server-side description fallback, honest errors, oversize guard, avif autoconvert |
 | `tags.test.ts` | 13 | tint store limits, normalization, prompt block, toggle gating |
 | `manage.test.ts` | 32 | character duplicate/rename, memory edit/rename/move/search, tools, /characters + /memories board flows |
+| `effort.test.ts` | 51 | default high, stale-value handling, level validation + persistence, per-message prefix, RP quiet mode, per-level blocks, feature gating, card |
 | `style.test.ts` | 38 | all-off defaults, level validation, freeform tone, persistence filter, prompt block, toggle gating, picker rows + apply, per-dial manuals + explainer, WBU gap dials, intimacy/profanity, Esc-crash regression |
 | `ghost.test.ts` | 28 | ghost draft cleanup, named history, hint pass-through, Send/Abort flow, thinking-only + HTTP fallback + error cause + model-leak guards + ctx.model + char-voice guard + status lantern |
 | `memory.test.ts` | 34 | slug/path safety, caps, index, migration, injection guard |

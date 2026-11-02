@@ -80,6 +80,7 @@ export const FEATURE_DEFS: Record<string, string> = {
   rpg_tools: "RPG tools (dice_roll, game_state, advance_time)",
   tags: "Additive conversation tints (/tags) in prompt",
   style: "Structured narrative dials (/style) in prompt",
+  effort: "Work-standard / effort level (/effort) in prompt",
 };
 
 export function loadToggles(): TogglesConfig {

@@ -19,6 +19,7 @@ import { addTodo, clearTodos, doneTodo, loadTodos, openTodos, todoBlock } from "
 import { listCheckpoints, resolveToolPath, restoreCheckpoint, snapshotFile } from "./checkpoints.ts";
 import { buildResumeText, loadAutoState, saveAutoStub, saveSummary } from "./resume.ts";
 import { addTags, clearTags, getTags, removeTags, renderTagsBlock, setTags } from "./tags.ts";
+import { EFFORT_HELP, EFFORT_LEVELS, describeEffort, effortForTurn, renderEffortBlock, setEffort } from "./effort.ts";
 import { applyStyleSettingChange, buildStyleSettingItems, clearStyle, describeStyle, getStyles, listStyleDials, renderStyleBlock, setStyle } from "./style.ts";
 import { clearTask, listTasks, pollTask, startTask, stopTask, waitTask } from "./taskman.ts";
 import {
@@ -1500,6 +1501,12 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     }
 
     const todayStr = new Date().toISOString().slice(0, 10);
+    // No effort line and no block when the feature is off or an RP mode is quiet.
+    const turnEffort = effortForTurn({ prompt: event?.prompt, mode });
+    const goalHeader = turnEffort
+      ? `Goal: do the user task completely. Depth follows the work standard below, not the length of the answer.\n` +
+        `Effort: ${turnEffort}.\n`
+      : `Goal: do the user task completely.\n`;
     let systemPrompt =
       `${personaPrompt}\n` +
       `Current Date: ${todayStr}.\n` +
@@ -1521,8 +1528,8 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       `- In bash, stay inside the working directory. Scripts from write need chmod +x before running.\n` +
       `- Prefer edit for existing files (read a few lines to anchor oldText first); write only for new files or full rewrites, batching non-overlapping edits in one call. Full rewrites must keep unchanged bytes identical.\n\n` +
       `Efficiency & Execution Rules:\n` +
-      `- Execution is serial by design: run one command at a time in bash and let it block until it finishes - no background tasks, no parallel work. For long commands use quiet/no-progress flags (see above) and check output before the next step.\n` +
-      `- Long-lived daemons (servers, watchers): start them detached from ONE bash call: 'nohup <cmd> > /tmp/<name>.log 2>&1 & echo $! > /tmp/<name>.pid' - the call returns immediately. Read logs with 'tail -n 20 /tmp/<name>.log'; stop with 'kill $(cat /tmp/<name>.pid)'. Never start a daemon twice.\n` +
+      `- One thing at a time in the foreground: run one bash command, let it finish, check its output before the next step. For long commands use quiet/no-progress flags (see above).\n` +
+      `- Builds, servers, watchers: task_start (max 3 live), read with task_output, block with task_wait, stop with task_stop. Check task_list before starting a server again. Never sleep-poll.\n` +
       `- Web research: delegate COMPLETE goals via web_search (never bare keywords). Never invent versions/hashes/URLs — use only returned data, verified against file contents/metadata. Never re-fetch a failed URL; never guess versions/years, search manifests/release APIs instead.\n` +
       `- Combine commands: chain related actions in one bash call (mkdir && curl && echo) instead of separate turns.\n` +
       `- If blocked or missing a required fact, say so in one sentence and ask the single most useful clarifying question - do not stall silently or invent filler.\n\n` +
@@ -1548,6 +1555,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       if (sty) systemPrompt += `\n\n${sty}`;
     }
 
+    if (turnEffort) systemPrompt += `\n\n${renderEffortBlock(turnEffort)}`;
     if (mode === "rp-creator") {
       systemPrompt += "\n\n" + buildCreatorSystemPrompt();
     }
@@ -3068,6 +3076,33 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
         ctx.ui?.notify?.(`Style: ${dial.key} = ${r.value}.`, "info");
       } catch (err: any) {
         ctx.ui?.notify?.(err.message, "error");
+  // 10b. Effort Slash Command (/effort [low | high | max]) --------------------
+  // Voice = persona. Depth = here. Kept separate so a terse caveman still
+  // builds whole systems instead of a skeleton.
+  pi.registerCommand("effort", {
+    description: "Work standard: /effort [low | high | max] (default high; one message: start it with low: / high: / max:)",
+    getArgumentCompletions: (argumentText: string) => {
+      if (argumentText.includes(" ")) return null;
+      const subs: AutocompleteItem[] = EFFORT_LEVELS.map((l) => ({ value: l, label: l, description: EFFORT_HELP[l] }));
+      const trimmed = argumentText.trim();
+      const filtered = trimmed ? fuzzyFilter(subs, trimmed, (s: any) => s.label) : subs;
+      return filtered.length ? filtered : null;
+    },
+    handler: async (args: string, ctx: any) => {
+      const trimmed = args?.trim().toLowerCase() || "";
+      if (!trimmed) {
+        ctx.ui?.notify?.(describeEffort(), "info");
+        return;
+      }
+      try {
+        const v = setEffort(trimmed);
+        ctx.ui?.notify?.(`Effort: ${v}. Work standard injected — persona voice unchanged.`, "info");
+      } catch (err: any) {
+        ctx.ui?.notify?.(err.message, "error");
+      }
+    },
+  });
+
       }
     },
   });
