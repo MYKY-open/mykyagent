@@ -1,16 +1,32 @@
-# Adversarial verification: prove it works, or name exactly what fails
+# Adversarial verification — for big or risky changes, not for one-line fixes
 
-Use when the user says verify / check / "did it really work", after any big implementation, or before declaring a feature done. Author is never the judge of their own work — same model, same blind spots.
+Use when the user says verify / check / "did it really work", before declaring a
+feature done, or after a change that touches state, files, network or a UI.
+Author is never the judge of their own work — same model, same blind spots.
+A typo fix does not need this skill; if you are unsure, run the one line below.
+
+## Size the pass first
+
+Match the pass to the change, or verification becomes the work:
+
+- **1 claim, one file, no state** — one command that would fail if the claim
+  were false. That is the whole pass.
+- **2-3 claims, or anything stateful** (saves, files, network, processes) — one
+  command per claim, plus the probes that map to the risk.
+- **New feature / user-facing UI / destructive work** — the full protocol.
+
+Skipping a probe because the change is trivial is honest. Marking PASS without
+running the command never is.
 
 ## Protocol
 
 1. **Collect claims.** List every "done" sentence you made: works, saves, loads, handles X, no crash, persists. Each one is a test target. No claims, no verification.
 2. **One command per claim.** For each claim: the exact command that would fail if the claim were false, then run it. Paste the output line that decides it. Reading the code again is NOT evidence.
-3. **Three probes.** Name the three most likely ways this breaks, then actually try each:
+3. **Probes — sized, not sprayed.** Name the ways this could realistically break, then actually try the ones that fit the change (one is enough for a small fix; three for stateful / user-facing work):
    - **boundary** — empty input, huge input, unicode, zero, negative, missing file, wrong type
    - **state** — run twice, kill mid-way, restart, stale file, read-only dir, concurrent second instance
    - **honesty** — does the happy path work when the user does the obvious wrong thing first?
-4. **Verdict per claim** — exactly one of PASS / PARTIAL / FAIL / UNVERIFIED, one line each:
+4. **Verdict per claim** — exactly one of PASS / PARTIAL / FAIL / UNVERIFIED, one line each — and only for claims you actually ran:
    - `PASS` — the command ran and its output proves the claim
    - `FAIL` — command + actual output + what it should have been
    - `PARTIAL` — passes the happy path, this probe fails

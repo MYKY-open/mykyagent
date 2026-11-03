@@ -11,7 +11,7 @@ A lightweight, crash-proof agent overlay for small local reasoning models (like 
 - **Persistent Memory (index + on-demand)**: Topic files under `~/.config/mykyagent/memory/`. Only a one-line summary per topic is injected into the system prompt; bodies load via `memory_read` when relevant. `memory_write` / `memory_read` / `memory_forget` / `memory_list`.
 - **Background Tasks**: Long commands run detached via `task_start`; follow with cursor-based `task_output` (new bytes only), blocking `task_wait`, or kill with `task_stop`. `task_list` / `/tasks` lists them. Max 3 live.
 - **Skills-lite**: On-demand capability packs in `skills/<name>.md` (or `skills/<name>/SKILL.md`). One index line per turn (zero when empty); full text loads via `skill_read` only when relevant. `/skill` lists/shows them.
-- **Todos**: Tiny persistent scratch (`todo` add/list/done/clear) for multi-step work, injected bounded into the prompt only while open.
+- **Todos**: Tiny persistent scratch (`todo` add/list/done/clear) for multi-step work, injected bounded into the prompt only while open. Humans get the same broom: `/todo` lists, `/todo add <text>`, `/todo done <id|text>`, `/todo clear` (finished only), **`/todo wipe`** (everything — for cancelled runs and models that forgot to close items).
 - **Checkpoints**: Every `write`/`edit` snapshots pre-write content (ring of 20, 100KB cap). `/rewind` lists, `/rewind <n>` restores. Undo, no gates.
 - **Resume**: `summarize` tool saves a session summary; `session_shutdown` auto-saves machine state (mode, active character, todos, checkpoint count). `/restore` injects both back into a fresh session **and re-applies the saved stage** — mode plus character with greeting (or an honest note if the card is gone). Personas, tags, style, author's note, and toggles persist in their own files already. (`/resume` is pi's own session switcher).
 - **Ultra Portable**: Clean TypeScript overlay with zero local `node_modules`.
@@ -72,21 +72,39 @@ Personas are **voice**, not effort. The five above also happen to bias behaviour
 
 Persona owns **voice**. Effort owns **depth**. A terse caveman persona ("no fluff, code first") reads as "minimum code, stop early" if the two are mixed, so the work standard lives in its own block.
 
+**Off by default.** No work standard is injected until you ask for one. `/effort low|high|max` stores a level and turns the feature on; `/mykyagent off effort` turns it back off without forgetting your level.
+
 | Level | What it means |
 | --- | --- |
 | `low` | Smallest correct change. One command proves it. No new tests. |
-| `high` (default) | Done-criteria before code, bug reports reproduced before fixing, real verification output, one DONE / NOT DONE line per ask. |
+| `high` (default level) | Done-criteria before code, bug reports reproduced before fixing, real verification output, one DONE / NOT DONE line per ask. |
 | `max` | Spec + architecture, tests, manual pass (play the game), polish pass, acceptance report. |
 
-- `/effort` shows the current level and all three. `/effort max` stores a level.
+- `/effort` shows whether the feature is on, the current level and all three. `/effort max` stores a level and enables it.
 - **One message at a time:** start a message with `low:`, `high:` or `max:` to override the stored level for that turn only, e.g. `max: build a tower defence with save/load`. Nothing to switch before every start.
-- Master toggle: `/mykyagent toggle effort` turns the whole block off. `/effort` says when it is disabled.
-- RP modes stay quiet unless you stored a level or typed a prefix. No build pipeline in the middle of a scene.
+- Master toggle: `/mykyagent toggle effort` (or `/mykyagent on effort`) flips the whole feature; the stored level survives either way.
+- **Code mode only.** Effort is a build standard, so roleplay never gets it: `rp` scenes have their own prompt, `rp-creator` (Story Studio) takes it only from a typed `low:` / `high:` / `max:` prefix. A stored level never leaks into prose.
 - Stored in `~/.config/mykyagent/effort.json`. Old `auto` / `normal` / `off` values read as `high`; use the toggle for "no steering".
+- **No level is a per-turn ritual.** Every block scales the proof to the change: a question gets answered, a one-line fix gets one proving command, a feature gets the full standard. A stored `max` does not grow a build pipeline under a typo.
+
+### Profiles (`/profile`)
+
+A profile is a named snapshot of the settings you keep flipping — **effort, toggles, persona, style dials, tags**. Switching writes them into the live stores, so every command keeps working exactly as before; no other module knows profiles exist.
+
+* `/profile` — card: saved profiles, the active one, what each holds
+* `/profile new <name>` — snapshot the current settings as a new profile and switch to it
+* `/profile use <name>` — switch (the outgoing profile is saved first, so tweaks are not lost)
+* `/profile save [name]` — write the current settings into the active (or named) profile
+* `/profile delete <name>` / `/profile rename <old> <new>`
+* Same thing from the board: `/mykyagent profile ...`; the board header shows `Profile:` and `Effort:`.
+* **pi footer**: a `mykyagent` status line reads `profile · effort` (e.g. `Story Night · effort max`), repainted on start, after any profile/effort/toggle change, and self-healed on the next turn. pi has no header — the footer is the only persistent status surface.
+* A snapshot always stores all five sections — a store you never created is captured as empty, so switching really restores the saved state instead of blending it with whatever was live.
+
+Details: names are free text, the directory is a slug (`Story Night` → `profiles/story-night/profile.json`); session state — mode, active character, user name — is **not** part of a profile; a hand-edited profile file is validated before anything is written, and one bad section refuses the whole switch instead of half-applying.
 
 ### Verification Pass (`/verify`)
 
-Separates judge from author: `/verify [scope]` kicks off a fresh turn that reads `skills/verification.md` and runs the protocol — collect the claims you made, one command per claim, probe boundary/state/honesty, then a per-claim verdict of `PASS` / `PARTIAL` / `FAIL` / `UNVERIFIED` with the deciding output line. "Should work" is an auto-FAIL; so is re-reading your own diff and calling it proof. Costs nothing until invoked.
+Separates judge from author: `/verify [scope]` kicks off a fresh turn that reads `skills/verification.md` and runs the protocol — collect the claims you made, one command per claim, then a per-claim verdict of `PASS` / `PARTIAL` / `FAIL` / `UNVERIFIED` with the deciding output line. Probes (boundary/state/honesty) are sized to the scope: one command for a one-file fix, the full sweep for stateful or user-facing work. "Should work" is an auto-FAIL; so is re-reading your own diff and calling it proof. Costs nothing until invoked.
 
 ## In-Chat Web Model
 Route only the `web_search` / `web_fetch` distillation sub-calls to a dedicated
@@ -124,16 +142,17 @@ and pi's picker immediately.
 
 ## Universal Toggles (`/mykyagent`)
 Toggle any tool, skill, or agent feature on/off individually. The picker is **mode-aware**: it shows `[code]`, `[rp]`, or `[rp-creator]` in its title, hides tools the current mode cannot use at all (with a "(N hidden — unavailable in X mode)" note), and every tool flip lands on **that mode's own setting** — turning `bash` off in RP leaves code mode untouched. Features and skills stay global. `/mykyagent reset` clears everything across all modes.
-* `/mykyagent` — Open interactive Settings picker (scroll with arrow keys, toggle with Enter/Space/arrows)
+* `/mykyagent` — Open interactive Settings picker (scroll with arrow keys, toggle with Enter/Space/arrows); the header carries `Profile:` and `Effort:`, and the list offers profile switch/save/new
 * `/mykyagent status` — Print status summary of all tools, skills, and features
 * `/mykyagent toggle <name>` — Flip a tool, skill, or feature on/off (e.g. `/mykyagent toggle bash`)
 * `/mykyagent on <name>` / `/mykyagent off <name>` — Enable or disable explicitly (e.g. `/mykyagent off memory`, `/mykyagent off web-scraping`)
-* `/mykyagent reset` — Re-enable all tools, skills, and features back to default
+* `/mykyagent reset` — Re-enable all tools, skills, and features back to default (profiles are untouched)
+* `/mykyagent profile ...` — Manage profiles without leaving the board: `list`, `new <name>`, `use <name>`, `save`, `delete <name>`, `rename <old> <new>`
 
 **Toggleable categories:**
 * **Tools**: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `memory_read`, `memory_write`, `memory_forget`, `memory_list`, `mcp_connect`, `mcp_disconnect`, `mcp_list`, and any discovered MCP server tools.
 * **Skills**: Master skills toggle (`skills`) and per-skill toggles (e.g. `web-scraping`).
-* **Features**: `memory` (persistent index & tools), `persona` (tone styling in prompt), `tool_recovery` (think-tag tool call recovery — OPT-IN, off by default: `/mykyagent on tool_recovery`), `output_sanitizer` (progress bar/ticker cleaning), `web`, `mcp`.
+* **Features**: `memory` (persistent index & tools), `persona` (tone styling in prompt), `tool_recovery` (think-tag tool call recovery — OPT-IN, off by default: `/mykyagent on tool_recovery`), `output_sanitizer` (progress bar/ticker cleaning), `web`, `mcp`, `effort` (work standard — OPT-IN, off by default: `/effort <level>` or `/mykyagent on effort`).
 
 Saved to `~/.config/mykyagent/toggles.json` and persists across sessions.
 

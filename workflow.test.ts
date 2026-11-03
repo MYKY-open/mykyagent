@@ -157,6 +157,48 @@ t("wiring: todo tool adds", String(todoAdd.content?.[0]?.text || "").includes("a
 const todoList = await tools.todo.execute("x", { action: "list" });
 t("wiring: todo tool lists", String(todoList.content?.[0]?.text || "").includes("From tool"));
 
+// /todo command: the human's broom
+{
+  const notes: string[] = [];
+  const tctx = { cwd: DIR, ui: { notify: (m: string, l = "info") => notes.push(`${l}: ${m}`) } };
+  const last = () => notes.at(-1) || "";
+  T.clearTodos(true);
+
+  t("wiring: /todo registered", !!commands.todo);
+  const verbs = commands.todo.getArgumentCompletions("");
+  t("wiring: /todo completions cover every verb", ["list", "add", "done", "clear", "wipe"].every((v) => verbs.some((c: any) => c.value === v)));
+
+  await commands.todo.handler("add wire the dialog", tctx);
+  t("wiring: /todo add works", last().includes("added") && T.openTodos().length === 1, last());
+  await commands.todo.handler("add finish the docs", tctx);
+  const doneSuggest = commands.todo.getArgumentCompletions("done ");
+  t("wiring: /todo done completions offer open ids", doneSuggest?.length === 2 && doneSuggest.every((c: any) => c.value.startsWith("done ")));
+
+  await commands.todo.handler("2", tctx);
+  t("wiring: bare number marks done", T.loadTodos().find((t) => t.id === 2)?.done === true && last().includes("done"));
+
+  notes.length = 0;
+  await commands.todo.handler("clear", tctx);
+  t("wiring: /todo clear drops finished only", last().includes("Dropped 1") && T.openTodos().length === 1, last());
+
+  notes.length = 0;
+  await commands.todo.handler("wipe", tctx);
+  t("wiring: /todo wipe drops open items too", T.loadTodos().length === 0 && last().includes("Wiped all todos (1"), last());
+  t("wiring: wipe clears the prompt block", T.todoBlock() === "");
+
+  notes.length = 0;
+  await commands.todo.handler("wipe", tctx);
+  t("wiring: wiping an empty list is calm", last().includes("already empty"), last());
+
+  notes.length = 0;
+  await commands.todo.handler("", tctx);
+  t("wiring: bare /todo lists", last().includes("Todos: none"), last());
+
+  notes.length = 0;
+  await commands.todo.handler("done 99", tctx);
+  t("wiring: unknown id reports an error", notes.at(-1)?.startsWith("error:") === true, last());
+}
+
 // summarize tool + /restore command
 await tools.summarize.execute("x", { text: "Wired everything." });
 const notify: string[] = [];

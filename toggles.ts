@@ -80,7 +80,7 @@ export const FEATURE_DEFS: Record<string, string> = {
   rpg_tools: "RPG tools (dice_roll, game_state, advance_time)",
   tags: "Additive conversation tints (/tags) in prompt",
   style: "Structured narrative dials (/style) in prompt",
-  effort: "Work-standard / effort level (/effort) in prompt",
+  effort: "Work standard / effort level (/effort) in prompt — OFF by default, /effort <level> turns it on",
 };
 
 export function loadToggles(): TogglesConfig {
@@ -114,7 +114,7 @@ export function saveToggles(cfg: TogglesConfig): void {
 }
 
 /** Features that default OFF (opt-in). Everything else defaults ON. */
-export const OPT_IN_FEATURES: Set<string> = new Set(["tool_recovery"]);
+export const OPT_IN_FEATURES: Set<string> = new Set(["tool_recovery", "effort"]);
 
 export function isFeatureEnabled(name: string): boolean {
   const cfg = loadToggles();
@@ -429,7 +429,7 @@ export function formatTogglesSummary(
   if (hidden.length && opts.mode) {
     lines.push("", `(${hidden.length} tools hidden — unavailable in ${opts.mode} mode: ${hidden.slice(0, 8).join(", ")}${hidden.length > 8 ? ", …" : ""})`);
   }
-  lines.push("", "Usage: /mykyagent [toggle <name> | on <name> | off <name> | reset | status]");
+  lines.push("", "Usage: /mykyagent [toggle <name> | on <name> | off <name> | profile ... | reset | status]", "Profiles: /profile [list | new <name> | use <name> | save | delete <name>]");
 
   return lines.join("\n");
 }

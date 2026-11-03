@@ -18,7 +18,7 @@ export const TAG_MAX_CHARS = 24;
 
 const TAGS_FILE = join(homedir(), ".config", "mykyagent", "tags.json");
 
-function getTagsFile(): string {
+export function getTagsFile(): string {
   return process.env.MYKYAGENT_TAGS_FILE || TAGS_FILE;
 }
 

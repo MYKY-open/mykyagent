@@ -18,7 +18,7 @@ import { isFeatureEnabled, setFeatureEnabled } from "./toggles.ts";
 
 const STYLE_FILE = join(homedir(), ".config", "mykyagent", "style.json");
 
-function getStyleFile(): string {
+export function getStyleFile(): string {
   return process.env.MYKYAGENT_STYLE_FILE || STYLE_FILE;
 }
 

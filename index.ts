@@ -15,11 +15,24 @@ import {
 import { runSearchHops, type ResearchPayload } from "./search_hops.ts";
 import { recoverLeakedToolCalls } from "./tool_recovery.ts";
 import { listSkills, readSkill, skillsPromptLine } from "./skills.ts";
-import { addTodo, clearTodos, doneTodo, loadTodos, openTodos, todoBlock } from "./todo.ts";
+import { addTodo, clearTodos, describeTodos, doneTodo, loadTodos, openTodos, todoBlock } from "./todo.ts";
 import { listCheckpoints, resolveToolPath, restoreCheckpoint, snapshotFile } from "./checkpoints.ts";
 import { buildResumeText, loadAutoState, saveAutoStub, saveSummary } from "./resume.ts";
 import { addTags, clearTags, getTags, removeTags, renderTagsBlock, setTags } from "./tags.ts";
-import { EFFORT_HELP, EFFORT_LEVELS, describeEffort, effortForTurn, renderEffortBlock, setEffort } from "./effort.ts";
+import { EFFORT_HELP, EFFORT_LEVELS, describeEffort, effortForTurn, getEffort, renderEffortBlock, setEffort } from "./effort.ts";
+import {
+  applyProfile,
+  configureProfiles,
+  createProfile,
+  deleteProfile,
+  describeProfiles,
+  getActiveProfile,
+  listProfiles,
+  profileBadge,
+  renameProfile,
+  resolveProfileSlug,
+  saveProfile,
+} from "./profiles.ts";
 import { applyStyleSettingChange, buildStyleSettingItems, clearStyle, describeStyle, getStyles, listStyleDials, renderStyleBlock, setStyle } from "./style.ts";
 import { clearTask, listTasks, pollTask, startTask, stopTask, waitTask } from "./taskman.ts";
 import {
@@ -1296,12 +1309,40 @@ try {
   }
 } catch {}
 
+// pi's footer is the only persistent status surface (no header): one line,
+// sorted by key, next to the ghost line. The key is not rendered, so the text
+// names itself. Module scope, so early hooks can never hit a TDZ.
+const STATUS_KEY = "mykyagent";
+let statusUi: { setStatus?: (key: string, text: string | undefined) => void } | null = null;
+let lastStatusText = "";
+
+function statusText(): string {
+  const active = listProfiles().find((p) => p.slug === getActiveProfile());
+  const profile = active?.name || "no profile";
+  const effort = isFeatureEnabled("effort") ? `effort ${getEffort()}` : "effort off";
+  return `${profile} · ${effort}`;
+}
+
+/** Repaint the footer when the visible state changed. Cheap and idempotent. */
+function refreshStatus(ctx?: any): void {
+  if (ctx?.ui?.setStatus) statusUi = ctx.ui;
+  const ui = statusUi;
+  if (!ui?.setStatus) return;
+  const text = statusText();
+  if (text === lastStatusText) return;
+  lastStatusText = text;
+  try {
+    ui.setStatus(STATUS_KEY, text);
+  } catch {}
+}
+
 export default function (pi: any) {
   migrateLegacyMemory();
 
   // 1. Caveman System Prompt + Memory Injection
   pi.on("before_agent_start", async (event: any, ctx: any) => {
     noteCompletionRegistry(ctx);
+    refreshStatus(ctx);
     const seenModel = (ctx as any)?.model || ctx?.getModel?.();
     if (seenModel) activeModelInfo = seenModel;
 
@@ -1661,6 +1702,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
 
   pi.on("session_start", async (event: any, ctx: any) => {
     noteCompletionRegistry(ctx);
+    refreshStatus(ctx);
     const mode = getEffectiveMode();
     if (mode === "rp") {
       const cfg = loadModeConfig();
@@ -2207,7 +2249,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
   pi.registerTool({
     name: "todo",
     label: "Todo",
-    description: "Tiny task scratch: add/list/done/clear. Use for multi-step work so nothing drops.",
+    description: "Tiny task scratch: add/list/done/clear. Use for multi-step work so nothing drops. clear drops finished items (all:true wipes the list).",
     parameters: Type.Object({
       action: Type.String({ description: "add, list, done, or clear" }),
       text: Type.Optional(Type.String({ description: "Todo text (add) or match text (done)" })),
@@ -3079,6 +3121,100 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     },
   });
 
+  // --- Profiles: one switch for the settings you keep flipping --------------
+  // A profile is a snapshot of effort + toggles + persona + style + tags. The
+  // live stores stay the truth; switching saves the outgoing profile first, so
+  // tweaks made while it was active survive the round trip.
+  configureProfiles({ personaFile });
+
+  const refreshActiveTools = () => {
+    try {
+      const all = (pi.getAllTools?.() || []).map((t: any) => t.name).filter(Boolean);
+      if (!all.length) return;
+      const mode = getEffectiveMode();
+      const next = all.filter((t: string) => isToolEnabled(t, mode) && isToolAllowedInMode(t, mode));
+      pi.setActiveTools?.(next);
+    } catch {}
+  };
+
+  const syncFeatureKillswitches = () => {
+    try {
+      setWebDisabled(!isFeatureEnabled("web"));
+    } catch {}
+    try {
+      setMcpDisabled(!isFeatureEnabled("mcp"));
+    } catch {}
+  };
+
+  /** Shared by /profile and /mykyagent profile so the board and the command agree. */
+  const runProfileAction = async (args: string, ctx: any): Promise<void> => {
+    const raw = (args || "").trim();
+    const [head, ...restParts] = raw ? raw.split(/\s+/) : [""];
+    const verb = (head || "").toLowerCase();
+    const rest = restParts.join(" ").trim();
+    const notify = (msg: string, level: "info" | "error" = "info") => ctx.ui?.notify?.(msg, level);
+
+    try {
+      if (!raw || verb === "list" || verb === "status") {
+        notify(describeProfiles());
+        return;
+      }
+      if (verb === "new" || verb === "create" || verb === "add") {
+        if (!rest) return notify("Usage: /profile new <name>", "error");
+        const meta = createProfile(rest);
+        refreshStatus(ctx);
+        notify(
+          `Profile "${meta.name}" saved from the current settings and activated (${meta.sections.join(", ")}).\n` +
+            `Change anything now, then /profile save — or switch away and it is saved for you.`
+        );
+        return;
+      }
+      if (verb === "use" || verb === "switch" || verb === "load") {
+        if (!rest) return notify("Usage: /profile use <name>", "error");
+        const res = applyProfile(rest);
+        syncFeatureKillswitches();
+        refreshActiveTools();
+        refreshStatus(ctx);
+        notify(`Profile "${res.applied.name}" active.${res.saved ? ` Saved "${res.saved}" first.` : ""}`);
+        return;
+      }
+      if (verb === "save" || verb === "update") {
+        const meta = saveProfile(rest || undefined);
+        refreshStatus(ctx);
+        notify(`Profile "${meta.name}" updated from the current settings.`);
+        return;
+      }
+      if (verb === "delete" || verb === "rm" || verb === "remove") {
+        if (!rest) return notify("Usage: /profile delete <name>", "error");
+        const meta = deleteProfile(rest);
+        refreshStatus(ctx);
+        notify(`Profile "${meta.name}" deleted.${getActiveProfile() ? "" : " No profile is active now."}`);
+        return;
+      }
+      if (verb === "rename" || verb === "mv") {
+        const [from, ...toParts] = rest.split(/\s+/);
+        const to = toParts.join(" ").trim();
+        if (!from || !to) return notify("Usage: /profile rename <old> <new>", "error");
+        const meta = renameProfile(from, to);
+        refreshStatus(ctx);
+        notify(`Profile renamed to "${meta.name}".`);
+        return;
+      }
+      // Bare name: switch to it. Anything else gets the card.
+      if (!rest && resolveProfileSlug(head)) {
+        const res = applyProfile(head);
+        syncFeatureKillswitches();
+        refreshActiveTools();
+        refreshStatus(ctx);
+        notify(`Profile "${res.applied.name}" active.${res.saved ? ` Saved "${res.saved}" first.` : ""}`);
+        return;
+      }
+      notify(describeProfiles());
+    } catch (err: any) {
+      notify(err?.message || String(err), "error");
+    }
+  };
+
   // 10b. Effort Slash Command (/effort [low | high | max]) --------------------
   // Voice = persona. Depth = here. Kept separate so a terse caveman still
   // builds whole systems instead of a skeleton.
@@ -3099,6 +3235,11 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       }
       try {
         const v = setEffort(trimmed);
+        // Storing a level is an explicit ask: it turns the feature on. The
+        // default is OFF now, and a stored level with the feature off would
+        // look like it worked while injecting nothing.
+        setFeatureEnabled("effort", true);
+        refreshStatus(ctx);
         ctx.ui?.notify?.(`Effort: ${v}. Work standard injected — persona voice unchanged.`, "info");
       } catch (err: any) {
         ctx.ui?.notify?.(err.message, "error");
@@ -3106,7 +3247,44 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     },
   });
 
-  // 10c. Verification Pass (/verify [scope]) ----------------------------------
+  // 10c. Profiles (/profile — named snapshots of effort/toggles/persona/style/tags)
+  pi.registerCommand("profile", {
+    description: "Profiles: /profile [list | new <name> | use <name> | save [name] | delete <name> | rename <old> <new>]",
+    getArgumentCompletions: (argumentText: string) => {
+      const verbs = [
+        { value: "list", label: "list", description: "Show saved profiles and the active one" },
+        { value: "new", label: "new", description: "Snapshot the current settings as a new profile" },
+        { value: "use", label: "use", description: "Switch to a saved profile" },
+        { value: "save", label: "save", description: "Save the current settings into the active profile" },
+        { value: "delete", label: "delete", description: "Delete a saved profile" },
+        { value: "rename", label: "rename", description: "Rename a saved profile" },
+      ];
+      const nameOption = (p: any, prefix: string) => ({
+        value: prefix ? `${prefix} ${p.slug}` : p.slug,
+        label: p.name,
+        description: `${p.slug === getActiveProfile() ? "active · " : ""}${p.sections.length} sections`,
+      });
+      const endsWithSpace = /\s$/.test(argumentText);
+      const words = argumentText.trim() ? argumentText.trim().split(/\s+/) : [];
+      if (words.length === 0 || (words.length === 1 && !endsWithSpace)) {
+        const opts = [...verbs, ...listProfiles().map((p) => nameOption(p, ""))];
+        const filtered = words.length ? fuzzyFilter(opts, words[0], (o: any) => o.label) : verbs;
+        return filtered.length ? filtered : null;
+      }
+      const verb = words[0].toLowerCase();
+      const taken = words.slice(1).join(" ");
+      // rename takes two names; a name is already complete after one.
+      if (verb === "rename" && taken.includes(" ")) return null;
+      if (verb === "list" || verb === "new") return null;
+      const prefix = verb === "use" || verb === "save" || verb === "delete" ? verb : "";
+      const names = listProfiles().map((p) => nameOption(p, prefix));
+      const filtered = taken ? fuzzyFilter(names, taken, (n: any) => n.label) : names;
+      return filtered.length ? filtered : null;
+    },
+    handler: async (args: string, ctx: any) => runProfileAction(args, ctx),
+  });
+
+  // 10d. Verification Pass (/verify [scope]) ----------------------------------
   // Separate judge from author: one command kicks off an adversarial pass
   // (claims -> commands -> probes -> PASS/FAIL) instead of "looks good".
   pi.registerCommand("verify", {
@@ -3115,8 +3293,8 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       const scope = (args || "").trim() || "everything changed in this session";
       const text =
         `Verification pass on: ${scope}.\n` +
-        `Read the verification skill first (skill_read verification), then follow it exactly: ` +
-        `list the claims you made, run one command per claim, probe boundary/state/honesty, ` +
+        `Read the verification skill first (skill_read verification), then size the pass to this scope: ` +
+        `list the claims you made, run one command per claim, probe the risks that fit the change (boundary/state/honesty only where they apply — one probe is enough for a small fix), ` +
         `and give PASS / PARTIAL / FAIL / UNVERIFIED per claim with the deciding output line. ` +
         `Do not re-read your own code as evidence. No "should work".`;
       pi.sendUserMessage(text);
@@ -3920,6 +4098,79 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     },
   });
 
+  // 13b. Todos (/todo) ------------------------------------------------------
+  // The model gets the open list every turn and still forgets to close items;
+  // a cancelled run leaves them behind. This is the human's broom.
+  pi.registerCommand("todo", {
+    description: "Todos: /todo [list | add <text> | done <id|text> | clear | wipe] (wipe drops everything)",
+    getArgumentCompletions: (argumentText: string) => {
+      const verbs = [
+        { value: "list", label: "list", description: "Show open and finished todos" },
+        { value: "add", label: "add", description: "Add a todo" },
+        { value: "done", label: "done", description: "Mark one finished (id or text)" },
+        { value: "clear", label: "clear", description: "Drop finished todos" },
+        { value: "wipe", label: "wipe", description: "Drop every todo, open ones included" },
+      ];
+      const endsWithSpace = /\s$/.test(argumentText);
+      const words = argumentText.trim() ? argumentText.trim().split(/\s+/) : [];
+      if (words.length === 0 || (words.length === 1 && !endsWithSpace)) {
+        const filtered = words.length ? fuzzyFilter(verbs, words[0], (o: any) => o.label) : verbs;
+        return filtered.length ? filtered : null;
+      }
+      if (words[0].toLowerCase() === "done") {
+        const opts = openTodos().map((t) => ({ value: `done ${t.id}`, label: String(t.id), description: t.text }));
+        const taken = words.slice(1).join(" ");
+        const filtered = taken ? fuzzyFilter(opts, taken, (o: any) => o.description) : opts;
+        return filtered.length ? filtered : null;
+      }
+      return null;
+    },
+    handler: async (args: string, ctx: any) => {
+      const raw = (args || "").trim();
+      const notify = (msg: string, level: "info" | "error" = "info") => ctx.ui?.notify?.(msg, level);
+      const [head, ...restParts] = raw ? raw.split(/\s+/) : [""];
+      const verb = (head || "").toLowerCase();
+      const rest = restParts.join(" ").trim();
+      try {
+        if (!raw || verb === "list" || verb === "show") {
+          notify(describeTodos());
+          return;
+        }
+        if (verb === "add" || verb === "new") {
+          if (!rest) return notify("Usage: /todo add <text>", "error");
+          const item = addTodo(rest);
+          notify(`Todo ${item.id} added: ${item.text}`);
+          return;
+        }
+        if (verb === "done" || verb === "complete" || verb === "check") {
+          if (!rest) return notify("Usage: /todo done <id|text>", "error");
+          const item = doneTodo(rest);
+          notify(`Todo ${item.id} done: ${item.text}`);
+          return;
+        }
+        if (verb === "clear" || verb === "prune") {
+          const n = clearTodos(false);
+          notify(n ? `Dropped ${n} finished todo(s).` : "No finished todos to drop. Use /todo wipe to remove open ones too.");
+          return;
+        }
+        if (verb === "wipe" || verb === "reset" || verb === "flush") {
+          const n = clearTodos(true);
+          notify(n ? `Wiped all todos (${n} removed).` : "Todo list was already empty.");
+          return;
+        }
+        // Bare number: mark that todo done, because that is the obvious guess.
+        if (/^\d+$/.test(verb)) {
+          const item = doneTodo(verb);
+          notify(`Todo ${item.id} done: ${item.text}`);
+          return;
+        }
+        notify(describeTodos());
+      } catch (err: any) {
+        notify(err?.message || String(err), "error");
+      }
+    },
+  });
+
   pi.registerCommand("rewind", {
     description: "Undo file writes: /rewind lists checkpoints, /rewind [n] restores one",
     handler: async (args: string, ctx: any) => {
@@ -4175,7 +4426,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
 
   // 15. /mykyagent command: Universal Tool, Skill, and Feature Toggles
   pi.registerCommand("mykyagent", {
-    description: "Toggle tools, skills, and features (e.g. /mykyagent, /mykyagent status, /mykyagent toggle <name>)",
+    description: "Board: tools, skills, features, profiles (e.g. /mykyagent, /mykyagent status, /mykyagent profile use <name>)",
     getArgumentCompletions: (argumentText: string) => {
       const trimmed = argumentText.trim();
       const modeNow = getEffectiveMode();
@@ -4193,6 +4444,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
         { value: "enable", label: "enable", description: "Enable a tool, skill, or feature" },
         { value: "disable", label: "disable", description: "Disable a tool, skill, or feature" },
         { value: "reset", label: "reset", description: "Reset all toggles to default enabled" },
+        { value: "profile", label: "profile", description: "Profiles: list / new / use / save / delete / rename" },
       ];
 
       if (!argumentText.includes(" ")) {
@@ -4203,6 +4455,30 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       const [sub, ...restParts] = argumentText.split(/\s+/);
       const subLower = sub.toLowerCase();
       const rest = restParts.join(" ");
+
+      if (subLower === "profile") {
+        const help: Record<string, string> = {
+          list: "Show saved profiles and the active one",
+          new: "Snapshot the current settings as a new profile",
+          use: "Switch to a saved profile",
+          save: "Save the current settings into the active profile",
+          delete: "Delete a saved profile",
+          rename: "Rename a saved profile",
+        };
+        const verbs = ["list", "new", "save", "use", "delete", "rename"].map((v) => ({
+          value: `profile ${v}`,
+          label: v,
+          description: help[v],
+        }));
+        const names = listProfiles().map((p) => ({
+          value: `profile use ${p.slug}`,
+          label: p.name,
+          description: `${p.slug === getActiveProfile() ? "active" : "profile"} · ${p.sections.length} sections`,
+        }));
+        const opts = rest.trim() ? [...verbs, ...names] : verbs;
+        const filtered = rest.trim() ? fuzzyFilter(opts, rest.trim(), (o: any) => o.label) : opts;
+        return filtered.length ? filtered : null;
+      }
 
       if (["toggle", "on", "off", "enable", "disable"].includes(subLower)) {
         const itemCompletions = allItems.map((item) => ({
@@ -4233,17 +4509,30 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
             pi.setActiveTools?.(next);
           }
         } catch {}
+        refreshStatus(ctx);
       };
 
+      if (trimmed === "profile" || trimmed?.startsWith("profile ")) {
+        await runProfileAction((trimmed || "").slice("profile".length).trim(), ctx);
+        return;
+      }
+
       if (trimmed === "status") {
-        ctx.ui?.notify?.(formatTogglesSummary(discoveredSkills, registeredTools, { mode, isAllowed: allowed }), "info");
+        ctx.ui?.notify?.(
+          `Profile: ${profileBadge()}\nEffort: ${isFeatureEnabled("effort") ? getEffort() : "off"} (${isFeatureEnabled("effort") ? "/effort to change" : "/effort <level> turns it on"})\n\n` +
+            formatTogglesSummary(discoveredSkills, registeredTools, { mode, isAllowed: allowed }),
+          "info"
+        );
         return;
       }
 
       if (trimmed === "reset") {
         resetAllToggles();
         applyToolChanges();
-        ctx.ui?.notify?.("All tools, skills, and features have been reset to ENABLED (all modes).", "info");
+        ctx.ui?.notify?.(
+          `All tools, skills, and features have been reset to their defaults (all modes). Profiles are untouched — /profile use <name> to restore one.`,
+          "info"
+        );
         return;
       }
 
@@ -4288,12 +4577,22 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       // Interactive UI mode (no args provided)
       if (ctx.ui?.custom && typeof getSettingsListTheme === "function") {
         const allItems = getAllToggleableItems(discoveredSkills, registeredTools, { mode, isAllowed: allowed });
-        const settingItems: SettingItem[] = allItems.map((item) => ({
-          id: item.id,
-          label: `${item.name} (${item.category})`,
-          currentValue: item.enabled ? "enabled" : "disabled",
-          values: ["enabled", "disabled"],
-        }));
+        const activeProfileName = listProfiles().find((p) => p.slug === getActiveProfile())?.name;
+        const settingItems: SettingItem[] = [
+          {
+            id: "profile:__save__",
+            label: `profile: save current${activeProfileName ? ` into "${activeProfileName}"` : " (no active profile)"}`,
+            currentValue: "save",
+            values: ["save"],
+          },
+          { id: "profile:__list__", label: "profile: list / switch (/profile)", currentValue: "list", values: ["list"] },
+          ...allItems.map((item) => ({
+            id: item.id,
+            label: `${item.name} (${item.category})`,
+            currentValue: item.enabled ? "enabled" : "disabled",
+            values: ["enabled", "disabled"],
+          })),
+        ];
 
         await ctx.ui.custom(
           (tui: any, theme: any, _kb: any, done: (val: any) => void) => {
@@ -4302,8 +4601,10 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
               new (class {
                 render(_width: number) {
                   return [
-                    theme.fg("accent", theme.bold(`MykyAgent [${mode} mode]: Tool, Skill & Feature Toggles`)),
+                    theme.fg("accent", theme.bold(`MykyAgent [${mode} mode]: tools, skills, features & profiles`)),
+                    theme.fg("muted", `Profile: ${profileBadge()}  ·  Effort: ${isFeatureEnabled("effort") ? getEffort() : "off"}${isFeatureEnabled("effort") ? "" : " (opt-in)"}`),
                     theme.fg("muted", "Arrow keys navigate • Enter/Space/Left/Right toggle • Esc closes"),
+                    theme.fg("muted", "/profile new <name> | use <name> | save — or /mykyagent profile"),
                     "",
                   ];
                 }
@@ -4316,6 +4617,14 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
               Math.min(settingItems.length + 3, 18),
               getSettingsListTheme(),
               (id: string, newValue: string) => {
+                if (id === "profile:__save__") {
+                  void runProfileAction("save", ctx);
+                  return;
+                }
+                if (id === "profile:__list__") {
+                  void runProfileAction("list", ctx);
+                  return;
+                }
                 const enabled = newValue === "enabled";
                 const colon = id.indexOf(":");
                 const cat = colon > 0 ? id.slice(0, colon) : "";
@@ -4366,7 +4675,11 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       // Fallback: ctx.ui.select
       if (ctx.ui?.select) {
         const allItems = getAllToggleableItems(discoveredSkills, registeredTools, { mode, isAllowed: allowed });
+        const activeName = listProfiles().find((p) => p.slug === getActiveProfile())?.name;
         const options = [
+          `📁 Profiles: ${profileBadge()}`,
+          ...(activeName ? [`💾 Save current settings into "${activeName}"`] : []),
+          "🆕 New profile from current settings",
           ...allItems.map(
             (i) => `${i.enabled ? "🟢 [ON] " : "🔴 [OFF]"} [${i.category.toUpperCase()}] ${i.name} - ${i.description}`
           ),
@@ -4375,6 +4688,31 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
         ];
         const selected = await ctx.ui.select(`Toggle MykyAgent Items [${mode} mode]:`, options);
         if (!selected || selected.startsWith("❌")) return;
+        if (selected.startsWith("📁")) {
+          const names = listProfiles();
+          if (!names.length) {
+            ctx.ui?.notify?.("No profiles yet — /profile new <name> snapshots the current settings.", "info");
+            return;
+          }
+          const pick = await ctx.ui.select(
+            `Switch profile (active: ${activeName || "none"}):`,
+            [...names.map((p) => `${p.slug === getActiveProfile() ? "●" : "○"} ${p.name}`), "❌ Close"]
+          );
+          const chosen = names.find((p) => pick?.includes(p.name));
+          if (!pick || pick.startsWith("❌") || !chosen) return;
+          await runProfileAction(`use ${chosen.slug}`, ctx);
+          return;
+        }
+        if (selected.startsWith("💾")) {
+          await runProfileAction("save", ctx);
+          return;
+        }
+        if (selected.startsWith("🆕")) {
+          const name = await ctx.ui.input?.("Profile name:", "e.g. story-night");
+          if (!name || !name.trim()) return;
+          await runProfileAction(`new ${name.trim()}`, ctx);
+          return;
+        }
         if (selected.startsWith("🔄")) {
           resetAllToggles();
           applyToolChanges();

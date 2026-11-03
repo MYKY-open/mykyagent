@@ -25,6 +25,11 @@ const t = (name: string, ok: boolean, extra = "") => {
 const effort = await import("./effort.ts");
 const toggles = await import("./toggles.ts");
 
+// The feature is opt-in: nothing is injected until the user turns it on.
+t("effort feature is OFF by default", toggles.isFeatureEnabled("effort") === false);
+t("feature off: stored max injects nothing", effort.effortForTurn({ prompt: "fix it", mode: "code" }) === null);
+toggles.setFeatureEnabled("effort", true);
+
 // --- levels and default -----------------------------------------------------
 t("three levels: low | high | max", effort.EFFORT_LEVELS.join(",") === "low,high,max", effort.EFFORT_LEVELS.join(","));
 t("default is high", effort.getEffort() === "high");
@@ -66,10 +71,13 @@ t("prefix does not change stored level", effort.getEffort() === "max");
 t("no prompt (custom run) uses stored level", effort.effortForTurn({ mode: "code" }) === "max");
 
 rmSync(process.env.MYKYAGENT_EFFORT_FILE!, { force: true });
+t("rp scene: no stored level, no block", effort.effortForTurn({ prompt: "*she looks up*", mode: "rp" }) === null);
 t("rp-creator quiet with default (no stored level)", effort.effortForTurn({ prompt: "hi", mode: "rp-creator" }) === null);
 t("rp-creator prefix still speaks", effort.effortForTurn({ prompt: "high: score the scene", mode: "rp-creator" }) === "high");
 effort.setEffort("max");
-t("rp-creator speaks once explicitly stored", effort.effortForTurn({ prompt: "hi", mode: "rp-creator" }) === "max");
+t("stored max never leaks into an rp scene", effort.effortForTurn({ prompt: "*she looks up*", mode: "rp" }) === null, String(effort.effortForTurn({ prompt: "hi", mode: "rp" })));
+t("stored max never leaks into rp-creator", effort.effortForTurn({ prompt: "hi", mode: "rp-creator" }) === null, String(effort.effortForTurn({ prompt: "hi", mode: "rp-creator" })));
+t("rp-creator still takes a typed prefix", effort.effortForTurn({ prompt: "max: build the cast", mode: "rp-creator" }) === "max");
 t("code mode never quiet", effort.effortForTurn({ prompt: "hi", mode: "code" }) === "max");
 
 toggles.setFeatureEnabled("effort", false);
@@ -86,11 +94,14 @@ t("low block: plan only for multi-step (no contradiction with base rule)", low.i
 t("low block: one command proves it", low.includes("Run one command"));
 t("high block demands done-criteria", high.includes("done-criteria"));
 t("high block bans literal compliance", high.includes("find it and change the code"));
-t("high block demands adversarial probe", high.includes("name 3 ways it could break"));
+t("high block demands adversarial probe, sized to the change", high.includes("Scale the proof to the change") && high.includes("1-2 probes"));
 t("high block: bug reports reproduced before fixing", high.includes("reproduce the exact symptom") && high.includes("watch it fail"));
 t("high block: per-ask DONE / NOT DONE line", high.includes("DONE with the command") && high.includes("NOT DONE"));
 t("high block demands evidence", high.includes("Never claim success without evidence"));
 t("max block adds tests and manual pass", max.includes("Write real tests") && max.includes("Manual pass"));
+t("max block sizes the ceremony to the change", max.includes("Size the ceremony to the change") && max.includes("question or explanation -> just answer it"));
+t("max block bans re-verifying untouched code", max.includes("Do not re-verify what you did not touch"));
+t("max report scales down for a small fix", max.includes("for a small fix, one line with the command that proved it"));
 t("max block reproduces bugs first", max.includes("reproduce the exact symptom"));
 t("max block validates at boundaries only", max.includes("Validate at boundaries"));
 t("max block bans compat shims", max.includes("no compat shims"));
@@ -105,10 +116,11 @@ t("card marks default", defaultCard.startsWith("Effort: high (default)"), defaul
 t("card lists every level", effort.EFFORT_LEVELS.every((l) => defaultCard.includes(`• ${l}`)));
 t("card marks current level", /• high {2}← current/.test(defaultCard));
 t("card explains the prefix", defaultCard.includes("starting it with low: / high: / max:"));
+t("card scopes effort to code mode", defaultCard.includes("Code mode only: rp scenes never carry a level"));
 effort.setEffort("low");
 t("card shows stored level, not default", effort.describeEffort().split("\n")[0] === "Effort: low", effort.describeEffort().split("\n")[0]);
 toggles.setFeatureEnabled("effort", false);
-t("card says when the feature is disabled", effort.describeEffort().includes("feature disabled"));
+t("card says when the feature is disabled", effort.describeEffort().includes("feature OFF, /effort <level> turns it on"));
 toggles.setFeatureEnabled("effort", true);
 
 rmSync(DIR, { recursive: true, force: true });

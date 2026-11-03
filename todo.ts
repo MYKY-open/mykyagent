@@ -90,8 +90,25 @@ export function todoBlock(): string {
   const open = openTodos();
   if (open.length === 0) return "";
   const lines = open.slice(0, TODO_BLOCK_ITEMS).map((t) => `${t.id}. ${t.text}`);
-  let block = `Open todos (${open.length}):\n${lines.join("\n")}\nMark finished work via the todo tool; add new steps as they appear.`;
+  let block = `Open todos (${open.length}):\n${lines.join("\n")}\nMark finished work via the todo tool; add new steps as they appear; wipe the list when the task is cancelled or done.`;
   if (block.length > TODO_BLOCK_CHARS) block = block.slice(0, TODO_BLOCK_CHARS) + "…";
   if (open.length > TODO_BLOCK_ITEMS) block += ` (+${open.length - TODO_BLOCK_ITEMS} more — use the todo tool to list all)`;
   return block;
+}
+
+/** Human-facing list for /todo: open and finished, with the commands that act on them. */
+export function describeTodos(): string {
+  const items = loadTodos();
+  if (items.length === 0) {
+    return "Todos: none.\nAdd one with /todo add <text> — the model also gets the list every turn until it is wiped.";
+  }
+  const open = items.filter((t) => !t.done).length;
+  const shown = items.slice(0, 30).map((t) => `${t.done ? "[x]" : "[ ]"} ${t.id}. ${t.text}`);
+  if (items.length > shown.length) shown.push(`… +${items.length - shown.length} more`);
+  return [
+    `Todos: ${open} open · ${items.length - open} done`,
+    ...shown,
+    "",
+    "/todo add <text> | done <id|text> | clear (drop finished) | wipe (drop everything)",
+  ].join("\n");
 }

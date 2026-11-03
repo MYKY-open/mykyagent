@@ -114,6 +114,8 @@ t("summary contains header and sections", summary.includes("Features:") && summa
 // 9. Opt-in features default off
 resetAllToggles();
 t("tool_recovery defaults OFF", isFeatureEnabled("tool_recovery") === false);
+t("effort defaults OFF", isFeatureEnabled("effort") === false);
+t("effort opt-in enables", (setFeatureEnabled("effort", true), isFeatureEnabled("effort") === true));
 t("regular features still default ON", isFeatureEnabled("memory") === true);
 setFeatureEnabled("tool_recovery", true);
 t("tool_recovery opt-in enables", isFeatureEnabled("tool_recovery") === true);

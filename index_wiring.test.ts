@@ -17,6 +17,9 @@ process.env.MYKYAGENT_TOGGLES_FILE = join(DIR, "toggles.json");
 process.env.MYKYAGENT_MODE_FILE = join(DIR, "mode.json");
 process.env.MYKYAGENT_EFFORT_FILE = join(DIR, "effort.json");
 process.env.MYKYAGENT_STYLE_FILE = join(DIR, "style.json");
+process.env.MYKYAGENT_TAGS_FILE = join(DIR, "tags.json");
+process.env.MYKYAGENT_PROFILES_DIR = join(DIR, "profiles");
+process.env.MYKYAGENT_PROFILE_FILE = join(DIR, "profile.json");
 // Keep the startup auto-reconnect pointed at the empty temp config.
 
 const ext = (await import("./index.ts")).default;
@@ -241,6 +244,8 @@ t("reset restores tool", isToolEnabled("bash") === true);
 // --- 12. effort levels (/effort) -------------------------------------------
 {
   const { setEffort } = await import("./effort.ts");
+  const { setFeatureEnabled: setFeatureEarly } = await import("./toggles.ts");
+  setFeatureEarly("effort", true); // opt-in feature: tests opt in
   t("/effort registered as a user command", !!commands["effort"]);
   const ec = commands["effort"].getArgumentCompletions("");
   t(
@@ -271,6 +276,11 @@ t("reset restores tool", isToolEnabled("bash") === true);
   t("/verify demands a PASS/FAIL verdict", vmsg.includes("PASS / PARTIAL / FAIL / UNVERIFIED"));
   t("/verify carries the scope", vmsg.includes("the effort dial"));
   t("/verify bans gut-feel proof", vmsg.includes('No "should work"'));
+  t("/verify sizes the pass to the scope", vmsg.includes("size the pass to this scope"));
+  // Storing a level is an explicit ask: it turns the opt-in feature on.
+  setFeatureEarly("effort", false);
+  await commands["effort"].handler("high", { cwd: DIR, ui: { notify: () => {} } });
+  t("/effort <level> enables the feature", (await import("./toggles.ts")).isFeatureEnabled("effort") === true);
 
   // --- 12b. personas -------------------------------------------------------
   {
@@ -316,6 +326,108 @@ t("reset restores tool", isToolEnabled("bash") === true);
   t("feature off injects no effort header", !/Effort:/.test(offPrompt));
   t("feature off keeps persona + goal", offPrompt.includes("Goal: do the user task completely."));
   setFeatureEnabled("effort", true);
+
+  // RP / Story Studio prose never carries the stored build standard.
+  const { setMode } = await import("./mode.ts");
+  setEffort("max");
+  setMode("rp");
+  const rpPlain: string = (await hooks["before_agent_start"]({ messageType: "user", prompt: "*she looks up*" }, { cwd: DIR }))?.systemPrompt || "";
+  t("stored max does not reach an rp turn", !rpPlain.includes("Work standard (effort="), rpPlain.slice(0, 160));
+  t("rp turn carries no effort header", !/Effort: (low|high|max)\./.test(rpPlain));
+  const rpTyped: string = (await hooks["before_agent_start"]({ messageType: "user", prompt: "max: write the duel" }, { cwd: DIR }))?.systemPrompt || "";
+  t("rp turn ignores even a typed prefix (own prompt)", !rpTyped.includes("Work standard (effort="));
+  setMode("rp-creator");
+  const creatorPlain: string = (await hooks["before_agent_start"]({ messageType: "user", prompt: "draft a rival" }, { cwd: DIR }))?.systemPrompt || "";
+  t("stored max does not reach rp-creator", !creatorPlain.includes("Work standard (effort="), creatorPlain.slice(0, 160));
+  const creatorTyped: string = (await hooks["before_agent_start"]({ messageType: "user", prompt: "high: draft a rival" }, { cwd: DIR }))?.systemPrompt || "";
+  t("rp-creator honors a typed prefix", creatorTyped.includes("Work standard (effort=high)"));
+  setMode("code");
+  setEffort("high");
+
+  // --- 12c. profiles (/profile, /mykyagent profile) ------------------------
+  {
+    const { getEffort, setEffort: setEffort2 } = await import("./effort.ts");
+    const { listProfiles, getActiveProfile } = await import("./profiles.ts");
+    setFeatureEarly("effort", true);
+    const notes: string[] = [];
+    const statuses: { key: string; text: string }[] = [];
+    const pctx = {
+      cwd: DIR,
+      ui: {
+        notify: (m: string) => notes.push(m),
+        setStatus: (key: string, text: string) => statuses.push({ key, text }),
+      },
+    };
+    t("/profile registered as a user command", !!commands["profile"]);
+    t("/mykyagent exposes the profile subcommand", commands["mykyagent"].getArgumentCompletions("pro").some((c: any) => c.value === "profile"));
+
+    setEffort2("max");
+    await commands["profile"].handler("new Quest Night", pctx);
+    t("/profile new creates and activates", getActiveProfile() === "quest-night" && notes.at(-1)!.includes("activated"));
+    t("profile snapshot stores effort", listProfiles()[0].effort === "max");
+
+    const verbs = commands["profile"].getArgumentCompletions("");
+    t("/profile completions list every verb", ["list", "new", "use", "save", "delete", "rename"].every((v) => verbs.some((c: any) => c.value === v)));
+    const byName = commands["profile"].getArgumentCompletions("use ");
+    t("/profile completions offer saved profiles", byName.some((c: any) => c.value === "use quest-night"));
+
+    setEffort2("low");
+    await commands["profile"].handler("new Ship Mode", pctx);
+    t("second profile snapshots low", listProfiles().some((p) => p.slug === "ship-mode" && p.effort === "low"));
+
+    await commands["profile"].handler("use Quest Night", pctx);
+    t("/profile use switches the live effort", getEffort() === "max");
+    t("footer line carries profile + effort", statuses.at(-1)?.key === "mykyagent" && statuses.at(-1)!.text.includes("Quest Night") && statuses.at(-1)!.text.includes("effort max"), JSON.stringify(statuses.at(-1)));
+
+    // Self-heal on the next turn, without a command: change effort behind the
+    // footer's back and let before_agent_start repaint it.
+    setEffort2("low");
+    await hooks["before_agent_start"]({ messageType: "user", prompt: "hi" }, pctx);
+    t("footer repaints on the next turn", statuses.at(-1)!.text.includes("effort low"), JSON.stringify(statuses.at(-1)));
+    const before = statuses.length;
+    await hooks["before_agent_start"]({ messageType: "user", prompt: "hi" }, pctx);
+    t("footer does not repaint unchanged state", statuses.length === before, `${before} -> ${statuses.length}`);
+    await commands["profile"].handler("use quest night", pctx);
+    t("footer repaints after a profile switch", statuses.at(-1)!.text.includes("Quest Night") && statuses.at(-1)!.text.includes("effort max"), JSON.stringify(statuses.at(-1)));
+    t("/profile use saved the outgoing profile", listProfiles().find((p) => p.slug === "ship-mode")?.effort === "low");
+
+    await commands["profile"].handler("save", pctx);
+    t("/profile save writes the active profile", listProfiles().find((p) => p.slug === "quest-night")?.effort === "max");
+
+    // End-to-end: the restored level reaches the prompt, and toggles come back too.
+    const restoredPrompt: string = (await hooks["before_agent_start"]({ messageType: "user", prompt: "go" }, { cwd: DIR }))?.systemPrompt || "";
+    t("restored effort reaches the prompt", restoredPrompt.includes("Work standard (effort=max)"), restoredPrompt.slice(0, 120));
+    setFeatureEarly("style", false);
+    await commands["profile"].handler("save", pctx);
+    setFeatureEarly("style", true);
+    await commands["profile"].handler("use quest-night", pctx);
+    const { isFeatureEnabled: isFeat } = await import("./toggles.ts");
+    t("restored toggles reach the live store", isFeat("style") === false);
+    setFeatureEarly("style", true);
+    await commands["profile"].handler("save", pctx);
+
+    // Routing through the board keeps one implementation.
+    notes.length = 0;
+    await commands["mykyagent"].handler("profile list", pctx);
+    t("/mykyagent profile list shows the card", notes.join("\n").includes("Quest Night") && notes.join("\n").includes("active"));
+
+    notes.length = 0;
+    await commands["mykyagent"].handler("profile use ship mode", pctx);
+    t("/mykyagent profile use switches", getEffort() === "low");
+
+    notes.length = 0;
+    await commands["profile"].handler("delete Ship Mode", pctx);
+    t("/profile delete removes it", !listProfiles().some((p) => p.slug === "ship-mode") && notes.at(-1)!.includes("deleted"), notes.at(-1));
+
+    notes.length = 0;
+    await commands["profile"].handler("use nope", pctx);
+    t("/profile use unknown reports an error, no throw", notes.at(-1)!.includes("No profile named"));
+
+    // Status card names the profile and the effort state.
+    notes.length = 0;
+    await commands["mykyagent"].handler("status", pctx);
+    t("status card shows profile + effort", notes.join("\n").includes("Profile:") && notes.join("\n").includes("Effort:"));
+  }
 }
 
 // --- 13. research bundle rendering (helper output contract) ----------------
