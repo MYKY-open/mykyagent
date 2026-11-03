@@ -19,6 +19,8 @@ process.env.MYKYAGENT_EFFORT_FILE = join(DIR, "effort.json");
 process.env.MYKYAGENT_STYLE_FILE = join(DIR, "style.json");
 process.env.MYKYAGENT_TAGS_FILE = join(DIR, "tags.json");
 process.env.MYKYAGENT_PROFILES_DIR = join(DIR, "profiles");
+process.env.MYKYAGENT_MEMORY_DIR = join(DIR, "memory");
+process.env.MYKYAGENT_TASKS_DIR = join(DIR, "tasks");
 process.env.MYKYAGENT_PROFILE_FILE = join(DIR, "profile.json");
 // Keep the startup auto-reconnect pointed at the empty temp config.
 
@@ -42,12 +44,21 @@ const commands: Record<string, any> = {};
 const hooks: Record<string, any> = {};
 let activeTools: string[] = [];
 const sentMessages: string[] = [];
+// pi defines a tool for every platform: powershell on Linux is a definition
+// that cannot run, plus one hidden tool that must never be listed.
+const ALL_TOOLS = [
+  { name: "bash", exposure: "direct" },
+  { name: "read", exposure: "direct" },
+  { name: "powershell", exposure: "direct" },
+  { name: "ghostpaneltool", exposure: "hidden" },
+];
 const pi: any = {
   on: (n: string, f: any) => (hooks[n] = f),
   sendUserMessage: (content: string) => sentMessages.push(content),
   registerTool: (def: any) => (tools[def.name] = def),
   registerCommand: (n: string, def: any) => (commands[n] = def),
   getActiveTools: () => [...activeTools],
+  getAllTools: () => [...ALL_TOOLS],
   setActiveTools: (names: string[]) => (activeTools = [...names]),
 };
 
@@ -62,6 +73,18 @@ activeTools = ["bash", "read"]; // pi fresh-session-ish snapshot
 await hooks["before_agent_start"]({}, { cwd: DIR });
 t("merge adds mcp builtins", activeTools.includes("mcp_connect") && activeTools.includes("mcp_list"), activeTools.join(","));
 t("merge keeps pi tools", activeTools.includes("bash") && activeTools.includes("read"));
+
+// --- 2b. skills master also drops the skill_read tool -----------------------
+{
+  const { setSkillsMasterEnabled } = await import("./toggles.ts");
+  activeTools = ["bash", "skill_read"];
+  setSkillsMasterEnabled(false);
+  await hooks["before_agent_start"]({}, { cwd: DIR });
+  t("skills master off removes skill_read from the toolset", !activeTools.includes("skill_read") && activeTools.includes("bash"), activeTools.join(","));
+  setSkillsMasterEnabled(true);
+  await hooks["before_agent_start"]({}, { cwd: DIR });
+  t("skills master on restores skill_read", activeTools.includes("skill_read"), activeTools.join(","));
+}
 
 // --- 3. killswitch strips every mcp_* tool ----------------------------------
 const { setMcpDisabled, mcpDisabled } = await import("./mcp.ts");
@@ -377,7 +400,7 @@ t("reset restores tool", isToolEnabled("bash") === true);
 
     await commands["profile"].handler("use Quest Night", pctx);
     t("/profile use switches the live effort", getEffort() === "max");
-    t("footer line carries profile + effort", statuses.at(-1)?.key === "mykyagent" && statuses.at(-1)!.text.includes("Quest Night") && statuses.at(-1)!.text.includes("effort max"), JSON.stringify(statuses.at(-1)));
+    t("footer line carries profile + effort", statuses.at(-1)?.key === "mykyagent" && statuses.at(-1)!.text.includes("Quest Night") && statuses.at(-1)!.text.includes("max"), JSON.stringify(statuses.at(-1)));
 
     // Self-heal on the next turn, without a command: change effort behind the
     // footer's back and let before_agent_start repaint it.
@@ -388,7 +411,7 @@ t("reset restores tool", isToolEnabled("bash") === true);
     await hooks["before_agent_start"]({ messageType: "user", prompt: "hi" }, pctx);
     t("footer does not repaint unchanged state", statuses.length === before, `${before} -> ${statuses.length}`);
     await commands["profile"].handler("use quest night", pctx);
-    t("footer repaints after a profile switch", statuses.at(-1)!.text.includes("Quest Night") && statuses.at(-1)!.text.includes("effort max"), JSON.stringify(statuses.at(-1)));
+    t("footer repaints after a profile switch", statuses.at(-1)!.text.includes("Quest Night") && statuses.at(-1)!.text.includes("max"), JSON.stringify(statuses.at(-1)));
     t("/profile use saved the outgoing profile", listProfiles().find((p) => p.slug === "ship-mode")?.effort === "low");
 
     await commands["profile"].handler("save", pctx);
@@ -427,7 +450,152 @@ t("reset restores tool", isToolEnabled("bash") === true);
     notes.length = 0;
     await commands["mykyagent"].handler("status", pctx);
     t("status card shows profile + effort", notes.join("\n").includes("Profile:") && notes.join("\n").includes("Effort:"));
+
+    // Platform/runnability filter: powershell and hidden tools never appear.
+    t("status card hides powershell off Windows", process.platform === "win32" || !notes.join("\n").includes("powershell"), notes.join("\n").slice(0, 200));
+    t("status card hides hidden-exposure tools", !notes.join("\n").includes("ghostpaneltool"));
+
+    // A profile switch must not activate tools that were not active.
+    activeTools = ["bash", "read"];
+    const beforeSwitch = [...activeTools];
+    await commands["profile"].handler("use quest-night", pctx);
+    t("profile switch does not activate dormant definitions", !activeTools.includes("powershell") && !activeTools.includes("ghostpaneltool"), activeTools.join(","));
+    t("profile switch keeps the active tools it had", beforeSwitch.every((n) => activeTools.includes(n)), activeTools.join(","));
   }
+}
+
+// --- 12d. status footer + board colors -------------------------------------
+{
+  const { fitFooterLine } = await import("./index.ts");
+  const { visibleWidth } = await import("@earendil-works/pi-tui");
+
+  // Same line as the model; the suffix is self-contained, so ANSI in the line
+  // can neither bleed into it nor lose its own color.
+  const line = "↑1k ↓2k 4%/200k" + " ".repeat(20) + "deepseek-v4.1-flash";
+  const out = fitFooterLine(line, " · Story Night · effort max", 60);
+  t("footer keeps stats, model and status on one line", visibleWidth(out) <= 60 && out.includes("Story Night"), `${visibleWidth(out)}: ${JSON.stringify(out)}`);
+  t("footer suffix comes last", out.endsWith(" · Story Night · effort max"));
+  // The inner footer is re-rendered at (width - suffix), so the model is laid
+  // out inside that room by pi itself; the helper only appends at the end.
+  const roomy = fitFooterLine("↑1k ↓2k 4%/200k      model", " · x", 40);
+  t("footer leaves the model alone", roomy.includes("model") && roomy.endsWith(" · x"), JSON.stringify(roomy));
+  t("footer appends when there is room", fitFooterLine("hi", " · x", 20) === "hi · x");
+  t("footer grows an empty line", fitFooterLine("", " status", 20).includes("status"));
+  const narrow = fitFooterLine("↑1k ↓2k" + " ".repeat(30) + "model", " · Story Night · effort max", 20);
+  t("footer keeps the suffix on a narrow terminal", narrow.endsWith(" · Story Night · effort max"), JSON.stringify(narrow));
+  const { insertStatusBeforeModel } = await import("./index.ts");
+  const base = "↑1k ↓2k 45%/200k" + " ".repeat(30) + "(prov) model • high";
+  const ins = insertStatusBeforeModel(base, " · Story Night · max");
+  t("footer status lands before the model", ins !== null && ins.indexOf("Story Night") < ins.indexOf("(prov) model"), JSON.stringify(ins));
+  t("footer keeps its exact width when inserting", ins !== null && visibleWidth(ins) === visibleWidth(base), `${ins ? visibleWidth(ins) : "-"} vs ${visibleWidth(base)}`);
+  t("footer leaves a space before the model", ins !== null && / max +\(prov\) model/.test(ins), JSON.stringify(ins));
+  t("footer refuses when the padding is too small", insertStatusBeforeModel("stats  model", " · Story Night · max") === null);
+  const ansi = fitFooterLine("\u001b[38;5;245mstats      model\u001b[39m", " · \u001b[38;5;245mdim x\u001b[39m", 40);
+  t("footer does not re-color the model line", ansi.includes("model") && ansi.endsWith("\u001b[39m"), JSON.stringify(ansi));
+
+  // Footer install: one custom footer, status rendered, repaint on change only.
+  const statuses: { text?: string }[] = [];
+  let renders = 0;
+  let installed = 0;
+  let factory: any = null;
+  const footerUi = {
+    notify: () => {},
+    setStatus: (_k: string, text: string) => statuses.push({ text }),
+    setFooter: (f: any) => {
+      factory = f;
+      installed++;
+    },
+    requestRender: () => {
+      renders++;
+    },
+  };
+  const fakeTheme = { fg: (_t: string, s: string) => `«${s}»`, bold: (s: string) => `*${s}*` };
+  await hooks["session_start"]({}, { cwd: DIR, ui: footerUi });
+  t("custom footer installed once", installed === 1 && typeof factory === "function");
+  const comp = factory({ requestRender: () => renders++ }, fakeTheme, {});
+  const lines: string[] = comp.render(60);
+  t("footer renders our state (fallback when pi internals missing)", lines.join("\n").includes("effort"), JSON.stringify(lines));
+  t("footer never throws with a shim session", Array.isArray(lines) && lines.length >= 1);
+
+  const before = renders;
+  await hooks["before_agent_start"]({ messageType: "user", prompt: "hi" }, { ui: footerUi, cwd: DIR });
+  t("footer does not repaint unchanged state", renders === before, `${before} -> ${renders}`);
+  const { setEffort: setEffort3 } = await import("./effort.ts");
+  setEffort3("low");
+  await hooks["before_agent_start"]({ messageType: "user", prompt: "hi" }, { ui: footerUi, cwd: DIR });
+  t("footer repaints when effort changes", renders > before, `${before} -> ${renders}`);
+  t("footer does not fall back to a second status line", statuses.length === 0, JSON.stringify(statuses));
+}
+
+// --- 12e. board colors ------------------------------------------------------
+{
+  const rendered: string[] = [];
+  const fakeTheme = { fg: (token: string, s: string) => `«${token}:${s}»`, bold: (s: string) => `*${s}*` };
+  const boardCtx = {
+    cwd: DIR,
+    ui: {
+      notify: () => {},
+      custom: (f: any) => {
+        const comp = f({ requestRender: () => {} }, fakeTheme, null, () => {});
+        rendered.push(...comp.render(120));
+      },
+    },
+  };
+  await commands["mykyagent"].handler("", boardCtx);
+  const board = rendered.join("\n");
+  t("board paints enabled green", board.includes("«success:✓ enabled»"), board.slice(0, 160));
+  t("board paints disabled red", board.includes("«error:✗ disabled»"));
+  t("board header counts on and off in color", /«success:\d+ on»/.test(board) && /«error:\d+ off»/.test(board));
+  t("board marks categories with glyphs", board.includes("⚙") && board.includes("📁"));
+}
+
+// --- 12f. merged memory tool ------------------------------------------------
+{
+  const { getAllToggleableItems } = await import("./toggles.ts");
+  t("one memory tool, old names gone", !!tools.memory && !tools.memory_read && !tools.memory_write && !tools.memory_list && !tools.memory_edit);
+  t("memory tool is a single board row", getAllToggleableItems([], ["memory"]).filter((i) => i.name === "memory").length === 2);
+  const call = (args: any) => tools.memory.execute("x", args);
+  const text = (r: any) => String(r?.content?.[0]?.text || "");
+
+  const w = await call({ action: "write", name: "alpha", summary: "alpha summary", body: "alpha body" });
+  t("memory write saves a topic", text(w).includes("Saved") && text(w).includes("alpha"));
+  t("memory read returns the body", text(await call({ action: "read", name: "alpha" })).includes("alpha body"));
+  t("memory list shows the topic", text(await call({ action: "list" })).includes("alpha"));
+  t("memory search finds body text", text(await call({ action: "search", query: "alpha body" })).includes("alpha"));
+  t("memory edit appends", text(await call({ action: "edit", name: "alpha", body: "more", mode: "append" })).includes("Updated"));
+  t("memory rename works", text(await call({ action: "rename", name: "alpha", new_name: "beta" })).includes("beta"));
+  t("memory move works", text(await call({ action: "move", name: "beta", target: "global" })).includes("beta"));
+
+  const syn = await call({ action: "save", name: "gamma", summary: "gamma", body: "g" });
+  t("memory action synonyms work", text(syn).includes("Saved"));
+  t("memory read missing topic errors", (await call({ action: "read", name: "nope" })).isError === true);
+  t("memory read without a name errors", (await call({ action: "read" })).isError === true);
+  t("memory forget deletes", text(await call({ action: "forget", name: "beta" })).includes("Deleted"));
+  t("memory forget missing errors", (await call({ action: "forget", name: "beta" })).isError === true);
+  t("memory unknown action falls back to list", text(await call({ action: "zzz" })).includes("gamma"));
+}
+
+// --- 12g. /tasks clear ------------------------------------------------------
+{
+  const notes: string[] = [];
+  const tctx = { cwd: DIR, ui: { notify: (m: string) => notes.push(m) } };
+  const T = await import("./taskman.ts");
+  // One real task, finished immediately; one real task, still alive.
+  const doneId = T.startTask("true", "finished-probe");
+  for (let i = 0; i < 40 && T.listTasks().find((x) => x.id === doneId)?.running; i++) await new Promise((r) => setTimeout(r, 25));
+  const runId = T.startTask("sleep 30", "running-probe");
+  const doneDir = join(DIR, "tasks", doneId);
+
+  t("/tasks clear is wired", !!commands["tasks"]);
+  await commands["tasks"].handler("clear", tctx);
+  t("/tasks clear drops finished only", !existsSync(doneDir) && T.listTasks().some((x) => x.id === runId), notes.at(-1));
+  notes.length = 0;
+  await commands["tasks"].handler(`clear ${runId}`, tctx);
+  t("/tasks clear refuses a running task", notes.at(-1)?.includes("still running") === true, notes.at(-1));
+  notes.length = 0;
+  await commands["tasks"].handler("clear", tctx);
+  t("/tasks clear with nothing finished is calm", notes.at(-1)?.includes("No finished tasks") === true, notes.at(-1));
+  T.stopTask(runId);
 }
 
 // --- 13. research bundle rendering (helper output contract) ----------------

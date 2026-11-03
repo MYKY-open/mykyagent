@@ -6,7 +6,7 @@
  * Store: MYKYAGENT_CHECKPOINTS_DIR or ~/.config/mykyagent/checkpoints/.
  * Pi-free. Restores mkdir -p the original path.
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 

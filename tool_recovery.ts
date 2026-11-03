@@ -53,10 +53,7 @@ export const DEFAULT_KNOWN_TOOLS = new Set([
   // Web & Memory
   "web_search",
   "web_fetch",
-  "memory_read",
-  "memory_write",
-  "memory_forget",
-  "memory_list",
+  "memory",
   // Workflow tools
   "skill_read",
   "todo",
@@ -90,8 +87,7 @@ const POSITIONAL_ARGS: Record<string, string[]> = {
   powershell: ["command", "timeout"],
   web_search: ["query"],
   web_fetch: ["url"],
-  memory_read: ["topic"],
-  memory_list: [],
+  memory: ["action", "name", "summary"],
   skill_read: ["name"],
   todo: ["action", "text"],
   summarize: ["text"],
@@ -102,8 +98,7 @@ const POSITIONAL_ARGS: Record<string, string[]> = {
   task_list: [],
   mcp_disconnect: ["server"],
   mcp_list: [],
-  memory_write: ["topic", "content"],
-  memory_forget: ["topic"],
+
 };
 
 function generateToolCallId(): string {

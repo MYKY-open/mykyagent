@@ -8,9 +8,9 @@ A lightweight, crash-proof agent overlay for small local reasoning models (like 
 - **Token-Disciplined Distillation**: Per-page character budgets, cross-page duplicate-block removal, and hard caps on fallback dumps. A typical search spends ~2k tokens, not ~4k, and bad pages are dropped instead of summarised.
 - **Safe Local Code Inspection**: Guardrailed `read` tool enforcing 250-line chunks (max 15KB) to prevent 10,000-line files or logs from flooding local context. Images come back as vision (avif/heic auto-converted via ffmpeg) or, when the model takes no images, as a server-side description. Automatic `grep`, `find`, and `ls` activation.
 - **Customizable Personas**: In-chat `/persona` slash command with presets (`caveman`, `senior`, `cyberpunk`, `academic`, `qa`, `maintainer`, `pm`, `speedrunner`, `gremlin`, or `custom`) saved to `~/.config/mykyagent/persona.json`.
-- **Persistent Memory (index + on-demand)**: Topic files under `~/.config/mykyagent/memory/`. Only a one-line summary per topic is injected into the system prompt; bodies load via `memory_read` when relevant. `memory_write` / `memory_read` / `memory_forget` / `memory_list`.
-- **Background Tasks**: Long commands run detached via `task_start`; follow with cursor-based `task_output` (new bytes only), blocking `task_wait`, or kill with `task_stop`. `task_list` / `/tasks` lists them. Max 3 live.
-- **Skills-lite**: On-demand capability packs in `skills/<name>.md` (or `skills/<name>/SKILL.md`). One index line per turn (zero when empty); full text loads via `skill_read` only when relevant. `/skill` lists/shows them.
+- **Persistent Memory (index + on-demand)**: Topic files under `~/.config/mykyagent/memory/`. Only a clipped one-line summary per topic is injected into the system prompt — index lines are capped at ~1000 chars total and 70 chars each (`MYKYAGENT_MEMORY_INDEX_CHARS`, `MYKYAGENT_MEMORY_INDEX_SUMMARY_CHARS`), so the index costs ~250 tokens/turn instead of a full dump; bodies load on demand. **One `memory` tool, eight actions** (`read`, `write`, `edit`, `forget`, `list`, `search`, `rename`, `move`) instead of eight schemas — ~1/4 the tool-schema cost.
+- **Background Tasks**: Long commands run detached via `task_start`; follow with cursor-based `task_output` (new bytes only), blocking `task_wait`, or kill with `task_stop`. `task_list` / `/tasks` lists them; **`/tasks clear [id]`** deletes finished task dirs (running ones are refused) so the store does not grow forever. Max 3 live.
+- **Skills-lite**: On-demand capability packs in `skills/<name>.md` (or `skills/<name>/SKILL.md`). One index line per turn (zero when empty); full text loads via `skill_read` only when relevant. `/skill` lists/shows them. **One master switch** in `/mykyagent` (`skills`) owns the whole system — prompt index, the `skill_read` tool and every per-skill row. Turn the master off and `skill_read` leaves the toolset too (nothing to read from), so the board does not list it as a separate switch.
 - **Todos**: Tiny persistent scratch (`todo` add/list/done/clear) for multi-step work, injected bounded into the prompt only while open. Humans get the same broom: `/todo` lists, `/todo add <text>`, `/todo done <id|text>`, `/todo clear` (finished only), **`/todo wipe`** (everything — for cancelled runs and models that forgot to close items).
 - **Checkpoints**: Every `write`/`edit` snapshots pre-write content (ring of 20, 100KB cap). `/rewind` lists, `/rewind <n>` restores. Undo, no gates.
 - **Resume**: `summarize` tool saves a session summary; `session_shutdown` auto-saves machine state (mode, active character, todos, checkpoint count). `/restore` injects both back into a fresh session **and re-applies the saved stage** — mode plus character with greeting (or an honest note if the card is gone). Personas, tags, style, author's note, and toggles persist in their own files already. (`/resume` is pi's own session switcher).
@@ -78,7 +78,7 @@ Persona owns **voice**. Effort owns **depth**. A terse caveman persona ("no fluf
 | --- | --- |
 | `low` | Smallest correct change. One command proves it. No new tests. |
 | `high` (default level) | Done-criteria before code, bug reports reproduced before fixing, real verification output, one DONE / NOT DONE line per ask. |
-| `max` | Spec + architecture, tests, manual pass (play the game), polish pass, acceptance report. |
+| `max` | Plan + architecture, tests, manual pass (play the game), polish pass, acceptance report. |
 
 - `/effort` shows whether the feature is on, the current level and all three. `/effort max` stores a level and enables it.
 - **One message at a time:** start a message with `low:`, `high:` or `max:` to override the stored level for that turn only, e.g. `max: build a tower defence with save/load`. Nothing to switch before every start.
@@ -97,7 +97,7 @@ A profile is a named snapshot of the settings you keep flipping — **effort, to
 * `/profile save [name]` — write the current settings into the active (or named) profile
 * `/profile delete <name>` / `/profile rename <old> <new>`
 * Same thing from the board: `/mykyagent profile ...`; the board header shows `Profile:` and `Effort:`.
-* **pi footer**: a `mykyagent` status line reads `profile · effort` (e.g. `Story Night · effort max`), repainted on start, after any profile/effort/toggle change, and self-healed on the next turn. pi has no header — the footer is the only persistent status surface.
+* **pi footer**: pi has no header, and `ctx.ui.setStatus` only adds another line — so mykyagent installs a custom footer that wraps pi's own (pwd, token stats, model all unchanged) and splices `profile · effort` (e.g. `Story Night · effort max`) onto the **model line**, in the same dim color. It repaints on start, after any profile/effort/toggle change, self-heals on the next turn, and never repaints unchanged state. If pi's internals ever move, the wrapped render fails soft into one dim line with the model and the state.
 * A snapshot always stores all five sections — a store you never created is captured as empty, so switching really restores the saved state instead of blending it with whatever was live.
 
 Details: names are free text, the directory is a slug (`Story Night` → `profiles/story-night/profile.json`); session state — mode, active character, user name — is **not** part of a profile; a hand-edited profile file is validated before anything is written, and one bad section refuses the whole switch instead of half-applying.
@@ -142,7 +142,7 @@ and pi's picker immediately.
 
 ## Universal Toggles (`/mykyagent`)
 Toggle any tool, skill, or agent feature on/off individually. The picker is **mode-aware**: it shows `[code]`, `[rp]`, or `[rp-creator]` in its title, hides tools the current mode cannot use at all (with a "(N hidden — unavailable in X mode)" note), and every tool flip lands on **that mode's own setting** — turning `bash` off in RP leaves code mode untouched. Features and skills stay global. `/mykyagent reset` clears everything across all modes.
-* `/mykyagent` — Open interactive Settings picker (scroll with arrow keys, toggle with Enter/Space/arrows); the header carries `Profile:` and `Effort:`, and the list offers profile switch/save/new
+* `/mykyagent` — Open interactive Settings picker (scroll with arrow keys, toggle with Enter/Space/arrows); the title carries `Profile:` and `Effort:`, a colored `N on · N off` count, green `✓ enabled` / red `✗ disabled` values, category glyphs (⚙ feature, 📚 skill, 🔧 tool, 📁 profile), and profile switch/save/new rows
 * `/mykyagent status` — Print status summary of all tools, skills, and features
 * `/mykyagent toggle <name>` — Flip a tool, skill, or feature on/off (e.g. `/mykyagent toggle bash`)
 * `/mykyagent on <name>` / `/mykyagent off <name>` — Enable or disable explicitly (e.g. `/mykyagent off memory`, `/mykyagent off web-scraping`)
@@ -150,9 +150,10 @@ Toggle any tool, skill, or agent feature on/off individually. The picker is **mo
 * `/mykyagent profile ...` — Manage profiles without leaving the board: `list`, `new <name>`, `use <name>`, `save`, `delete <name>`, `rename <old> <new>`
 
 **Toggleable categories:**
-* **Tools**: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `memory_read`, `memory_write`, `memory_forget`, `memory_list`, `mcp_connect`, `mcp_disconnect`, `mcp_list`, and any discovered MCP server tools.
+* **Tools**: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `memory` (read/write/edit/forget/list/search/rename/move), `mcp_connect`, `mcp_disconnect`, `mcp_list`, and any discovered MCP server tools. Bare `/mykyagent off memory` is the master feature; `/mykyagent off tool:memory` disables just the tool.
 * **Skills**: Master skills toggle (`skills`) and per-skill toggles (e.g. `web-scraping`).
 * **Features**: `memory` (persistent index & tools), `persona` (tone styling in prompt), `tool_recovery` (think-tag tool call recovery — OPT-IN, off by default: `/mykyagent on tool_recovery`), `output_sanitizer` (progress bar/ticker cleaning), `web`, `mcp`, `effort` (work standard — OPT-IN, off by default: `/effort <level>` or `/mykyagent on effort`).
+* **Platform-aware**: the board, status card and prompt gate only list tools this machine can run. pi ships a `powershell` definition on every platform, but it throws "only available on Windows" elsewhere — it is hidden off Windows and never activated, so its schema (~130 tokens/turn) stays out of context. Hidden-exposure tools are filtered too.
 
 Saved to `~/.config/mykyagent/toggles.json` and persists across sessions.
 
@@ -360,22 +361,22 @@ that bodies are not loaded:
 
 ```
 ## Persistent Memory (index only - bodies are NOT loaded)
-Call `memory_read` with the exact topic name when one becomes relevant.
+Call `memory` with action `read` and the exact topic name when one becomes relevant.
 - minecraft_server_setup: MYKYpack NeoForge 1.21.1 server - paths, JVM flags...
 - mykyagent_search: search_helper.py architecture - engines, APIs, knobs...
 ```
 
-Bodies are fetched with `memory_read` only when a topic becomes relevant. This keeps
+Bodies are fetched with `memory` (action `read`) only when a topic becomes relevant. This keeps
 the per-turn prompt cost roughly constant as knowledge accumulates (~140 tokens for
 three topics holding ~7KB of notes), and keeps model-authored prose out of the
 highest-trust region of the context.
 
 | Tool | Purpose |
 | --- | --- |
-| `memory_read` | load one topic body by name |
-| `memory_write` | create/update a topic (`name`, one-line `summary`, `body`) |
-| `memory_forget` | delete a topic that is outdated or wrong |
-| `memory_list` | all topics with size and last-updated date |
+| `memory` + `action: "read"` | load one topic body by name |
+| `memory` + `action: "write"` | create/update a topic (`name`, one-line `summary`, `body`) |
+| `memory` + `action: "forget"` | delete a topic that is outdated or wrong |
+| `memory` + `action: "list"` | all topics with size and last-updated date |
 
 Topic names resolve loosely, so `"Proj Alpha"` finds `proj_alpha`. Summaries are
 forced to a single line and a topic name can never escape the memory root.
@@ -422,7 +423,7 @@ Design notes:
 - **Serial cap**: at most 3 live tasks; starting beyond that errors instead of
   spawning a fleet.
 
-In-chat: `/tasks` lists all tasks.
+In-chat: `/tasks` lists all tasks; `/tasks clear` drops finished ones (or `/tasks clear <id>` for a single one).
 
 | Variable | Default | Effect |
 | --- | --- | --- |
@@ -463,9 +464,9 @@ In `rp` mode the system prompt is rebuilt each turn as structured XML (`<charact
 
 ### Per-Character Memory
 
-Agent memory is one global store in `~/.config/mykyagent/memory/`, but in `rp` mode with a loaded character it is **namespaced**: writes land in `char-<slug>-<topic>` files, the prompt index and `memory_list` show only that character's topics, and `memory_read` resolves the character's topics first (global topics remain readable by exact name for OOC questions). Switching characters or unloading switches namespaces automatically; `code` and `rp-creator` modes always see the global store.
+Agent memory is one global store in `~/.config/mykyagent/memory/`, but in `rp` mode with a loaded character it is **namespaced**: writes land in `char-<slug>-<topic>` files, the prompt index and `memory` (action `list`) show only that character's topics, and `memory` (action `read`) resolves the character's topics first (global topics remain readable by exact name for OOC questions). Switching characters or unloading switches namespaces automatically; `code` and `rp-creator` modes always see the global store.
 
-Manage it with the `/memories [all|<query>]` browser (read, rename, move between global and character namespaces, delete) and the `memory_edit` (replace/append), `memory_rename`, `memory_move`, and `memory_search` (substring over names, summaries, and bodies) tools — all namespace-aware, so the agent can tidy up in chat too.
+Manage it with the `/memories [all|<query>]` browser (read, rename, move between global and character namespaces, delete) and the `memory` tool actions `edit` (replace/append), `rename`, `move`, and `search` (substring over names, summaries, and bodies) — all namespace-aware, so the agent can tidy up in chat too.
 
 ### RP-Creator Studio
 

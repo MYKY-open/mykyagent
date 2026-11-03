@@ -105,7 +105,7 @@ const pi: any = {
 await ext(pi);
 
 t("creator tools registered", !!(tools.character_duplicate && tools.character_rename));
-t("memory tools registered", !!(tools.memory_edit && tools.memory_rename && tools.memory_move && tools.memory_search));
+t("memory tool registered (one tool, many actions)", !!tools.memory && !tools.memory_edit && !tools.memory_search);
 t("creator tools blocked in rp", ["character_duplicate", "character_rename"].every((x) => modeMod.isToolAllowedInMode(x, "rp") === false));
 
 const dupTool = await tools.character_duplicate.execute("x", { slug: "evelyn", name: "Evelyn Second" });
@@ -115,16 +115,16 @@ t("duplicate tool reports collision", dupClash.isError === true);
 const renTool = await tools.character_rename.execute("x", { slug: "evelyn-second", name: "Evelyn 2" });
 t("rename tool works", !renTool.isError && String(renTool.content[0].text).includes("evelyn-2"));
 
-const editTool = await tools.memory_edit.execute("x", { name: "trust", summary: "trusts User deeply", mode: "replace" });
-t("memory_edit tool works", !editTool.isError && String(editTool.content[0].text).includes("trust"));
-const editMiss = await tools.memory_edit.execute("x", { name: "ghost" });
-t("memory_edit missing errors", editMiss.isError === true);
-const searchTool = await tools.memory_search.execute("x", { query: "arduino" });
-t("memory_search tool works", !searchTool.isError && String(searchTool.content[0].text).includes("kernel-notes"));
-const moveTool = await tools.memory_move.execute("x", { name: "trust", target: "evelyn" });
-t("memory_move tool works", !moveTool.isError && String(moveTool.content[0].text).includes("char-evelyn-trust"));
-const renameTool = await tools.memory_rename.execute("x", { name: "char-evelyn-trust", new_name: "evelyn bond" });
-t("memory_rename tool works", !renameTool.isError && String(renameTool.content[0].text).includes("evelyn-bond"));
+const editTool = await tools.memory.execute("x", { action: "edit", name: "trust", summary: "trusts User deeply", mode: "replace" });
+t("memory edit action works", !editTool.isError && String(editTool.content[0].text).includes("trust"));
+const editMiss = await tools.memory.execute("x", { action: "edit", name: "ghost" });
+t("memory edit missing errors", editMiss.isError === true);
+const searchTool = await tools.memory.execute("x", { action: "search", query: "arduino" });
+t("memory search action works", !searchTool.isError && String(searchTool.content[0].text).includes("kernel-notes"));
+const moveTool = await tools.memory.execute("x", { action: "move", name: "trust", target: "evelyn" });
+t("memory move action works", !moveTool.isError && String(moveTool.content[0].text).includes("char-evelyn-trust"));
+const renameTool = await tools.memory.execute("x", { action: "rename", name: "char-evelyn-trust", new_name: "evelyn bond" });
+t("memory rename action works", !renameTool.isError && String(renameTool.content[0].text).includes("evelyn-bond"));
 
 // --- /characters board -------------------------------------------------------
 const scripted = (answers: string[], inputs: string[], confirmVal = true) => {

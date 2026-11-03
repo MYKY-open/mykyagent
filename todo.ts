@@ -6,7 +6,7 @@
  * Store: single JSON file (MYKYAGENT_TODO_FILE or ~/.config/mykyagent/todo.json).
  * Pi-free. IDs are stable numbers; done() also accepts 1-based list position.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 

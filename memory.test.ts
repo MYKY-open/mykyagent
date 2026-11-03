@@ -71,6 +71,14 @@ for (let i = 0; i < 40; i++) {
 }
 const block = M.memoryIndexBlock();
 t("index: is capped", block.length < M.MEMORY_INDEX_MAX + 400, `${block.length}`);
+// A long summary is clipped in the index (the body keeps it): the index is
+// paid for on every turn, so lines are bounded.
+const longSum = "x".repeat(200) + " tail-marker";
+M.writeMemoryEntry("long_summary_topic", longSum, "body");
+const idx = M.memoryIndexBlock("long_summary");
+const longLine = idx.split("\n").find((l) => l.includes("long_summary_topic")) || "";
+t("index: clips long summaries", longLine.includes("…") && !longLine.includes("tail-marker") && longLine.length < 120, `${longLine.length}: ${longLine.slice(0, 60)}`);
+t("index: the full summary stays in the body", M.readMemoryEntry("long_summary_topic")?.summary.length === M.MEMORY_SUMMARY_MAX);
 t("index: warns about hidden topics", /further topic\(s\) not shown/.test(block));
 t("index: tells the model bodies are not loaded", /bodies are NOT loaded/.test(block));
 

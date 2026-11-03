@@ -146,9 +146,6 @@ export function isToolAllowedInMode(toolName: string, mode: Mode): boolean {
   return true;
 }
 
-export function isCreatorTool(name: string): boolean {
-  return CREATOR_TOOLS.has(name);
-}
 
 // --- System prompt builders ---------------------------------------------------
 

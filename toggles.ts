@@ -38,10 +38,7 @@ export const BUILTIN_TOOL_DEFS: Record<string, string> = {
   ls: "List directory contents",
   web_search: "Autonomous deep research & multi-hop crawl",
   web_fetch: "Clean technical web extraction & distillation",
-  memory_read: "Read persistent memory topic body",
-  memory_write: "Write/update persistent memory topic",
-  memory_forget: "Delete persistent memory topic",
-  memory_list: "List persistent memory topics",
+  memory: "Persistent memory topics (read/write/edit/forget/list/search/rename/move)",
   mcp_connect: "Connect to MCP server and register tools",
   mcp_disconnect: "Disconnect MCP server and unregister tools",
   mcp_list: "List connected MCP servers and tools",
@@ -113,6 +110,16 @@ export function saveToggles(cfg: TogglesConfig): void {
   writeFileSync(file, JSON.stringify(cfg, null, 2), "utf-8");
 }
 
+/**
+ * Tools pi defines on every platform but only one can run. powershell throws
+ * "The powershell tool is only available on Windows" anywhere else, so showing
+ * it in a board or activating it is pure context noise.
+ */
+export function isToolRunnableHere(name: string): boolean {
+  if (name === "powershell") return process.platform === "win32";
+  return true;
+}
+
 /** Features that default OFF (opt-in). Everything else defaults ON. */
 export const OPT_IN_FEATURES: Set<string> = new Set(["tool_recovery", "effort"]);
 
@@ -173,7 +180,11 @@ export function isToolEnabled(name: string, mode?: string): boolean {
   // Master feature switches
   if (name.startsWith("web_") && cfg.features?.web === false) return false;
   if (name.startsWith("mcp_") && cfg.features?.mcp === false) return false;
-  if (name.startsWith("memory_") && cfg.features?.memory === false) return false;
+  if ((name === "memory" || name.startsWith("memory_")) && cfg.features?.memory === false) return false;
+  // The skills master is the only switch for the skills system: with it off
+  // there is no index to read from, so a live skill_read tool would be dead
+  // weight in the toolset.
+  if (name === "skill_read" && !isSkillsMasterEnabled()) return false;
 
   const v = cfg.tools?.[name];
   if (typeof v === "boolean") return v; // legacy global: applies to every mode
@@ -182,6 +193,55 @@ export function isToolEnabled(name: string, mode?: string): boolean {
     const mv = (v as Record<string, boolean>)[mode];
     return typeof mv === "boolean" ? mv : true;
   }
+  return true;
+}
+
+/** Tool names from before the single `memory` tool. */
+export const LEGACY_MEMORY_TOOLS = [
+  "memory_read",
+  "memory_write",
+  "memory_edit",
+  "memory_forget",
+  "memory_list",
+  "memory_search",
+  "memory_rename",
+  "memory_move",
+];
+
+/**
+ * Fold the eight old memory tool settings into the merged `memory` tool and
+ * drop the stale keys, so /mykyagent does not keep showing tools that no
+ * longer exist. A mode is off when every old memory tool was off there.
+ * Idempotent; returns true when it changed the file.
+ */
+export function migrateLegacyMemoryToggles(): boolean {
+  const cfg = loadToggles();
+  const tools = cfg.tools || {};
+  const legacy = LEGACY_MEMORY_TOOLS.filter((k) => k in tools);
+  if (!legacy.length) return false;
+  if (!("memory" in tools)) {
+    const modes = new Set<string>();
+    let legacyGlobalOff = false;
+    for (const k of legacy) {
+      const v = tools[k];
+      if (v === false) legacyGlobalOff = true;
+      else if (v && typeof v === "object") for (const m of Object.keys(v)) modes.add(m);
+    }
+    const merged: Record<string, boolean> = {};
+    for (const m of modes) {
+      const values = legacy.map((k) => {
+        const v = tools[k];
+        return v && typeof v === "object" ? v[m] : v;
+      });
+      const known = values.filter((v): v is boolean => typeof v === "boolean");
+      if (known.length && known.every((v) => v === false)) merged[m] = false;
+    }
+    if (legacyGlobalOff && Object.keys(merged).length === 0) tools.memory = false;
+    else if (Object.keys(merged).length) tools.memory = merged;
+  }
+  for (const k of legacy) delete tools[k];
+  cfg.tools = tools;
+  saveToggles(cfg);
   return true;
 }
 
@@ -239,7 +299,7 @@ export function getAllToggleableItems(
     name: "skills",
     category: "skill",
     label: "Skills: (Master toggle)",
-    description: "Enable/disable entire Agent Skills system and prompt injection",
+    description: "Skills system: prompt index, per-skill toggles, and the skill_read tool",
     enabled: isSkillsMasterEnabled(),
   });
 
@@ -266,6 +326,8 @@ export function getAllToggleableItems(
   ).sort();
 
   for (const t of allToolNames) {
+    if (!isToolRunnableHere(t)) continue;
+    if (t === "skill_read") continue; // covered by the Skills master row
     if (opts.isAllowed && !opts.isAllowed(t)) continue;
     const desc = BUILTIN_TOOL_DEFS[t] || (t.startsWith("mcp_") ? "Discovered MCP tool" : "Registered tool");
     items.push({
@@ -289,7 +351,9 @@ export function modeHiddenTools(
   if (!isAllowed) return [];
   const cfg = loadToggles();
   const all = new Set([...Object.keys(BUILTIN_TOOL_DEFS), ...registeredTools, ...Object.keys(cfg.tools || {})]);
-  return Array.from(all).filter((t) => !isAllowed(t)).sort();
+  return Array.from(all)
+    .filter((t) => isToolRunnableHere(t) && !isAllowed(t))
+    .sort();
 }
 
 export function toggleByName(
@@ -299,22 +363,28 @@ export function toggleByName(
   mode?: string
 ): { ok: boolean; name: string; enabled: boolean; category: string; message: string } {
   const norm = target.trim().toLowerCase();
+  // `tool:` / `feat:` disambiguate names that exist in both categories (the
+  // `memory` master feature and the `memory` tool). Bare names resolve to the
+  // feature first, which is the master switch anyway.
+  const forcedTool = norm.startsWith("tool:");
+  const forcedFeature = norm.startsWith("feat:");
+  const bare = forcedTool ? norm.slice(5) : forcedFeature ? norm.slice(4) : norm;
 
   // 1. Match feature
-  if (norm in FEATURE_DEFS) {
-    const next = explicitState !== undefined ? explicitState : !isFeatureEnabled(norm);
-    setFeatureEnabled(norm, next);
+  if (!forcedTool && bare in FEATURE_DEFS) {
+    const next = explicitState !== undefined ? explicitState : !isFeatureEnabled(bare);
+    setFeatureEnabled(bare, next);
     return {
       ok: true,
-      name: norm,
+      name: bare,
       enabled: next,
       category: "feature",
-      message: `Feature "${norm}" is now ${next ? "ENABLED" : "DISABLED"}.`,
+      message: `Feature "${bare}" is now ${next ? "ENABLED" : "DISABLED"}.`,
     };
   }
 
-  // 2. Match master skills
-  if (norm === "skills" || norm === "skill") {
+  // 2. Match master skills (bare skill_read included: the tool tracks the master)
+  if (norm === "skills" || norm === "skill" || (!forcedTool && norm === "skill_read")) {
     const next = explicitState !== undefined ? explicitState : !isSkillsMasterEnabled();
     setSkillsMasterEnabled(next);
     return {
@@ -350,7 +420,7 @@ export function toggleByName(
     `Tool "${toolName}" is now ${next ? "ENABLED" : "DISABLED"}${mode ? ` in ${mode} mode` : ""}.`;
 
   // 4. Match tool (with or without 'tool:' prefix)
-  const toolName = norm.startsWith("tool:") ? norm.slice(5) : norm;
+  const toolName = forcedTool ? bare : norm;
   if (toolName in BUILTIN_TOOL_DEFS || toolName.startsWith("mcp_") || toolName in (cfg.tools || {})) {
     const next = explicitState !== undefined ? explicitState : !isToolEnabled(toolName, mode);
     setToolEnabled(toolName, next, mode);

@@ -1,6 +1,7 @@
 import { Type } from "@sinclair/typebox";
 import { execFile } from "node:child_process";
 import {
+  FooterComponent,
   ModelSelectorComponent,
   formatSkillsForPrompt,
   getSettingsListTheme,
@@ -10,6 +11,8 @@ import {
   SettingsList,
   type SettingItem,
   fuzzyFilter,
+  truncateToWidth,
+  visibleWidth,
   type AutocompleteItem,
 } from "@earendil-works/pi-tui";
 import { runSearchHops, type ResearchPayload } from "./search_hops.ts";
@@ -71,13 +74,14 @@ import {
   isSkillEnabled,
   isSkillsMasterEnabled,
   isToolEnabled,
+  isToolRunnableHere,
+  migrateLegacyMemoryToggles,
   resetAllToggles,
   setFeatureEnabled,
   setSkillEnabled,
   setSkillsMasterEnabled,
   setToolEnabled,
   toggleByName,
-  type ToggleItem,
 } from "./toggles.ts";
 import {
   buildCreatorSystemPrompt,
@@ -103,7 +107,6 @@ import {
   renameCharacter,
   renderCharacterBlock,
   renderGreeting,
-  saveCharacter,
   seedStarterCharacters,
   validateCard,
   type CharacterCard,
@@ -1309,35 +1312,189 @@ try {
   }
 } catch {}
 
-// pi's footer is the only persistent status surface (no header): one line,
-// sorted by key, next to the ghost line. The key is not rendered, so the text
-// names itself. Module scope, so early hooks can never hit a TDZ.
+// pi's footer is the only persistent status surface (no header). Our state is
+// spliced onto the model line, not added as a separate status line. Module
+// scope, so early hooks can never hit a TDZ.
 const STATUS_KEY = "mykyagent";
-let statusUi: { setStatus?: (key: string, text: string | undefined) => void } | null = null;
+let statusUi: any = null;
+let footerUiInstalled: any = null;
+let footerTui: any = null;
 let lastStatusText = "";
 
-function statusText(): string {
+function statusParts(): { profile: string; effort: string } {
   const active = listProfiles().find((p) => p.slug === getActiveProfile());
-  const profile = active?.name || "no profile";
-  const effort = isFeatureEnabled("effort") ? `effort ${getEffort()}` : "effort off";
-  return `${profile} · ${effort}`;
+  return {
+    profile: active?.name || "no profile",
+    effort: isFeatureEnabled("effort") ? getEffort() : "effort off",
+  };
+}
+
+function statusText(opts: { short?: boolean } = {}): string {
+  const { profile, effort } = statusParts();
+  // The footer shares a line with the model, so it gets the short form; the
+  // fallback line has room for the spelled-out one.
+  if (opts.short) return `${profile} · ${effort}`;
+  return `${profile} · effort ${effort === "effort off" ? "off" : effort}`;
+}
+
+/** Footer variants, longest first: a narrow terminal drops the profile, then all. */
+function statusCandidates(): string[] {
+  const { profile, effort } = statusParts();
+  return [` · ${profile} · ${effort}`, ` · ${profile}`, ` · ${effort}`];
+}
+
+/** Names pi can declare here: configured, not hidden, and runnable on this OS. */
+function declarableToolNames(pi: any): string[] {
+  const infos = pi?.getAllTools?.() || [];
+  return infos
+    .filter((t: any) => t?.name && t.exposure !== "hidden" && isToolRunnableHere(t.name))
+    .map((t: any) => t.name);
+}
+
+/**
+ * Put " · status" at the end of a footer line that already carries the model.
+ * The suffix is self-contained (its own color codes), so this is safe on an
+ * ANSI-colored line: no code from the line can bleed into the suffix or the
+ * other way round. Truncates only the line's tail (trailing padding), never
+ * inside the suffix. Exported for tests.
+ */
+export function fitFooterLine(line: string, suffix: string, width: number): string {
+  const room = Math.max(0, width - visibleWidth(suffix));
+  const body = truncateToWidth((line || "").replace(/\s+$/, ""), room, "");
+  return body + suffix;
+}
+
+/**
+ * Insert " · status" before the right-aligned provider/model block, so the line
+ * reads left to right: stats, profile, effort, provider, model. pi's line is
+ * "stats<padding>model" with the padding inside the dim wrapper, so the status
+ * borrows padding space and re-opens the dim color for what follows — that is
+ * why `status` must end with that re-open code. Returns null when the padding
+ * is too small (the caller then falls back to fitFooterLine). Exported for tests.
+ */
+export function insertStatusBeforeModel(line: string, status: string): string | null {
+  const text = line || "";
+  const runs = [...text.matchAll(/ {2,}/g)];
+  if (!runs.length) return null;
+  const padding = runs[runs.length - 1];
+  const start = padding.index ?? -1;
+  if (start < 0) return null;
+  // Keep at least one space between the status and the model.
+  if (visibleWidth(status) + 1 > padding[0].length) return null;
+  const rest = " ".repeat(padding[0].length - visibleWidth(status));
+  const merged = text.slice(0, start) + status + rest + text.slice(start + padding[0].length);
+  return visibleWidth(merged) === visibleWidth(text) ? merged : null;
+}
+
+/**
+ * Custom footer: pi's own footer (wrapped, so pwd/stats/model stay exactly as
+ * they are) with our state spliced onto the model line in the same dim color.
+ * The built-in component needs a session; the extension context has the pieces
+ * it reads, so a small shim feeds it. Any failure degrades to one dim line
+ * instead of a broken footer.
+ */
+function buildFooterComponent(ctx: any, tui: any, theme: any, footerData: any) {
+  footerTui = tui;
+  let inner: any = null;
+  try {
+    const session = {
+      sessionManager: ctx?.sessionManager,
+      model: ctx?.model,
+      thinkingLevel: ctx?.thinkingLevel,
+      routedModel: undefined,
+      state: { model: ctx?.model, thinkingLevel: ctx?.thinkingLevel },
+      modelRuntime: { isUsingSubscription: () => false },
+      getContextUsage: () => ctx?.getContextUsage?.(),
+    };
+    inner = new FooterComponent(session as any, footerData);
+  } catch {
+    inner = null;
+  }
+
+  // Degraded footer: at least the model and our state, in one dim line (a
+  // failed inner render must never leave a blank footer).
+  const modelId = ctx?.model?.id || "no-model";
+  const fallback = (width: number) =>
+    [theme.fg("dim", truncateToWidth(`${statusText()} · ${modelId}`, width, "…"))];
+  return {
+    render(width: number) {
+      if (!inner) return fallback(width);
+      // dim() gives us the open/close codes of pi's dim color, so inserted text
+      // can continue the same color for the rest of the line.
+      const [open, close] = theme.fg("dim", "\u0000").split("\u0000");
+      const dim = (text: string) => `${open}${text}${close || ""}`;
+      const suffix = dim(` · ${statusText({ short: true })}`);
+      let lines: string[] = [];
+      try {
+        lines = inner.render(width) || [];
+      } catch {
+        return fallback(width);
+      }
+      if (!lines.length) return fallback(width);
+      const idx = lines.length > 1 ? 1 : 0;
+      const line = lines[idx] ?? "";
+      // Preferred: before the model, order profile -> effort -> provider -> model.
+      // Narrow terminals get a shorter variant rather than an out-of-order line.
+      for (const candidate of statusCandidates()) {
+        const merged = insertStatusBeforeModel(line, dim(candidate) + open);
+        if (merged !== null) {
+          lines[idx] = merged;
+          return lines;
+        }
+      }
+      // Narrow terminal: no padding to borrow, so re-render one notch narrower
+      // and append at the end rather than cutting the model.
+      const innerWidth = Math.max(24, width - visibleWidth(suffix));
+      try {
+        lines = inner.render(innerWidth) || lines;
+      } catch {
+        return fallback(width);
+      }
+      lines[idx] = fitFooterLine(lines[idx] ?? "", suffix, width);
+      return lines;
+    },
+    invalidate() {
+      try {
+        inner?.invalidate?.();
+      } catch {}
+    },
+    dispose() {
+      try {
+        inner?.dispose?.();
+      } catch {}
+    },
+  };
 }
 
 /** Repaint the footer when the visible state changed. Cheap and idempotent. */
 function refreshStatus(ctx?: any): void {
-  if (ctx?.ui?.setStatus) statusUi = ctx.ui;
+  if (ctx?.ui) statusUi = ctx.ui;
   const ui = statusUi;
-  if (!ui?.setStatus) return;
+  if (!ui) return;
+  if (typeof ui.setFooter === "function" && ui !== footerUiInstalled) {
+    try {
+      ui.setFooter((tui: any, theme: any, footerData: any) => buildFooterComponent(ctx, tui, theme, footerData));
+      footerUiInstalled = ui;
+    } catch {}
+  }
   const text = statusText();
   if (text === lastStatusText) return;
   lastStatusText = text;
-  try {
-    ui.setStatus(STATUS_KEY, text);
-  } catch {}
+  if (footerUiInstalled) {
+    try {
+      footerTui?.requestRender?.();
+    } catch {}
+  } else {
+    // No setFooter (older pi / rpc mode): the separate status line still works.
+    try {
+      ui.setStatus?.(STATUS_KEY, text);
+    } catch {}
+  }
 }
 
 export default function (pi: any) {
   migrateLegacyMemory();
+  migrateLegacyMemoryToggles();
 
   // 1. Caveman System Prompt + Memory Injection
   pi.on("before_agent_start", async (event: any, ctx: any) => {
@@ -1367,10 +1524,11 @@ export default function (pi: any) {
     const gateTool = (t: string) => {
       if (webOff && WEB_TOOL_NAMES.includes(t)) return false;
       if (mcpOff && isMcpToolName(t)) return false;
-      if (memoryOff && t.startsWith("memory_")) return false;
+      if (memoryOff && (t === "memory" || t.startsWith("memory_"))) return false;
       if (rpCreatorOff && CREATOR_TOOL_NAMES.includes(t)) return false;
       if (rpgOff && RPG_TOOL_NAMES.includes(t)) return false;
       if (!isToolAllowedInMode(t, mode)) return false;
+      if (!isToolRunnableHere(t)) return false;
       return isToolEnabled(t, mode);
     };
 
@@ -1385,10 +1543,7 @@ export default function (pi: any) {
         "ls",
         "web_search",
         "web_fetch",
-        "memory_read",
-        "memory_write",
-        "memory_forget",
-        "memory_list",
+        "memory",
         "mcp_connect",
         "mcp_disconnect",
         "mcp_list",
@@ -1512,11 +1667,10 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       toolLines.push("- (web_fetch / web_search: Playwright Chromium is DISABLED by /web-browser off; pure static HTTP only)");
     }
 
-    if (!memoryOff && isToolEnabled("memory_read")) {
-      toolLines.push("- memory_read: load the full body of one memory topic by name. Call it when a topic from the memory index becomes relevant.");
-    }
-    if (!memoryOff && (isToolEnabled("memory_write") || isToolEnabled("memory_forget") || isToolEnabled("memory_list"))) {
-      toolLines.push("- memory_write / memory_forget / memory_list: store, delete, or list persistent memory topics (one-line summary + on-demand body).");
+    if (!memoryOff && isToolEnabled("memory")) {
+      toolLines.push(
+        "- memory: persistent topics, one tool with an action — read (body), write (summary + body), edit, forget, list, search, rename, move. The index is in the prompt; read a topic before relying on it."
+      );
     }
 
     let skillsSection = "";
@@ -1869,190 +2023,127 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     },
   });
 
-  // 5-8. Memory tools -- memory is a small always-visible index plus topic
-  // bodies loaded on demand, not a blob pasted into every prompt.
+  // 5. Memory tool -- one schema, eight actions. Eight separate tools cost
+  // ~700 chars of schema per turn and eight rows in /mykyagent for the same
+  // capability; an action param is the same shape the todo tool already uses.
   pi.registerTool({
-    name: "memory_read",
-    label: "Memory Read",
+    name: "memory",
+    label: "Memory",
     description:
-      "Load the full body of one persistent memory topic. Call this as soon as a topic from the memory index becomes relevant to the task. In rp mode with a loaded character, the character's own topics resolve first; global topics remain readable by exact name.",
+      "Persistent memory topics (durable facts, prefs, env details, decisions - not transcripts or web copies). " +
+      "Actions: read (topic body), write (summary + body), edit (replace/append body), forget, list, search, rename, move (global <-> character namespace). " +
+      "The prompt shows an index; read a topic before relying on it.",
     parameters: Type.Object({
-      name: Type.String({ description: "Topic name exactly as it appears in the memory index" }),
+      action: Type.String({ description: "read | write | edit | forget | list | search | rename | move" }),
+      name: Type.Optional(Type.String({ description: "Topic name (read/write/edit/forget/rename/move)" })),
+      summary: Type.Optional(Type.String({ description: "write/edit: one index line (<120 chars)" })),
+      body: Type.Optional(Type.String({ description: "write/edit: body text (omit on edit to keep it)" })),
+      mode: Type.Optional(Type.String({ description: "edit: replace | append" })),
+      new_name: Type.Optional(Type.String({ description: "rename: new topic name" })),
+      target: Type.Optional(Type.String({ description: 'move: "global" or a character slug' })),
+      query: Type.Optional(Type.String({ description: "search: text to find" })),
+      all: Type.Optional(Type.Boolean({ description: "search: every namespace, not just the current one" })),
     }),
-    async execute(_id: string, { name }: { name: string }) {
-      const e = readMemoryEntry(memoryNameForRead(name));
-      if (!e) {
-        return {
-          content: [
-            { type: "text", text: `No memory topic "${name}". Use memory_list to see the available topics.` },
-          ],
-          isError: true,
-        };
-      }
-      return {
-        content: [
-          {
-            type: "text",
-            text: `# ${e.name}\nSummary: ${e.summary}\nLast updated: ${e.updated || "unknown"}\n\n${e.body}`,
-          },
-        ],
-      };
-    },
-  });
-
-  pi.registerTool({
-    name: "memory_write",
-    label: "Memory Write",
-    description:
-      "Save a memory topic (durable facts, prefs, env details, decisions — not transcripts/web copies). `summary` is one index line (<120 chars).",
-    parameters: Type.Object({
-      name: Type.String({ description: "Topic name, e.g. 'myproject_deploy' (letters, digits, underscores, hyphens)" }),
-      summary: Type.String({ description: "One line describing what this topic holds (max ~120 chars)" }),
-      body: Type.String({ description: "The full content to store for this topic" }),
-    }),
-    async execute(_id: string, { name, summary, body }: { name: string; summary: string; body: string }) {
+    async execute(_id: string, args: any) {
+      let action = String(args?.action || "list").toLowerCase().trim();
+      // Forgiving synonyms: weak models say get/show/save/delete.
+      if (["get", "load", "open"].includes(action)) action = "read";
+      else if (["save", "store", "create", "add", "update"].includes(action)) action = "write";
+      else if (["show", "index", "topics"].includes(action)) action = "list";
+      else if (["delete", "remove", "rm", "drop"].includes(action)) action = "forget";
+      else if (["find", "grep", "lookup"].includes(action)) action = "search";
+      else if (["mv"].includes(action)) action = "move";
+      const name = String(args?.name ?? args?.topic ?? "").trim();
       try {
-        const e = writeMemoryEntry(memoryNameForWrite(name), summary, body);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Saved memory topic "${e.name}" (${e.chars} chars). It now appears in the memory index.`,
-            },
-          ],
-        };
+        if (action === "read") {
+          if (!name) return { content: [{ type: "text", text: "memory read needs a name." }], isError: true };
+          const e = readMemoryEntry(memoryNameForRead(name));
+          if (!e) {
+            return { content: [{ type: "text", text: `No memory topic "${name}". Use memory list to see the available topics.` }], isError: true };
+          }
+          return {
+            content: [
+              {
+                type: "text",
+                text: `# ${e.name}\nSummary: ${e.summary}\nLast updated: ${e.updated || "unknown"}\n\n${e.body}`,
+              },
+            ],
+          };
+        }
+        if (action === "write") {
+          if (!name) return { content: [{ type: "text", text: "memory write needs a name and a summary." }], isError: true };
+          const e = writeMemoryEntry(memoryNameForWrite(name), String(args?.summary ?? ""), String(args?.body ?? ""));
+          return {
+            content: [{ type: "text", text: `Saved memory topic "${e.name}" (${e.chars} chars). It now appears in the memory index.` }],
+          };
+        }
+        if (action === "edit") {
+          if (!name) return { content: [{ type: "text", text: "memory edit needs a name." }], isError: true };
+          const editMode = String(args?.mode ?? "").toLowerCase() === "append" ? "append" : "replace";
+          const e = editMemoryEntry(memoryNameForRead(name), {
+            summary: typeof args?.summary === "string" ? args.summary : undefined,
+            body: typeof args?.body === "string" ? args.body : undefined,
+            mode: editMode,
+          });
+          if (!e) return { content: [{ type: "text", text: `No memory topic "${name}".` }], isError: true };
+          return { content: [{ type: "text", text: `Updated memory topic "${e.name}" (${e.chars} chars).` }] };
+        }
+        if (action === "forget") {
+          if (!name) return { content: [{ type: "text", text: "memory forget needs a name." }], isError: true };
+          const ok = forgetMemoryEntry(memoryNameForRead(name));
+          return {
+            content: [{ type: "text", text: ok ? `Deleted memory topic "${memorySlug(name)}".` : `No memory topic "${name}".` }],
+            ...(ok ? {} : { isError: true }),
+          };
+        }
+        if (action === "search") {
+          const query = String(args?.query ?? "").trim();
+          if (!query) return { content: [{ type: "text", text: "memory search needs a query." }], isError: true };
+          const prefix = args?.all === true ? undefined : rpMemoryPrefix();
+          const hits = searchMemories(query, prefix ? { prefix } : undefined);
+          if (!hits.length) return { content: [{ type: "text", text: `No memories match "${query}".` }] };
+          return { content: [{ type: "text", text: hits.map((h) => `• ${h.name}: ${h.summary}\n  ${h.snippet}`).join("\n") }] };
+        }
+        if (action === "rename") {
+          const to = String(args?.new_name ?? "").trim();
+          if (!name || !to) return { content: [{ type: "text", text: "memory rename needs a name and new_name." }], isError: true };
+          const prefix = rpMemoryPrefix() || "";
+          const clean = memorySlug(to);
+          if (!clean) return { content: [{ type: "text", text: "New name needs at least one letter or digit." }], isError: true };
+          const target = prefix && !clean.startsWith(prefix) ? `${prefix}${clean}` : clean;
+          const e = renameMemoryEntry(memoryNameForRead(name), target);
+          if (!e) return { content: [{ type: "text", text: `No memory topic "${name}".` }], isError: true };
+          return { content: [{ type: "text", text: `Renamed to "${e.name}".` }] };
+        }
+        if (action === "move") {
+          const target = String(args?.target ?? "").trim();
+          if (!name || !target) return { content: [{ type: "text", text: 'memory move needs a name and target ("global" or a character slug).' }], isError: true };
+          const e = moveMemoryEntry(memoryNameForRead(name), target);
+          if (!e) return { content: [{ type: "text", text: `No memory topic "${name}".` }], isError: true };
+          return { content: [{ type: "text", text: `Moved to "${e.name}".` }] };
+        }
+        // list (default)
+        const prefix = rpMemoryPrefix();
+        const entries = prefix ? listMemoryEntries().filter((e) => e.name.startsWith(prefix)) : listMemoryEntries();
+        if (entries.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: prefix
+                  ? "No memory topics for this character yet. New topics you write are kept private to this character."
+                  : "Memory is currently empty.",
+              },
+            ],
+          };
+        }
+        const out = entries
+          .map((e) => `• ${e.name} (${e.chars} chars, updated ${e.updated || "?"}): ${e.summary}`)
+          .join("\n");
+        return { content: [{ type: "text", text: out }] };
       } catch (err: any) {
-        return { content: [{ type: "text", text: `Could not save memory: ${err.message}` }], isError: true };
+        return { content: [{ type: "text", text: `Memory ${action} failed: ${err?.message || String(err)}` }], isError: true };
       }
-    },
-  });
-
-  pi.registerTool({
-    name: "memory_forget",
-    label: "Memory Forget",
-    description:
-      "Delete a persistent memory topic. Use when a stored fact has become outdated, wrong, or superseded.",
-    parameters: Type.Object({
-      name: Type.String({ description: "Topic name to delete" }),
-    }),
-    async execute(_id: string, { name }: { name: string }) {
-      const ok = forgetMemoryEntry(memoryNameForRead(name));
-      return {
-        content: [
-          { type: "text", text: ok ? `Deleted memory topic "${memorySlug(name)}".` : `No memory topic "${name}".` },
-        ],
-        ...(ok ? {} : { isError: true }),
-      };
-    },
-  });
-
-  pi.registerTool({
-    name: "memory_list",
-    label: "Memory List",
-    description: "List every persistent memory topic with its summary, size and last-updated date.",
-    parameters: Type.Object({}),
-    async execute() {
-      const prefix = rpMemoryPrefix();
-      const entries = prefix ? listMemoryEntries().filter((e) => e.name.startsWith(prefix)) : listMemoryEntries();
-      if (entries.length === 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: prefix
-                ? "No memory topics for this character yet. New topics you write are kept private to this character."
-                : "Memory is currently empty.",
-            },
-          ],
-        };
-      }
-      const out = entries
-        .map((e) => `• ${e.name} (${e.chars} chars, updated ${e.updated || "?"}): ${e.summary}`)
-        .join("\n");
-      return { content: [{ type: "text", text: out }] };
-    },
-  });
-
-  pi.registerTool({
-    name: "memory_edit",
-    label: "Memory Edit",
-    description:
-      "Rewrite a persistent memory topic's summary and/or body (namespace-aware like memory_read). Mode append adds to the body; replace overwrites.",
-    parameters: Type.Object({
-      name: Type.String({ description: "Topic name" }),
-      summary: Type.Optional(Type.String({ description: "New one-line summary (omit to keep)" })),
-      body: Type.Optional(Type.String({ description: "New body text (omit to keep)" })),
-      mode: Type.Optional(Type.Union([Type.Literal("replace"), Type.Literal("append")])),
-    }),
-    async execute(_id: string, { name, summary, body, mode }: { name: string; summary?: string; body?: string; mode?: "replace" | "append" }) {
-      try {
-        const e = editMemoryEntry(memoryNameForRead(name), { summary, body, mode });
-        if (!e) return { content: [{ type: "text", text: `No memory topic "${name}".` }], isError: true };
-        return { content: [{ type: "text", text: `Updated memory topic "${e.name}" (${e.chars} chars).` }] };
-      } catch (err: any) {
-        return { content: [{ type: "text", text: `Could not edit memory: ${err.message}` }], isError: true };
-      }
-    },
-  });
-
-  pi.registerTool({
-    name: "memory_rename",
-    label: "Memory Rename",
-    description: "Rename a persistent memory topic (stays in its namespace).",
-    parameters: Type.Object({
-      name: Type.String({ description: "Current topic name" }),
-      new_name: Type.String({ description: "New topic name" }),
-    }),
-    async execute(_id: string, { name, new_name }: { name: string; new_name: string }) {
-      try {
-        const prefix = rpMemoryPrefix() || "";
-        const clean = memorySlug(new_name);
-        if (!clean) throw new Error("new name needs at least one letter or digit");
-        const target = prefix && !clean.startsWith(prefix) ? `${prefix}${clean}` : clean;
-        const e = renameMemoryEntry(memoryNameForRead(name), target);
-        if (!e) return { content: [{ type: "text", text: `No memory topic "${name}".` }], isError: true };
-        return { content: [{ type: "text", text: `Renamed to "${e.name}".` }] };
-      } catch (err: any) {
-        return { content: [{ type: "text", text: `Could not rename memory: ${err.message}` }], isError: true };
-      }
-    },
-  });
-
-  pi.registerTool({
-    name: "memory_move",
-    label: "Memory Move",
-    description:
-      "Move a memory topic between the global store and a character namespace. Target: \"global\" or a character slug (e.g. \"evelyn\").",
-    parameters: Type.Object({
-      name: Type.String({ description: "Topic name" }),
-      target: Type.String({ description: '"global" or a character slug' }),
-    }),
-    async execute(_id: string, { name, target }: { name: string; target: string }) {
-      try {
-        const e = moveMemoryEntry(memoryNameForRead(name), target);
-        if (!e) return { content: [{ type: "text", text: `No memory topic "${name}".` }], isError: true };
-        return { content: [{ type: "text", text: `Moved to "${e.name}".` }] };
-      } catch (err: any) {
-        return { content: [{ type: "text", text: `Could not move memory: ${err.message}` }], isError: true };
-      }
-    },
-  });
-
-  pi.registerTool({
-    name: "memory_search",
-    label: "Memory Search",
-    description:
-      "Substring search over memory names, summaries, and bodies (case-insensitive). Defaults to the current namespace; pass all=true for the whole store.",
-    parameters: Type.Object({
-      query: Type.String({ description: "Text to search for" }),
-      all: Type.Optional(Type.Boolean({ description: "Search every namespace, not just the current one" })),
-    }),
-    async execute(_id: string, { query, all }: { query: string; all?: boolean }) {
-      const prefix = all ? undefined : rpMemoryPrefix();
-      const hits = searchMemories(query, prefix ? { prefix } : undefined);
-      if (!hits.length) return { content: [{ type: "text", text: `No memories match "${query}".` }] };
-      const out = hits.map((h) => `• ${h.name}: ${h.summary}\n  ${h.snippet}`).join("\n");
-      return { content: [{ type: "text", text: out }] };
     },
   });
 
@@ -3127,13 +3218,17 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
   // tweaks made while it was active survive the round trip.
   configureProfiles({ personaFile });
 
+  // Drop tools that just got disabled. Never rebuild the list from
+  // getAllTools(): that is every *configured* tool, including definitions this
+  // platform cannot run (powershell on Linux) and ones the user never had
+  // active — activating those puts their schemas in the model context for
+  // nothing. Re-enabling is handled by the before_agent_start merge.
   const refreshActiveTools = () => {
     try {
-      const all = (pi.getAllTools?.() || []).map((t: any) => t.name).filter(Boolean);
-      if (!all.length) return;
+      const current = pi.getActiveTools?.() || [];
+      if (!current.length) return;
       const mode = getEffectiveMode();
-      const next = all.filter((t: string) => isToolEnabled(t, mode) && isToolAllowedInMode(t, mode));
-      pi.setActiveTools?.(next);
+      pi.setActiveTools?.(current.filter((t: string) => isToolEnabled(t, mode) && isToolAllowedInMode(t, mode)));
     } catch {}
   };
 
@@ -3642,7 +3737,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       const entries = (scopeAll ? listMemoryEntries() : listMemoryEntries().filter((e) => e.name.startsWith(prefix!))).sort((x, y) => x.name.localeCompare(y.name));
       const scopeNote = scopeAll ? "all namespaces" : `this character (${prefix}*)`;
       if (!entries.length) {
-        ctx.ui?.notify?.(`No memory topics (${scopeNote}). Write one with the memory_write tool or /memories all to look wider.`, "info");
+        ctx.ui?.notify?.(`No memory topics (${scopeNote}). Write one with the memory tool (action write) or /memories all to look wider.`, "info");
         return;
       }
       if (!ctx.ui?.select) {
@@ -3661,7 +3756,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       if (!action || action.startsWith("❌")) return;
       try {
         if (action === "Read") {
-          const body = entry.body.length > 2000 ? entry.body.slice(0, 2000) + "\n…(truncated — memory_read shows it all)" : entry.body;
+          const body = entry.body.length > 2000 ? entry.body.slice(0, 2000) + "\n…(truncated — memory read shows it all)" : entry.body;
           ctx.ui?.notify?.(`${entry.name} (${entry.updated || "?"}): ${entry.summary}\n\n${body}`, "info");
           return;
         }
@@ -4197,14 +4292,48 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
   });
 
   pi.registerCommand("tasks", {
-    description: "List tracked background tasks (same as task_list)",
+    description: "Background tasks: /tasks [list | clear [id]] (clear drops finished task dirs)",
+    getArgumentCompletions: (argumentText: string) => {
+      const verbs = [{ value: "list", label: "list", description: "Show tracked tasks" }];
+      const trimmed = argumentText.trim();
+      if (!trimmed || !trimmed.includes(" ")) {
+        const filtered = trimmed ? fuzzyFilter(verbs, trimmed, (v: any) => v.label) : verbs;
+        return filtered.length ? filtered : null;
+      }
+      if (trimmed.split(/\s+/)[0].toLowerCase() !== "clear") return null;
+      const finished = listTasks().filter((t) => !t.running).map((t) => ({ value: `clear ${t.id}`, label: t.name, description: t.command.slice(0, 60) }));
+      return finished.length ? finished : null;
+    },
     handler: async (args: string, ctx: any) => {
-      void args;
+      const raw = (args || "").trim();
+      const [verb, ...rest] = raw ? raw.split(/\s+/) : [""];
+      const notify = (m: string, level: "info" | "error" = "info") => ctx.ui?.notify?.(m, level);
+      if (verb.toLowerCase() === "clear" || verb.toLowerCase() === "wipe") {
+        const target = rest.join(" ").trim();
+        try {
+          if (target) {
+            clearTask(target);
+            notify(`Removed finished task ${target}.`);
+            return;
+          }
+          const finished = listTasks().filter((t) => !t.running);
+          if (!finished.length) {
+            notify("No finished tasks to clear.");
+            return;
+          }
+          for (const t of finished) clearTask(t.id);
+          notify(`Cleared ${finished.length} finished task(s).`);
+        } catch (err: any) {
+          notify(err?.message || String(err), "error");
+        }
+        return;
+      }
       const all = listTasks();
-      ctx.ui?.notify?.(
+      notify(
         all.length === 0
           ? "No tasks."
-          : all.map((t) => `${t.running ? "RUN" : "END"} ${t.id} [${t.name}] exit=${t.exitCode ?? "-"} :: ${t.command.slice(0, 80)}`).join("\n"),
+          : all.map((t) => `${t.running ? "RUN" : "END"} ${t.id} [${t.name}] exit=${t.exitCode ?? "-"} :: ${t.command.slice(0, 80)}`).join("\n") +
+              "\n/tasks clear drops finished task dirs.",
         "info"
       );
     },
@@ -4431,11 +4560,10 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       const trimmed = argumentText.trim();
       const modeNow = getEffectiveMode();
       const allowedNow = (t: string) => isToolAllowedInMode(t, modeNow);
-      const allItems = getAllToggleableItems(
-        lastDiscoveredSkills,
-        pi.getAllTools?.()?.map((t: any) => t.name) || [],
-        { mode: modeNow, isAllowed: allowedNow }
-      );
+      const allItems = getAllToggleableItems(lastDiscoveredSkills, declarableToolNames(pi), {
+        mode: modeNow,
+        isAllowed: allowedNow,
+      });
       const subCommands = [
         { value: "status", label: "status", description: "Show status of all tools, skills, and features" },
         { value: "toggle", label: "toggle", description: "Toggle a tool, skill, or feature on/off" },
@@ -4494,7 +4622,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     },
     handler: async (args: string, ctx: any) => {
       const trimmed = args?.trim();
-      const registeredTools = pi.getAllTools?.()?.map((t: any) => t.name) || [];
+      const registeredTools = declarableToolNames(pi);
       const discoveredSkills = lastDiscoveredSkills;
       // Per-mode settings room: only what this mode may use is shown, and
       // every tool flip lands on this mode's own setting.
@@ -4581,21 +4709,39 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
         const settingItems: SettingItem[] = [
           {
             id: "profile:__save__",
-            label: `profile: save current${activeProfileName ? ` into "${activeProfileName}"` : " (no active profile)"}`,
+            label: `📁 profile: save current${activeProfileName ? ` into "${activeProfileName}"` : " (no active profile)"}`,
             currentValue: "save",
             values: ["save"],
           },
-          { id: "profile:__list__", label: "profile: list / switch (/profile)", currentValue: "list", values: ["list"] },
+          { id: "profile:__list__", label: "📁 profile: list / switch (/profile)", currentValue: "list", values: ["list"] },
           ...allItems.map((item) => ({
             id: item.id,
-            label: `${item.name} (${item.category})`,
+            label: `${item.category === "feature" ? "⚙" : item.category === "skill" ? "📚" : "🔧"} ${item.name} (${item.category})`,
             currentValue: item.enabled ? "enabled" : "disabled",
             values: ["enabled", "disabled"],
           })),
         ];
+        const onCount = allItems.filter((i) => i.enabled).length;
+        const offCount = allItems.length - onCount;
 
         await ctx.ui.custom(
           (tui: any, theme: any, _kb: any, done: (val: any) => void) => {
+            // Green = on, red = off. Values are colored by content, so the
+            // list stays readable while scrolling; the cursor marks the row.
+            const listTheme = {
+              label: (text: string, selected: boolean) => (selected ? theme.fg("accent", theme.bold(text)) : text),
+              value: (text: string, selected: boolean) => {
+                if (text === "enabled") return theme.fg("success", "✓ enabled");
+                if (text === "disabled") return theme.fg("error", "✗ disabled");
+                if (text === "save") return theme.fg("accent", "save");
+                if (text === "list") return theme.fg("muted", "list");
+                return selected ? theme.fg("accent", text) : theme.fg("muted", text);
+              },
+              description: (text: string) => theme.fg("dim", text),
+              cursor: theme.fg("accent", "→ "),
+              hint: (text: string) => theme.fg("dim", text),
+            };
+
             const container = new Container();
             container.addChild(
               new (class {
@@ -4603,7 +4749,8 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
                   return [
                     theme.fg("accent", theme.bold(`MykyAgent [${mode} mode]: tools, skills, features & profiles`)),
                     theme.fg("muted", `Profile: ${profileBadge()}  ·  Effort: ${isFeatureEnabled("effort") ? getEffort() : "off"}${isFeatureEnabled("effort") ? "" : " (opt-in)"}`),
-                    theme.fg("muted", "Arrow keys navigate • Enter/Space/Left/Right toggle • Esc closes"),
+                    `${theme.fg("success", `${onCount} on`)} ${theme.fg("dim", "·")} ${theme.fg("error", `${offCount} off`)} ${theme.fg("dim", "·")} ${theme.fg("muted", "Enter to flip")}`,
+                    theme.fg("muted", "↑↓ move • Enter/Space toggles • Esc closes"),
                     theme.fg("muted", "/profile new <name> | use <name> | save — or /mykyagent profile"),
                     "",
                   ];
@@ -4615,7 +4762,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
             const settingsList = new SettingsList(
               settingItems,
               Math.min(settingItems.length + 3, 18),
-              getSettingsListTheme(),
+              listTheme,
               (id: string, newValue: string) => {
                 if (id === "profile:__save__") {
                   void runProfileAction("save", ctx);

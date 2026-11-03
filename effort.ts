@@ -7,7 +7,7 @@
  * Levels: low | high | max   (default: high)
  *   low  — smallest correct change, one command proves it.
  *   high — done-criteria up front, bugs reproduced before fixing, real output.
- *   max  — spec + architecture + tests + manual pass + polish + acceptance report.
+ *   max  — plan + architecture + tests + manual run + polish + acceptance report.
  *
  * No level is a per-turn ritual: every block scales the proof to the change. A
  * question must not grow a build pipeline just because the stored level is max;
@@ -40,9 +40,9 @@ export type EffortLevel = (typeof EFFORT_LEVELS)[number];
 export const DEFAULT_EFFORT: EffortLevel = "high";
 
 export const EFFORT_HELP: Record<EffortLevel, string> = {
-  low: "Smallest correct change. No new tests. Use for typos, one-liners, throwaway probes.",
-  high: "Done-criteria before code, bugs reproduced before fixing, real verification output, honest gap list. Use for features, bug hunts, game systems.",
-  max: "Spec + architecture, tests, manual playthrough, polish pass, acceptance report. Use for new projects and anything you will actually ship.",
+  low: "Smallest correct change, one proving command. Typos, one-liners, throwaway probes.",
+  high: "Real output for anything you claim; a reported bug is reproduced before it is fixed.",
+  max: "Plan, tests, manual run, polish, acceptance report. New projects you will ship.",
 };
 
 const BLOCKS: Record<EffortLevel, string> = {
@@ -63,7 +63,7 @@ const BLOCKS: Record<EffortLevel, string> = {
   max:
     `Work standard (effort=max):\n` +
     `- Size the ceremony to the change: question or explanation -> just answer it; one-line or targeted fix -> make it and run one command that proves it; feature, bug hunt, multi-file or stateful change -> the full standard below. Depth is judgment, not ritual.\n` +
-    `- Spec first: state assumptions and up to 3 open questions. For anything big, sketch the architecture (files, data, state) before writing.\n` +
+    `- Plan first: state assumptions and up to 3 open questions. For anything big, sketch the architecture (files, data, state) before writing.\n` +
     `- Build in slices, each one runnable — no big-bang dump at the end.\n` +
     `- Bug report: reproduce the exact symptom in a test or probe first, then fix.\n` +
     `- Write real tests for core logic and run them.\n` +
@@ -114,7 +114,7 @@ export function describeEffort(): string {
   const cur = getEffort();
   const lines = EFFORT_LEVELS.map((l) => `• ${l}${l === cur ? "  ← current" : ""}: ${EFFORT_HELP[l]}`);
   const header = `Effort: ${cur}${isEffortExplicit() ? "" : " (default)"}${isFeatureEnabled("effort") ? "" : " — feature OFF, /effort <level> turns it on"}`;
-  return [header, ...lines, "Set with /effort <level>. Override one message by starting it with low: / high: / max:", "Code mode only: rp scenes never carry a level, rp-creator only via the prefix."].join("\n");
+  return [header, ...lines, "Set with /effort <level>, or prefix one message: low: / high: / max:. Code mode only."].join("\n");
 }
 
 /** Leading `low:` / `high:` / `max:` on a user message, or null. */

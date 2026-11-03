@@ -8,7 +8,7 @@
  *     prompt (see `memoryIndexBlock`) and is therefore hard-capped, single-line,
  *     and sanitised;
  *   - a `body`, which is never injected and is only loaded when the model calls
- *     `memory_read` for that topic.
+ *     the `memory` tool (action read) for that topic.
  *
  * That keeps the prompt cost roughly constant whether there are 4 topics or 400,
  * and keeps model-authored prose out of the highest-trust region of the context
@@ -24,7 +24,14 @@ import { dirname, join } from "node:path";
 
 const DEFAULT_ROOT = join(homedir(), ".config", "mykyagent", "memory");
 
-export const MEMORY_INDEX_MAX = Number(process.env.MYKYAGENT_MEMORY_INDEX_CHARS) || 1800;
+/**
+ * Chars of index lines injected per turn. The index is a discovery aid, not a
+ * dump: ~1000 chars keeps 8-10 topics visible (~250 tokens) and memory list
+ * covers the rest. Override with MYKYAGENT_MEMORY_INDEX_CHARS.
+ */
+export const MEMORY_INDEX_MAX = Number(process.env.MYKYAGENT_MEMORY_INDEX_CHARS) || 1000;
+/** Chars of a topic summary shown in the index line (the body keeps the rest). */
+export const MEMORY_INDEX_SUMMARY_MAX = Number(process.env.MYKYAGENT_MEMORY_INDEX_SUMMARY_CHARS) || 70;
 export const MEMORY_BODY_MAX = Number(process.env.MYKYAGENT_MEMORY_BODY_CHARS) || 12000;
 export const MEMORY_SUMMARY_MAX = 140;
 
@@ -221,7 +228,11 @@ export function memoryIndexBlock(onlyPrefix?: string): string {
   let used = 0;
   let hidden = 0;
   for (const e of entries) {
-    const line = `- ${e.name}: ${e.summary || "(no summary)"}`;
+    // The index is paid for on every turn: one clipped line per topic, long
+    // summaries stay in the body where a memory read can fetch them.
+    const summary = (e.summary || "(no summary)").slice(0, MEMORY_INDEX_SUMMARY_MAX);
+    const clipped = summary.length < (e.summary || "").length ? `${summary}…` : summary;
+    const line = `- ${e.name}: ${clipped}`;
     if (lines.length > 0 && used + line.length + 1 > MEMORY_INDEX_MAX) {
       hidden = entries.length - lines.length;
       break;
@@ -231,12 +242,11 @@ export function memoryIndexBlock(onlyPrefix?: string): string {
   }
 
   let block =
-    "\n\n## Persistent Memory (index only - bodies are NOT loaded)\n" +
-    "Call `memory_read` with the exact topic name when one becomes relevant. " +
-    "Never assume you know the contents of a topic you have not read this session.\n" +
+    "\n\n## Memory index (bodies are NOT loaded)\n" +
+    "Read a topic with the memory tool before relying on it.\n" +
     lines.join("\n");
 
-  if (hidden > 0) block += `\n(${hidden} further topic(s) not shown - use memory_list)`;
+  if (hidden > 0) block += `\n(${hidden} further topic(s) not shown - memory list shows all)`;
   return block;
 }
 

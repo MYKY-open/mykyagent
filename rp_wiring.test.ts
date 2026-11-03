@@ -248,14 +248,14 @@ t("rp features in toggle registry", ["rp", "lorebook", "authors_note", "rp_creat
 // Section 7 unloaded the character (mode: code). Seed a global topic that must
 // NOT leak into the character's index — while still in code mode.
 const modeMod = await import("./mode.ts");
-await tools.memory_write.execute("x", { name: "kernel_build", summary: "tech build notes", body: "arduino stuff" });
+await tools.memory.execute("x", { action: "write", name: "kernel_build", summary: "tech build notes", body: "arduino stuff" });
 
 // Re-enter rp with Vex loaded.
 modeMod.setMode("rp");
 modeMod.setActiveCharacter("vex");
 
 // Still in rp mode with Vex loaded from earlier in this suite.
-await tools.memory_write.execute("x", { name: "trust", summary: "Vex trusts User after the harbor escape", body: "affinity high; owes User one" });
+await tools.memory.execute("x", { action: "write", name: "trust", summary: "Vex trusts User after the harbor escape", body: "affinity high; owes User one" });
 
 const { existsSync, readFileSync: rf } = await import("node:fs");
 const memDir = process.env.MYKYAGENT_MEMORY_DIR!;
@@ -263,26 +263,26 @@ t("rp write namespaced to char-vex-trust", existsSync(join(memDir, "char-vex-tru
 t("rp write did not touch global store", !existsSync(join(memDir, "trust.md")));
 
 // character index shows only character topics
-const memListRp = await tools.memory_list.execute("x", {});
-t("rp memory_list shows only char topics", String(memListRp.content[0].text).includes("char-vex-trust") && !String(memListRp.content[0].text).includes("kernel_build"));
+const memListRp = await tools.memory.execute("x", { action: "list" });
+t("rp memory list shows only char topics", String(memListRp.content[0].text).includes("char-vex-trust") && !String(memListRp.content[0].text).includes("kernel_build"));
 
 // rp prompt index also filtered
 const rpMemPrompt = await hooks["before_agent_start"]({ prompt: "what do you remember about us?" }, { cwd: DIR });
 t("rp prompt memory index filtered", rpMemPrompt.systemPrompt.includes("char-vex-trust") && !rpMemPrompt.systemPrompt.includes("kernel_build"));
 
 // read resolves character topic by short name
-const readLocal = await tools.memory_read.execute("x", { name: "trust" });
+const readLocal = await tools.memory.execute("x", { action: "read", name: "trust" });
 t("rp read resolves char topic by short name", String(readLocal.content[0].text).includes("harbor escape"));
 
 // read falls back to global when character has no such topic
-const readGlobal = await tools.memory_read.execute("x", { name: "kernel_build" });
+const readGlobal = await tools.memory.execute("x", { action: "read", name: "kernel_build" });
 t("rp read falls back to global topic", String(readGlobal.content[0].text).includes("arduino stuff"));
 
 // code mode: global view again, no namespace on writes
 modeMod.setMode("code");
-const memListCode = await tools.memory_list.execute("x", {});
-t("code memory_list shows global topics", String(memListCode.content[0].text).includes("kernel_build") && String(memListCode.content[0].text).includes("char-vex-trust"));
-await tools.memory_write.execute("x", { name: "global_note", summary: "global", body: "g" });
+const memListCode = await tools.memory.execute("x", { action: "list" });
+t("code memory list shows global topics", String(memListCode.content[0].text).includes("kernel_build") && String(memListCode.content[0].text).includes("char-vex-trust"));
+await tools.memory.execute("x", { action: "write", name: "global_note", summary: "global", body: "g" });
 t("code write lands unnamespaced", existsSync(join(memDir, "global_note.md")));
 
 // --- 10. fresh-session greeting self-heal (/new + /clear wipe the transcript;
@@ -299,22 +299,22 @@ await hooks["before_agent_start"](
 );
 t("lived-in session stays quiet", !livedNotify.some((n) => n.includes("Greeting:")));
 
-// --- 10. per-mode tool settings: memory_read off in rp, on in code --------
+// --- 10. per-mode tool settings: memory off in rp, on in code --------------
 const { setToolEnabled: setTE } = await import("./toggles.ts");
-setTE("memory_read", false, "rp");
+setTE("memory", false, "rp");
 modeMod.setMode("rp");
 modeMod.setActiveCharacter("vex");
-activeTools = ["bash", "read", "memory_read", "dice_roll"];
+activeTools = ["bash", "read", "memory", "dice_roll"];
 await hooks["before_agent_start"]({ prompt: "hi" }, { cwd: DIR });
-t("per-mode off hides tool in rp", !activeTools.includes("memory_read") && activeTools.includes("dice_roll"));
+t("per-mode off hides tool in rp", !activeTools.includes("memory") && activeTools.includes("dice_roll"));
 modeMod.setMode("code");
-activeTools = ["bash", "read", "memory_read", "dice_roll"];
+activeTools = ["bash", "read", "memory", "dice_roll"];
 await hooks["before_agent_start"]({ prompt: "hi" }, { cwd: DIR });
-t("other mode keeps tool", activeTools.includes("memory_read") && activeTools.includes("read"));
-setTE("memory_read", true);
+t("other mode keeps tool", activeTools.includes("memory") && activeTools.includes("read"));
+setTE("memory", true);
 modeMod.setMode("rp");
 modeMod.setActiveCharacter("vex");
-t("bare reset restores everywhere", (await import("./toggles.ts")).isToolEnabled("memory_read", "rp") === true);
+t("bare reset restores everywhere", (await import("./toggles.ts")).isToolEnabled("memory", "rp") === true);
 
 rmSync(DIR, { recursive: true, force: true });
 console.log(`\n${pass} pass, ${fail} fail`);

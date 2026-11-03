@@ -339,8 +339,3 @@ export class McpRegistry {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Back-compat: index.ts used to wire a toolset remover for custom tools.
-// Pi owns tool lifecycles now; kept as a no-op export so old imports don't break.
-// ---------------------------------------------------------------------------
-export function setMcpActiveToolsetRemover(_fn: (toolName: string) => void): void {}

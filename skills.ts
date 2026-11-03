@@ -106,10 +106,3 @@ export function skillsPromptLine(): string {
   return `Skills on disk: ${skills.map((s) => s.name).join(", ")} — read any via skill_read when the task matches.`;
 }
 
-export function ensureSkillsDirs(): void {
-  for (const dir of skillsDirs()) {
-    try {
-      mkdirSync(dir, { recursive: true });
-    } catch {}
-  }
-}

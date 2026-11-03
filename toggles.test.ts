@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -8,7 +8,9 @@ import {
   isSkillEnabled,
   isSkillsMasterEnabled,
   isToolEnabled,
+  isToolRunnableHere,
   loadToggles,
+  migrateLegacyMemoryToggles,
   resetAllToggles,
   setFeatureEnabled,
   setSkillEnabled,
@@ -59,9 +61,9 @@ setFeatureEnabled("web", true);
 t("web feature true restores web_search", isToolEnabled("web_search") === true);
 
 setFeatureEnabled("memory", false);
-t("memory feature false disables memory_read", isToolEnabled("memory_read") === false);
+t("memory feature false disables the memory tool", isToolEnabled("memory") === false);
 setFeatureEnabled("memory", true);
-t("memory feature true restores memory_read", isToolEnabled("memory_read") === true);
+t("memory feature true restores the memory tool", isToolEnabled("memory") === true);
 
 // 5. Skills toggles
 setSkillEnabled("web-scraping", false);
@@ -108,6 +110,13 @@ t("items include custom tools", items.some((i) => i.name === "custom_tool" && i.
 t("items include features", items.some((i) => i.name === "memory" && i.category === "feature"));
 t("items include skills", items.some((i) => i.name === "web-scraping" && i.category === "skill"));
 
+// pi defines powershell on every platform; only Windows can run it, so the
+// board must not list it (or offer a toggle that does nothing) elsewhere.
+t("runnable filter: powershell is Windows-only", isToolRunnableHere("powershell") === (process.platform === "win32"));
+t("runnable filter: other tools pass", isToolRunnableHere("bash") === true && isToolRunnableHere("read") === true);
+const plat = getAllToggleableItems(["web-scraping"], ["bash", "powershell"]);
+t("board hides platform-dead tools", process.platform === "win32" || !plat.some((i) => i.name === "powershell"), plat.map((i) => i.name).join(","));
+
 const summary = formatTogglesSummary(["web-scraping"]);
 t("summary contains header and sections", summary.includes("Features:") && summary.includes("Skills:") && summary.includes("Tools:"));
 
@@ -125,20 +134,25 @@ resetAllToggles();
 t("reset returns tool_recovery to OFF", isFeatureEnabled("tool_recovery") === false);
 
 // 10. Per-mode tool settings
-setToolEnabled("memory_read", false, "rp");
-t("per-mode off in rp", isToolEnabled("memory_read", "rp") === false);
-t("other mode unaffected", isToolEnabled("memory_read", "code") === true);
+setToolEnabled("memory", false, "rp");
+t("per-mode off in rp", isToolEnabled("memory", "rp") === false);
+t("other mode unaffected", isToolEnabled("memory", "code") === true);
 t("legacy boolean still global", (() => { setToolEnabled("bash", false); const a = isToolEnabled("bash", "rp") === false && isToolEnabled("bash", "code") === false; setToolEnabled("bash", true); return a; })());
-setToolEnabled("memory_read", true, "rp");
-t("per-mode re-enable", isToolEnabled("memory_read", "rp") === true);
+setToolEnabled("memory", true, "rp");
+t("per-mode re-enable", isToolEnabled("memory", "rp") === true);
 
 setToolEnabled("grep", false);
 t("bare set hits all modes", isToolEnabled("grep", "rp") === false && isToolEnabled("grep") === false);
 setToolEnabled("grep", true);
 
-const rMode = toggleByName("memory_write", false, [], "rp");
-t("toggleByName mode message", rMode.ok && rMode.enabled === false && rMode.message.includes("rp mode") && isToolEnabled("memory_write", "rp") === false && isToolEnabled("memory_write", "code") === true);
-setToolEnabled("memory_write", true, "rp");
+const rMode = toggleByName("tool:memory", false, [], "rp");
+t("toggleByName mode message", rMode.ok && rMode.enabled === false && rMode.message.includes("rp mode") && isToolEnabled("memory", "rp") === false && isToolEnabled("memory", "code") === true);
+setToolEnabled("memory", true, "rp");
+// Name collision by design: bare "memory" is the master feature, the tool
+// needs the prefix.
+t("bare memory hits the feature", toggleByName("memory", false, []).category === "feature" && isFeatureEnabled("memory") === false);
+t("tool:memory hits the tool", toggleByName("tool:memory", true, []).category === "tool");
+setFeatureEnabled("memory", true);
 
 const rpItems = getAllToggleableItems([], ["bash", "dice_roll"], { mode: "rp", isAllowed: (x) => x !== "bash" });
 t("mode-blocked tools hidden", !rpItems.some((i) => i.name === "bash") && rpItems.some((i) => i.name === "dice_roll"));
@@ -149,6 +163,41 @@ setToolEnabled("dice_roll", true, "rp");
 const sumMode = formatTogglesSummary([], ["bash"], { mode: "rp", isAllowed: (x) => x !== "bash" });
 t("summary shows mode + hidden note", sumMode.includes("[rp mode]") && sumMode.includes("unavailable in rp mode"));
 t("unfiltered listing unchanged", getAllToggleableItems(["web-scraping"], ["custom_tool"]).some((i) => i.name === "read"));
+
+// 10b. skills master owns the skill_read tool
+{
+  setSkillsMasterEnabled(true);
+  t("skills master on: skill_read usable", isToolEnabled("skill_read") === true);
+  setSkillsMasterEnabled(false);
+  t("skills master off: skill_read follows", isToolEnabled("skill_read") === false);
+  const boardOff = getAllToggleableItems(["commit"], ["skill_read"]);
+  t("board has one master row plus per-skill rows", boardOff.filter((i) => i.category === "skill" && i.name === "skills").length === 1 && boardOff.some((i) => i.name === "commit"), boardOff.map((i) => i.id).join(","));
+  t("board hides the skill_read tool row", !boardOff.some((i) => i.name === "skill_read" && i.category === "tool"));
+  const flipped = toggleByName("skill_read", true, ["commit"]);
+  t("bare skill_read flips the master", flipped.category === "skill" && isSkillsMasterEnabled() === true && isToolEnabled("skill_read") === true);
+}
+
+// 11. legacy memory tool keys fold into the merged memory tool
+{
+  writeFileSync(
+    process.env.MYKYAGENT_TOGGLES_FILE!,
+    JSON.stringify({
+      tools: {
+        memory_read: { code: false, rp: true },
+        memory_write: { code: false, rp: true },
+        memory_list: { code: false },
+        bash: { code: false },
+      },
+    }),
+    "utf-8"
+  );
+  t("migration runs on legacy keys", migrateLegacyMemoryToggles() === true);
+  const cfg = loadToggles();
+  t("migration derives the merged mode", isToolEnabled("memory", "code") === false && isToolEnabled("memory", "rp") === true);
+  t("migration drops the stale keys", !Object.keys(cfg.tools || {}).some((k) => k.startsWith("memory_")), Object.keys(cfg.tools || {}).join(","));
+  t("migration keeps unrelated tools", isToolEnabled("bash", "code") === false);
+  t("migration is idempotent", migrateLegacyMemoryToggles() === false);
+}
 
 rmSync(DIR, { recursive: true, force: true });
 console.log(`\ntoggles: ${pass} passed, ${fail} failed`);

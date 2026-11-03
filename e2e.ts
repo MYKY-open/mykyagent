@@ -39,7 +39,7 @@ const hooks: Record<string, any> = {};
 
 const ctx: any = { getModel: () => undefined, cwd: process.cwd() };
 
-t("tools: all expected tools registered", ["web_search", "web_fetch", "memory_read", "memory_write", "memory_forget", "memory_list", "read"].every((n) => tools[n]), Object.keys(tools).join(","));
+t("tools: all expected tools registered", ["web_search", "web_fetch", "memory", "read"].every((n) => tools[n]), Object.keys(tools).join(","));
 t("tools: persona_set is NOT registered", !tools["persona_set"]);
 
 if (hooks["before_agent_start"]) await hooks["before_agent_start"]({}, ctx);

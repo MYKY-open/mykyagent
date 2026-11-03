@@ -38,7 +38,7 @@ t("normalizeMode keeps rp-creator", mode.normalizeMode("rp-creator") === "rp-cre
 t("rp mode blocks coding tools", mode.isToolAllowedInMode("bash", "rp") === false);
 t("rp mode blocks web tools", mode.isToolAllowedInMode("web_search", "rp") === false);
 t("rp mode blocks creator tools", mode.isToolAllowedInMode("character_save", "rp") === false);
-t("rp mode keeps read + memory", mode.isToolAllowedInMode("read", "rp") && mode.isToolAllowedInMode("memory_read", "rp"));
+t("rp mode keeps read + memory", mode.isToolAllowedInMode("read", "rp") && mode.isToolAllowedInMode("memory", "rp"));
 t("rp mode keeps rpg tools", RPG_ALLOWS());
 function RPG_ALLOWS() {
   return ["dice_roll", "game_state", "advance_time"].every((x) => mode.isToolAllowedInMode(x, "rp"));

@@ -19,7 +19,7 @@ const notify = (m: string) => console.log("  [notify]", m.split("\n").join(" | "
 
 const commands: Record<string, any> = {};
 const hooks: Record<string, any> = {};
-const toolState = { active: ["bash", "web_search", "web_fetch", "memory_list"] as string[] };
+const toolState = { active: ["bash", "web_search", "web_fetch", "memory"] as string[] };
 (ext as any)({
   on: (n: string, f: any) => (hooks[n] = f),
   registerTool: () => {},
@@ -242,7 +242,7 @@ console.log("--- 12. web-toggle: status, off, before_agent_start merge, on ---")
   console.log("--- 12b. killswitch survives a RESTART (fresh session defaults) ---");
   await commands["web-toggle"].handler("off", ctxB);
   // Simulate a brand-new session: pi's defaults include the registered web tools.
-  toolState.active = ["bash", "read", "web_search", "web_fetch", "memory_list"];
+  toolState.active = ["bash", "read", "web_search", "web_fetch", "memory"];
   const res3 = await hooks["before_agent_start"]({}, ctxB);
   const sp3: string = res3?.systemPrompt || "";
   console.log(

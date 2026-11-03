@@ -8,7 +8,6 @@
 import {
   deleteCharacter,
   duplicateCharacter,
-  listCharacters,
   loadCharacter,
   renameCharacter,
   saveCharacter,
