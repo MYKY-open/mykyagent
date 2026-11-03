@@ -21,7 +21,7 @@ import { listSkills, readSkill, skillsPromptLine } from "./skills.ts";
 import { addTodo, clearTodos, describeTodos, doneTodo, loadTodos, openTodos, todoBlock } from "./todo.ts";
 import { listCheckpoints, resolveToolPath, restoreCheckpoint, snapshotFile } from "./checkpoints.ts";
 import { buildResumeText, loadAutoState, saveAutoStub, saveSummary } from "./resume.ts";
-import { addTags, clearTags, getTags, removeTags, renderTagsBlock, setTags } from "./tags.ts";
+import { clearBrief, describeBrief, getBrief, renderBriefBlock, setBrief } from "./brief.ts";
 import { EFFORT_HELP, EFFORT_LEVELS, describeEffort, effortForTurn, getEffort, renderEffortBlock, setEffort } from "./effort.ts";
 import {
   applyProfile,
@@ -75,6 +75,7 @@ import {
   isSkillsMasterEnabled,
   isToolEnabled,
   isToolRunnableHere,
+  migrateLegacyFeatureToggles,
   migrateLegacyMemoryToggles,
   resetAllToggles,
   setFeatureEnabled,
@@ -1115,8 +1116,8 @@ export function cleanGhostDraft(raw: string, userName: string): string {
   return d.trim();
 }
 
-export function buildGhostPrompt(opts: { charName?: string; charLine?: string; userName: string; history: string; hint: string; tints: string[] }): { systemPrompt: string; userContent: string } {
-  const { charName, charLine, userName, history, hint, tints } = opts;
+export function buildGhostPrompt(opts: { charName?: string; charLine?: string; userName: string; history: string; hint: string; brief: string }): { systemPrompt: string; userContent: string } {
+  const { charName, charLine, userName, history, hint, brief } = opts;
   const who = charName ? `You are ghostwriting for ${userName}, who is roleplaying with the character ${charName}${charLine ? ` (${charLine})` : ""}.` : `You are ghostwriting for ${userName} in an open roleplay.`;
   const notYou = charName
     ? `You are NOT ${charName}. Never write ${charName}'s words, thoughts, or actions — only ${userName}'s. If the last scene message is from ${charName}, respond TO it as ${userName}; do not continue it. `
@@ -1129,7 +1130,7 @@ export function buildGhostPrompt(opts: { charName?: string; charLine?: string; u
     `Output ONLY the draft message — no quotes, no speaker prefix, no stage directions about who is talking, no commentary.`;
   const parts = [`Write ${userName}'s next message.`];
   if (history) parts.push(`Recent scene:\n${history}`);
-  if (tints.length) parts.push(`Flavor (subtle): ${tints.join(", ")}.`);
+  if (brief.trim()) parts.push(`Session brief (what the story is about): ${brief.trim().slice(0, 300)}`);
   if (hint.trim()) parts.push(`${userName}'s rough idea (expand faithfully into a finished, in-voice message, same intent): "${hint.trim().slice(0, 300)}"`);
   else parts.push(`No hint given: write the most natural, scene-fitting thing for ${userName} to say or do next.`);
   return { systemPrompt, userContent: parts.join("\n\n") };
@@ -1495,6 +1496,7 @@ function refreshStatus(ctx?: any): void {
 export default function (pi: any) {
   migrateLegacyMemory();
   migrateLegacyMemoryToggles();
+  migrateLegacyFeatureToggles();
 
   // 1. Caveman System Prompt + Memory Injection
   pi.on("before_agent_start", async (event: any, ctx: any) => {
@@ -1625,7 +1627,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
         : "";
 
       const rpMemBlock = memoryOff ? "" : memoryIndexBlock(rpMemoryPrefix());
-      const rpTagsBlock = isFeatureEnabled("tags") ? renderTagsBlock() : "";
+      const rpBriefBlock = isFeatureEnabled("brief") ? renderBriefBlock() : "";
       const rpStyleBlock = isFeatureEnabled("style") ? renderStyleBlock() : "";
       // Fresh-session self-heal: /new and /clear wipe the visible transcript and
       // pi never emits session_start for them, so the load-time greeting toast
@@ -1640,7 +1642,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
           ctx.ui.notify(`\x1b[22m\x1b[1;97mGreeting:\x1b[0m\n${formatWhiteGreeting(greetNow)}`, "info");
         }
       } catch {}
-      return { systemPrompt: buildRpSystemPrompt({ characterBlock, loreBlock, authorsNoteBlock: anBlock, toolHintsBlock, memoryBlock: rpMemBlock, userName, greetingReminder, tagsBlock: rpTagsBlock, styleBlock: rpStyleBlock }) };
+      return { systemPrompt: buildRpSystemPrompt({ characterBlock, loreBlock, authorsNoteBlock: anBlock, toolHintsBlock, memoryBlock: rpMemBlock, userName, greetingReminder, briefBlock: rpBriefBlock, styleBlock: rpStyleBlock }) };
     }
 
     // --- rp-creator mode: engineering prompt + Story Studio overlay ----------
@@ -1742,9 +1744,9 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     if (skillLine) systemPrompt += `\n\n${skillLine}`;
     const todos = todoBlock();
     if (todos) systemPrompt += `\n\n${todos}`;
-    if (isFeatureEnabled("tags")) {
-      const tint = renderTagsBlock();
-      if (tint) systemPrompt += `\n\n${tint}`;
+    if (isFeatureEnabled("brief")) {
+      const brief = renderBriefBlock();
+      if (brief) systemPrompt += `\n\n${brief}`;
     }
     if (isFeatureEnabled("style")) {
       const sty = renderStyleBlock();
@@ -3213,7 +3215,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
   });
 
   // --- Profiles: one switch for the settings you keep flipping --------------
-  // A profile is a snapshot of effort + toggles + persona + style + tags. The
+  // A profile is a snapshot of effort + toggles + persona + style + brief. The
   // live stores stay the truth; switching saves the outgoing profile first, so
   // tweaks made while it was active survive the round trip.
   configureProfiles({ personaFile });
@@ -3342,7 +3344,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     },
   });
 
-  // 10c. Profiles (/profile — named snapshots of effort/toggles/persona/style/tags)
+  // 10c. Profiles (/profile — named snapshots of effort/toggles/persona/style/brief)
   pi.registerCommand("profile", {
     description: "Profiles: /profile [list | new <name> | use <name> | save [name] | delete <name> | rename <old> <new>]",
     getArgumentCompletions: (argumentText: string) => {
@@ -3396,59 +3398,52 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     },
   });
 
+  // 10e. Session brief (/brief, alias /tags) --------------------------------
+  // One paragraph in the user's own words, injected in code and RP. The old
+  // tint list ("noir, terse") asked the model to guess; this does not.
+  const briefHandler = async (args: string, ctx: any) => {
+    const raw = (args || "").trim();
+    const notify = (msg: string, level: "info" | "error" = "info") => ctx.ui?.notify?.(msg, level);
+    if (!raw || raw.toLowerCase() === "list" || raw.toLowerCase() === "show") {
+      notify(describeBrief());
+      return;
+    }
+    if (raw.toLowerCase() === "clear") {
+      clearBrief();
+      notify("Session brief cleared.");
+      return;
+    }
+    // Old muscle memory: /tags add|remove|set are gone with the tint list.
+    const [head, ...rest] = raw.split(/\s+/);
+    const verb = head.toLowerCase();
+    if (verb === "add" || verb === "remove" || verb === "set") {
+      const text = rest.join(" ").trim();
+      notify(
+        text
+          ? `Tints are gone — /brief takes a description, not keywords. Use /brief ${text} if you meant that.`
+          : "Tints are gone. Use /brief <text> to describe the session instead.",
+        "error"
+      );
+      return;
+    }
+    try {
+      const text = setBrief(raw);
+      setFeatureEnabled("brief", true);
+      const shown = text.length > 120 ? `${text.slice(0, 120)}…` : text;
+      notify(`Session brief set (${text.length} chars, clipped to 600 in the prompt):\n${shown}\nApplies to code and RP; /brief clear removes it.`);
+    } catch (err: any) {
+      notify(err?.message || String(err), "error");
+    }
+  };
+
+  pi.registerCommand("brief", {
+    description: "Session brief: /brief <text> | /brief | /brief clear — what this session is about, code and RP",
+    handler: briefHandler,
+  });
+
   pi.registerCommand("tags", {
-    description: "Conversation tints: /tags [add <a, b> | remove <a> | list | clear] (additive flavor, works in every mode)",
-    getArgumentCompletions: (argumentText: string) => {
-      if (argumentText.includes(" ")) return null;
-      const subs: AutocompleteItem[] = [
-        { value: "add", label: "add", description: "add tint(s): /tags add noir, terse" },
-        { value: "remove", label: "remove", description: "drop tint(s)" },
-        { value: "list", label: "list", description: "show active tints" },
-        { value: "clear", label: "clear", description: "remove all tints" },
-      ];
-      const trimmed = argumentText.trim();
-      const filtered = trimmed ? fuzzyFilter(subs, trimmed, (s: any) => s.label) : subs;
-      return filtered.length ? filtered : null;
-    },
-    handler: async (args: string, ctx: any) => {
-      const trimmed = args?.trim() || "";
-      if (!trimmed || trimmed === "list") {
-        const cur = getTags();
-        ctx.ui?.notify?.(cur.length ? `Active tints: ${cur.join(", ")} (toggle: /mykyagent toggle tags)` : "No tints set. Try /tags add noir, terse — or /tags add cozy.", "info");
-        return;
-      }
-      if (trimmed === "clear") {
-        clearTags();
-        ctx.ui?.notify?.("Tints cleared.", "info");
-        return;
-      }
-      const [sub, ...rest] = trimmed.split(/\s+/);
-      const payload = rest.join(" ").split(/[,,]+/).map((s) => s.trim()).filter(Boolean);
-      if (sub === "add") {
-        if (!payload.length) {
-          ctx.ui?.notify?.("Usage: /tags add <tint>[, <tint>...] (e.g. /tags add noir, terse)", "error");
-          return;
-        }
-        const { tags, added } = addTags(payload);
-        ctx.ui?.notify?.(added.length ? `Tints: ${tags.join(", ")} (added ${added.join(", ")}).` : `Nothing added (max 10 tints). Current: ${tags.join(", ") || "none"}.`, "info");
-        return;
-      }
-      if (sub === "remove") {
-        if (!payload.length) {
-          ctx.ui?.notify?.("Usage: /tags remove <tint>[, ...]", "error");
-          return;
-        }
-        const { tags, removed } = removeTags(payload);
-        ctx.ui?.notify?.(removed.length ? `Removed ${removed.join(", ")}. Tints: ${tags.join(", ") || "none"}.` : `None of those tints are active. Current: ${tags.join(", ") || "none"}.`, "info");
-        return;
-      }
-      if (sub === "set") {
-        const tags = setTags(payload);
-        ctx.ui?.notify?.(tags.length ? `Tints set: ${tags.join(", ")}.` : "Tints cleared.", "info");
-        return;
-      }
-      ctx.ui?.notify?.("Usage: /tags [add <tint, ...> | remove <tint, ...> | list | clear]", "error");
-    },
+    description: "Alias for /brief (conversation tints were removed)",
+    handler: briefHandler,
   });
 
   const ghostHandler = async (args: string, ctx: any) => {
@@ -3471,14 +3466,14 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     const card = cfg.activeCharacter ? loadCharacter(cfg.activeCharacter) : null;
     const entries = ctx?.sessionManager?.getEntries?.() || [];
     const history = extractGhostHistory(entries, 2000, userName, card?.name || "char");
-    const tints = isFeatureEnabled("tags") ? getTags() : [];
+    const brief = isFeatureEnabled("brief") ? getBrief() : "";
     const { systemPrompt, userContent } = buildGhostPrompt({
       charName: card?.name,
       charLine: card ? `${card.personality || ""} ${card.scenario || ""}`.trim().replace(/\s+/g, " ").slice(0, 300) : undefined,
       userName,
       history,
       hint,
-      tints,
+      brief,
     });
     const completeOnce = async (): Promise<{ draft?: string; error?: string; leaked?: boolean }> => {
       const ghostChar = card?.name;

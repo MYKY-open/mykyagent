@@ -2,7 +2,7 @@
  * Profiles: named snapshots of the settings you keep flipping.
  *
  * A profile stores the raw JSON of the live stores — effort, toggles, persona,
- * style dials, tags — so switching one writes those files and every module
+ * style dials, brief — so switching one writes those files and every module
  * picks the change up on its next read. No other module knows profiles exist.
  *
  *   ~/.config/mykyagent/profiles/<slug>/profile.json   (env MYKYAGENT_PROFILES_DIR)
@@ -29,7 +29,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { EFFORT_LEVELS, getEffortFile } from "./effort.ts";
 import { getStyleFile } from "./style.ts";
-import { getTagsFile } from "./tags.ts";
+import { briefFile } from "./brief.ts";
 import { getTogglesFile } from "./toggles.ts";
 
 const HOME_DIR = join(homedir(), ".config", "mykyagent");
@@ -41,7 +41,7 @@ export const PROFILE_NAME_MAX = 40;
 const PROFILE_MAX = 50;
 
 /** Section ids, in the order they are written. Unknown ids in a profile file are ignored. */
-export const PROFILE_SECTIONS = ["effort", "persona", "style", "tags", "toggles"] as const;
+export const PROFILE_SECTIONS = ["effort", "persona", "style", "brief", "toggles"] as const;
 export type ProfileSectionId = (typeof PROFILE_SECTIONS)[number];
 
 let personaFileOverride: (() => string) | null = null;
@@ -74,8 +74,8 @@ function sectionFile(id: ProfileSectionId): string {
       return personaFile();
     case "style":
       return getStyleFile();
-    case "tags":
-      return getTagsFile();
+    case "brief":
+      return briefFile();
   }
 }
 
@@ -167,6 +167,13 @@ function profileFile(slug: string): string {
 function readProfile(slug: string): ProfileFile | null {
   const parsed = readJson(profileFile(slug));
   if (!isPlainObject(parsed) || !isPlainObject(parsed.settings)) return null;
+  // Profiles written before the tint list became a session brief still carry
+  // a `tags` section; keep the words instead of dropping them silently.
+  const legacyTags = isPlainObject(parsed.settings.tags) ? parsed.settings.tags.tags : undefined;
+  if (!isPlainObject(parsed.settings.brief) && Array.isArray(legacyTags)) {
+    const text = legacyTags.filter((t) => typeof t === "string").join(", ").trim();
+    if (text) parsed.settings.brief = { text };
+  }
   const sections = PROFILE_SECTIONS.filter((id) => isPlainObject(parsed.settings[id]));
   return {
     name: String(parsed.name || slug),
@@ -258,11 +265,8 @@ export function validateProfileSettings(settings: Record<string, unknown>): stri
         if (typeof v !== "string") problems.push(`style.${k}: must be a string`);
       }
     }
-    if (id === "tags") {
-      const tags = isPlainObject(section) ? section.tags : undefined;
-      if (tags !== undefined && (!Array.isArray(tags) || tags.some((t) => typeof t !== "string"))) {
-        problems.push("tags.tags: must be an array of strings");
-      }
+    if (id === "brief") {
+      if ("text" in section && typeof section.text !== "string") problems.push("brief.text: must be a string");
     }
   }
   return problems;

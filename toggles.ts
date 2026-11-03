@@ -75,7 +75,7 @@ export const FEATURE_DEFS: Record<string, string> = {
   authors_note: "Author's Note steering block (/an) in RP mode",
   rp_creator: "RP-Creator card/lore authoring tools",
   rpg_tools: "RPG tools (dice_roll, game_state, advance_time)",
-  tags: "Additive conversation tints (/tags) in prompt",
+  brief: "Session brief (/brief) — the user's description of the session — in prompt",
   style: "Structured narrative dials (/style) in prompt",
   effort: "Work standard / effort level (/effort) in prompt — OFF by default, /effort <level> turns it on",
 };
@@ -214,6 +214,22 @@ export const LEGACY_MEMORY_TOOLS = [
  * longer exist. A mode is off when every old memory tool was off there.
  * Idempotent; returns true when it changed the file.
  */
+/**
+ * Rename retired feature switches to their current names so an old
+ * toggles.json does not silently re-enable something the user turned off.
+ * Currently: tags -> brief (the tint list became a session description).
+ */
+export function migrateLegacyFeatureToggles(): boolean {
+  const cfg = loadToggles();
+  const features = cfg.features || {};
+  if (!("tags" in features)) return false;
+  if (!("brief" in features)) features.brief = features.tags;
+  delete features.tags;
+  cfg.features = features;
+  saveToggles(cfg);
+  return true;
+}
+
 export function migrateLegacyMemoryToggles(): boolean {
   const cfg = loadToggles();
   const tools = cfg.tools || {};

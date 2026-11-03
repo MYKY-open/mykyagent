@@ -14,7 +14,7 @@ process.env.MYKYAGENT_EFFORT_FILE = join(DIR, "effort.json");
 process.env.MYKYAGENT_TOGGLES_FILE = join(DIR, "toggles.json");
 process.env.MYKYAGENT_PERSONA_FILE = join(DIR, "persona.json");
 process.env.MYKYAGENT_STYLE_FILE = join(DIR, "style.json");
-process.env.MYKYAGENT_TAGS_FILE = join(DIR, "tags.json");
+process.env.MYKYAGENT_BRIEF_FILE = join(DIR, "brief.json");
 
 let pass = 0,
   fail = 0;
@@ -62,7 +62,7 @@ write("effort.json", { level: "max" });
 write("toggles.json", { features: { effort: true, style: true } });
 write("persona.json", { current: "gremlin" });
 write("style.json", { mode: "roleplay", tone: "noir" });
-write("tags.json", { tags: ["noir", "terse"] });
+write("brief.json", { text: "harbour heist, noir" });
 
 t("no profiles on first run", P.listProfiles().length === 0 && P.getActiveProfile() === null);
 t("card explains how to start", P.describeProfiles().includes("/profile new <name>"));
@@ -70,11 +70,11 @@ t("badge nudges to create", P.profileBadge().includes("no profiles"));
 
 const a = P.createProfile("Story Night");
 t("create returns meta", a.name === "Story Night" && a.slug === "story-night");
-t("create snapshots every section", a.sections.join(",") === "effort,persona,style,tags,toggles", a.sections.join(","));
+t("create snapshots every section", a.sections.join(",") === "effort,persona,style,brief,toggles", a.sections.join(","));
 t("snapshot holds the live effort level", a.effort === "max");
 t("create activates", P.getActiveProfile() === "story-night");
 const storedA = store("story-night");
-t("profile file keeps raw store JSON", storedA.settings.toggles.features.effort === true && storedA.settings.tags.tags.join(",") === "noir,terse");
+t("profile file keeps raw store JSON", storedA.settings.toggles.features.effort === true && storedA.settings.brief.text === "harbour heist, noir");
 t("profile file has timestamps", !!storedA.created && !!storedA.updated);
 t("duplicate name rejects with a hint", (() => {
   try {
@@ -96,15 +96,15 @@ write("effort.json", { level: "high" });
 const res = P.applyProfile("Story Night");
 t("switch saves the outgoing profile", res.saved === "Code Only");
 t("switch writes the live effort file", read("effort.json").level === "max");
-t("switch writes persona, style, tags, toggles", read("persona.json").current === "gremlin" && read("style.json").mode === "roleplay" && read("tags.json").tags.includes("terse") && read("toggles.json").features.style === true);
+t("switch writes persona, style, brief, toggles", read("persona.json").current === "gremlin" && read("style.json").mode === "roleplay" && read("brief.json").text.includes("harbour") && read("toggles.json").features.style === true);
 t("switch marks the new profile active", P.getActiveProfile() === "story-night");
 t("outgoing tweaks were persisted", store("code-only").settings.effort.level === "high", JSON.stringify(store("code-only").settings.effort));
 
 // Explicit save overwrites the active profile with the live stores.
 write("effort.json", { level: "max" });
-write("tags.json", { tags: ["cozy"] });
+write("brief.json", { text: "cozy slice of life" });
 const saved = P.saveProfile();
-t("save writes the active profile", saved.name === "Story Night" && store("story-night").settings.tags.tags.join(",") === "cozy");
+t("save writes the active profile", saved.name === "Story Night" && store("story-night").settings.brief.text === "cozy slice of life");
 t("save by name targets another profile", (() => {
   P.saveProfile("Code Only");
   return P.getActiveProfile() === "code-only";
@@ -148,7 +148,7 @@ t("corrupt profile refuses to apply", (() => {
 writeFileSync(join(PROFILES, "story-night", "profile.json"), JSON.stringify(storedA), "utf-8");
 const renamed = P.renameProfile("Code Only", "Ship Mode");
 t("rename moves the directory", !existsSync(join(PROFILES, "code-only")) && existsSync(join(PROFILES, "ship-mode")));
-t("rename keeps the settings", store("ship-mode").settings.tags.tags.join(",") === "cozy", JSON.stringify(store("ship-mode").settings.tags));
+t("rename keeps the settings", store("ship-mode").settings.brief.text === "cozy slice of life", JSON.stringify(store("ship-mode").settings.brief));
 t("rename clears a dotted path", renamed.slug === "ship-mode");
 t("rename keeps active pointing at the profile", P.getActiveProfile() === "ship-mode");
 t("rename onto an existing slug rejects", (() => {
@@ -173,13 +173,23 @@ t("save without an active profile helps", (() => {
 })());
 
 // --- empty sections are real settings ---------------------------------------
-rmSync(join(DIR, "tags.json"), { force: true });
+rmSync(join(DIR, "brief.json"), { force: true });
 P.saveProfile("Story Night");
-t("missing store is captured as an empty section", JSON.stringify(store("story-night").settings.tags) === "{}", JSON.stringify(store("story-night").settings.tags));
-write("tags.json", { tags: ["cozy", "noir"] });
+t("missing store is captured as an empty section", JSON.stringify(store("story-night").settings.brief) === "{}", JSON.stringify(store("story-night").settings.brief));
+write("brief.json", { text: "added after the snapshot" });
 P.applyProfile("Story Night");
-const tagsMod = await import("./tags.ts");
-t("switch clears settings the profile never had", tagsMod.getTags().length === 0, JSON.stringify(read("tags.json")));
+t("switch clears settings the profile never had", (await import("./brief.ts")).getBrief() === "", JSON.stringify(read("brief.json")));
+
+// Profiles written before the brief existed still carry a `tags` list.
+{
+  const legacy = JSON.parse(JSON.stringify(storedA));
+  delete legacy.settings.brief;
+  legacy.settings.tags = { tags: ["noir", "terse"] };
+  writeFileSync(join(PROFILES, "story-night", "profile.json"), JSON.stringify(legacy), "utf-8");
+  P.applyProfile("Story Night");
+  t("legacy tags become a brief", (await import("./brief.ts")).getBrief() === "noir, terse", JSON.stringify(read("brief.json")));
+  t("legacy section is not listed", !P.listProfiles().find((p) => p.slug === "story-night")?.sections.includes("tags"));
+}
 
 // --- leftover temp files -----------------------------------------------------
 const leftovers = readdirSync(PROFILES).filter((n) => n.includes(".tmp-"));

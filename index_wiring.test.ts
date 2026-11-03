@@ -17,7 +17,7 @@ process.env.MYKYAGENT_TOGGLES_FILE = join(DIR, "toggles.json");
 process.env.MYKYAGENT_MODE_FILE = join(DIR, "mode.json");
 process.env.MYKYAGENT_EFFORT_FILE = join(DIR, "effort.json");
 process.env.MYKYAGENT_STYLE_FILE = join(DIR, "style.json");
-process.env.MYKYAGENT_TAGS_FILE = join(DIR, "tags.json");
+process.env.MYKYAGENT_BRIEF_FILE = join(DIR, "brief.json");
 process.env.MYKYAGENT_PROFILES_DIR = join(DIR, "profiles");
 process.env.MYKYAGENT_MEMORY_DIR = join(DIR, "memory");
 process.env.MYKYAGENT_TASKS_DIR = join(DIR, "tasks");
@@ -596,6 +596,32 @@ t("reset restores tool", isToolEnabled("bash") === true);
   await commands["tasks"].handler("clear", tctx);
   t("/tasks clear with nothing finished is calm", notes.at(-1)?.includes("No finished tasks") === true, notes.at(-1));
   T.stopTask(runId);
+}
+
+// --- 12h. session brief (/brief, alias /tags) -------------------------------
+{
+  const { getBrief } = await import("./brief.ts");
+  const { isFeatureEnabled: isFeat } = await import("./toggles.ts");
+  const notes: string[] = [];
+  const bctx = { cwd: DIR, ui: { notify: (m: string) => notes.push(m) } };
+  t("/brief registered", !!commands["brief"]);
+  t("/tags kept as an alias", !!commands["tags"]);
+
+  await commands["brief"].handler("porting the A155F patch, C only", bctx);
+  t("/brief stores and enables", getBrief() === "porting the A155F patch, C only" && isFeat("brief") === true, getBrief());
+  const withBrief: string = (await hooks["before_agent_start"]({ messageType: "user", prompt: "hi" }, { cwd: DIR }))?.systemPrompt || "";
+  t("brief lands in the prompt", withBrief.includes("porting the A155F patch") && withBrief.includes("Session brief"), withBrief.slice(-200));
+
+  notes.length = 0;
+  await commands["tags"].handler("add noir", bctx);
+  t("legacy /tags add explains the change", notes.at(-1)!.includes("Tints are gone"), notes.at(-1));
+  t("legacy /tags add does not corrupt the brief", getBrief() === "porting the A155F patch, C only");
+
+  notes.length = 0;
+  await commands["brief"].handler("clear", bctx);
+  t("/brief clear empties it", getBrief() === "" && notes.at(-1)!.includes("cleared"));
+  const cleared: string = (await hooks["before_agent_start"]({ messageType: "user", prompt: "hi" }, { cwd: DIR }))?.systemPrompt || "";
+  t("cleared brief leaves no trace in the prompt", !cleared.includes("Session brief"));
 }
 
 // --- 13. research bundle rendering (helper output contract) ----------------

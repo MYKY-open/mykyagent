@@ -157,7 +157,7 @@ export interface RpPromptOptions {
   memoryBlock?: string;
   userName?: string;
   greetingReminder?: string;
-  tagsBlock?: string;
+  briefBlock?: string;
   styleBlock?: string;
 }
 
@@ -189,7 +189,7 @@ export function buildRpSystemPrompt(opts: RpPromptOptions = {}): string {
   if (opts.authorsNoteBlock) parts.push(opts.authorsNoteBlock);
   if (opts.toolHintsBlock) parts.push(opts.toolHintsBlock);
   if (opts.memoryBlock) parts.push(opts.memoryBlock);
-  if (opts.tagsBlock) parts.push(opts.tagsBlock);
+  if (opts.briefBlock) parts.push(opts.briefBlock);
   if (opts.styleBlock) parts.push(opts.styleBlock);
   if (opts.greetingReminder) parts.push(opts.greetingReminder);
   return parts.join("\n\n");

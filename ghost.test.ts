@@ -13,7 +13,7 @@ process.env.MYKYAGENT_LORE_DIR = join(DIR, "lore");
 process.env.MYKYAGENT_AN_FILE = join(DIR, "authors_note.json");
 process.env.MYKYAGENT_GAMESTATE_DIR = join(DIR, "gamestate");
 process.env.MYKYAGENT_TOGGLES_FILE = join(DIR, "toggles.json");
-process.env.MYKYAGENT_TAGS_FILE = join(DIR, "tags.json");
+process.env.MYKYAGENT_BRIEF_FILE = join(DIR, "brief.json");
 
 let pass = 0,
   fail = 0;
@@ -43,10 +43,10 @@ const hist = idx.extractGhostHistory([
 ]);
 t("history extracts last messages", hist.includes("user: hi") && hist.includes("char: Welcome.") && !hist.includes("skip me"));
 
-const gp = idx.buildGhostPrompt({ charName: "Evelyn", charLine: "dry wit", userName: "Kai", history: "user: hi", hint: "i do as im told", tints: ["noir"] });
-t("prompt carries hint + tints", gp.userContent.includes("i do as im told") && gp.userContent.includes("noir") && gp.systemPrompt.includes("Kai"));
+const gp = idx.buildGhostPrompt({ charName: "Evelyn", charLine: "dry wit", userName: "Kai", history: "user: hi", hint: "i do as im told", brief: "harbour heist, no one gets hurt" });
+t("prompt carries hint + brief", gp.userContent.includes("i do as im told") && gp.userContent.includes("harbour heist") && gp.systemPrompt.includes("Kai"));
 
-const gpNoHint = idx.buildGhostPrompt({ userName: "Kai", history: "", hint: "", tints: [] });
+const gpNoHint = idx.buildGhostPrompt({ userName: "Kai", history: "", hint: "", brief: "" });
 t("prompt handles no hint", gpNoHint.userContent.includes("No hint given"));
 
 // --- command flow -----------------------------------------------------------
@@ -241,7 +241,7 @@ t("history uses real names when given", idx.extractGhostHistory(
   2000, "Kai", "Evelyn").includes("Kai: hi") && idx.extractGhostHistory(
   [{ type: "message", message: { role: "assistant", content: "Welcome." } }],
   2000, "Kai", "Evelyn").includes("Evelyn: Welcome."));
-t("prompt denies the character identity", idx.buildGhostPrompt({ charName: "Evelyn", userName: "Kai", history: "", hint: "", tints: [] }).systemPrompt.includes("You are NOT Evelyn"));
+t("prompt denies the character identity", idx.buildGhostPrompt({ charName: "Evelyn", userName: "Kai", history: "", hint: "", brief: "" }).systemPrompt.includes("You are NOT Evelyn"));
 t("leak detector flags char prefix", idx.isCharLeak("Evelyn: Come here.", "Evelyn") === true);
 t("leak detector spares user addressing her", idx.isCharLeak("Evelyn, wait for me!", "Evelyn") === false && idx.isCharLeak("I kneel.", "Evelyn") === false);
 

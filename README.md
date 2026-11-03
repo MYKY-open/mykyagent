@@ -89,7 +89,7 @@ Persona owns **voice**. Effort owns **depth**. A terse caveman persona ("no fluf
 
 ### Profiles (`/profile`)
 
-A profile is a named snapshot of the settings you keep flipping — **effort, toggles, persona, style dials, tags**. Switching writes them into the live stores, so every command keeps working exactly as before; no other module knows profiles exist.
+A profile is a named snapshot of the settings you keep flipping — **effort, toggles, persona, style dials, brief**. Switching writes them into the live stores, so every command keeps working exactly as before; no other module knows profiles exist.
 
 * `/profile` — card: saved profiles, the active one, what each holds
 * `/profile new <name>` — snapshot the current settings as a new profile and switch to it
@@ -488,13 +488,13 @@ Workflows: `/rp-creator new` (interactive interview), `/rp-creator card <concept
 
 Blank-brain rescue: `/ghost` drafts **your** next message in your voice, fitting the scene and character — take it, steal from it, or abort and write manually. Add a rough steer and it polishes instead of invents: `/ghost i do as im told`. Identity-guarded: the prompt denies the character's identity (`You are NOT Evelyn`), scene history uses real names, a character-voiced draft gets one stern retry, and a twice-leaking draft is shown flagged — never sneaked into your mouth. Flow per call: draft shown → **send** (posted as your message) / **again** (regenerate, up to 3) / **abort**. A status-bar lantern (*Ghost is listening…* / *whispering again…*) burns while it drafts and goes out the moment the draft lands. Headless (no picker UI): the draft is printed for manual copy. Uses your conversation's own model via pi's registry first, then direct HTTP as fallback for OpenAI-compatible endpoints only (llama-server/OpenRouter, like web distillation; max ~256 tokens, warmer temperature for creative writing). Providers that don't speak raw HTTP (google, anthropic, azure, bedrock, vertex) are registry-only — the ghost never sends them raw requests. Accepts text and thinking-block replies; failures report the true cause instead of a bare empty message.
 
-### Conversation Tints (`/tags`)
+### Session Brief (`/brief`, alias `/tags`)
 
-Additive flavor that works in **every** mode without replacing your persona or character — e.g. `/tags add noir, terse` or `/tags add cozy`. One line in the prompt, zero tax when empty (max 10 tags, 24 chars each). Manage with `/tags [add <a, b> | remove <a> | list | clear]`; master toggle `/mykyagent toggle tags`. Tints are explicitly subordinate: they can tint wording but never override character voice, persona, or task rules.
+One description, in your own words, of what this session is about — the replacement for the old tint list. `/brief porting the A155F kernel patch, C only, skip the hand-holding` or `/brief slow-burn harbour heist, Vex POV, keep replies short`. It lands in the prompt in **code and RP alike**, framed as context: follow it where it applies, but the current message, the character and the persona win on conflict. Zero tax when empty; stored up to 2000 chars, clipped to 600 in the prompt. Bare `/brief` shows it, `/brief clear` removes it, master toggle `/mykyagent toggle brief`. Old `/tags add noir, terse` was guessed at by the model; a sentence it can read is the same tokens and no guessing.
 
 ### Narrative Dials (`/style`)
 
-WBU-inspired structure without the bloat: 23 dials (mode, momentum, tone, length, density, rhythm, figurative, tense, pov, distance, showtell, dialogue, depth, speech, heat, intimacy, profanity, combat, consequences, change, vocab, volatility, thoughts), each with fixed validated levels — **every one unset by default**, unset dials cost zero prompt tax. Set ones compile into one tight rules line (`/style tense past`, `/style pov 3rd`, `/style dialogue sparse`). Manage with `/style [list | clear | <dial> <level> | clear <dial>]`; master toggle `/mykyagent toggle style`. Bare `/style` opens an interactive dial-board like `/mykyagent`: master switch on top, one row per dial — **→ steps a level up, ← steps down**, Enter/Space cycles, **c disables the dial**, Esc closes. (Custom tones still via `/style tone <...>`.) Every dial carries a manual: `/style <dial>` (e.g. `/style heat`) explains what it does, lists its levels with their effects, and shows its current value. `/tags` stays for freeform mood; `/style` is the machinery models can actually obey.
+WBU-inspired structure without the bloat: 23 dials (mode, momentum, tone, length, density, rhythm, figurative, tense, pov, distance, showtell, dialogue, depth, speech, heat, intimacy, profanity, combat, consequences, change, vocab, volatility, thoughts), each with fixed validated levels — **every one unset by default**, unset dials cost zero prompt tax. Set ones compile into one tight rules line (`/style tense past`, `/style pov 3rd`, `/style dialogue sparse`). Manage with `/style [list | clear | <dial> <level> | clear <dial>]`; master toggle `/mykyagent toggle style`. Bare `/style` opens an interactive dial-board like `/mykyagent`: master switch on top, one row per dial — **→ steps a level up, ← steps down**, Enter/Space cycles, **c disables the dial**, Esc closes. (Custom tones still via `/style tone <...>`.) Every dial carries a manual: `/style <dial>` (e.g. `/style heat`) explains what it does, lists its levels with their effects, and shows its current value. the session brief (`/brief`) stays for what the session is about; `/style` is the machinery models can actually obey.
 
 ### RPG Tools
 
@@ -515,7 +515,7 @@ Everything here runs without a network:
 | `rp.test.ts` | 90 | mode persistence/gating, card validation/rendering, lorebook scanning, author's note, dice/state/time, card audit |
 | `rp_wiring.test.ts` | 59 | registration, mode-gated toolset, RP/creator prompt dispatch, cross-mode card flow, fresh-session greeting, per-mode tools |
 | `read.test.ts` | 6 | vision blocks for capable models, server-side description fallback, honest errors, oversize guard, avif autoconvert |
-| `tags.test.ts` | 13 | tint store limits, normalization, prompt block, toggle gating |
+| `brief.test.ts` | 21 | session brief store limits, prompt block, toggle gating, legacy tags migration |
 | `manage.test.ts` | 32 | character duplicate/rename, memory edit/rename/move/search, tools, /characters + /memories board flows |
 | `effort.test.ts` | 51 | default high, stale-value handling, level validation + persistence, per-message prefix, RP quiet mode, per-level blocks, feature gating, card |
 | `style.test.ts` | 38 | all-off defaults, level validation, freeform tone, persistence filter, prompt block, toggle gating, picker rows + apply, per-dial manuals + explainer, WBU gap dials, intimacy/profanity, Esc-crash regression |
