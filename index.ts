@@ -1321,6 +1321,8 @@ const STATUS_KEY = "mykyagent";
 let statusUi: any = null;
 let footerUiInstalled: any = null;
 let footerTui: any = null;
+// Latest extension ctx the footer should read from (see buildFooterComponent).
+let footerCtx: any = null;
 let lastStatusText = "";
 
 function statusParts(): { profile: string; effort: string } {
@@ -1397,16 +1399,37 @@ export function insertStatusBeforeModel(line: string, status: string): string | 
  */
 function buildFooterComponent(ctx: any, tui: any, theme: any, footerData: any) {
   footerTui = tui;
+  footerCtx = ctx;
   let inner: any = null;
   try {
+    // pi's ctx exposes model/thinkingLevel as live getters, but this footer is
+    // built once and kept. Copying them here froze the footer on the level it
+    // had at startup, so /thinking and model switches never showed. Read through
+    // the latest ctx on every render instead. A stale ctx throws (pi's
+    // assertActive), so a failed read degrades to undefined, not a crash.
+    const live = (key: string) => {
+      try {
+        return footerCtx?.[key];
+      } catch {
+        return undefined;
+      }
+    };
     const session = {
-      sessionManager: ctx?.sessionManager,
-      model: ctx?.model,
-      thinkingLevel: ctx?.thinkingLevel,
+      get sessionManager() {
+        return live("sessionManager");
+      },
+      get model() {
+        return live("model");
+      },
+      get thinkingLevel() {
+        return live("thinkingLevel");
+      },
       routedModel: undefined,
-      state: { model: ctx?.model, thinkingLevel: ctx?.thinkingLevel },
+      get state() {
+        return { model: live("model"), thinkingLevel: live("thinkingLevel") };
+      },
       modelRuntime: { isUsingSubscription: () => false },
-      getContextUsage: () => ctx?.getContextUsage?.(),
+      getContextUsage: () => live("getContextUsage")?.call(footerCtx),
     };
     inner = new FooterComponent(session as any, footerData);
   } catch {
@@ -1415,7 +1438,10 @@ function buildFooterComponent(ctx: any, tui: any, theme: any, footerData: any) {
 
   // Degraded footer: at least the model and our state, in one dim line (a
   // failed inner render must never leave a blank footer).
-  const modelId = ctx?.model?.id || "no-model";
+  let modelId = "no-model";
+  try {
+    modelId = footerCtx?.model?.id || modelId;
+  } catch {}
   const fallback = (width: number) =>
     [theme.fg("dim", truncateToWidth(`${statusText()} · ${modelId}`, width, "…"))];
   return {
@@ -1470,6 +1496,7 @@ function buildFooterComponent(ctx: any, tui: any, theme: any, footerData: any) {
 
 /** Repaint the footer when the visible state changed. Cheap and idempotent. */
 function refreshStatus(ctx?: any): void {
+  if (ctx) footerCtx = ctx;
   if (ctx?.ui) statusUi = ctx.ui;
   const ui = statusUi;
   if (!ui) return;
