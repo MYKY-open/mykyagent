@@ -26,6 +26,7 @@ import { EFFORT_HELP, EFFORT_LEVELS, describeEffort, effortForTurn, getEffort, r
 import {
   applyProfile,
   configureProfiles,
+  createDefaultProfile,
   createProfile,
   deleteProfile,
   describeProfiles,
@@ -3257,8 +3258,30 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
         return;
       }
       if (verb === "new" || verb === "create" || verb === "add") {
-        if (!rest) return notify("Usage: /profile new <name>", "error");
-        const meta = createProfile(rest);
+        // Flags are stripped anywhere in the arguments so `new Clean --default`
+        // and `new --default Clean` both name the same profile.
+        const flags: string[] = [];
+        const nameWords = rest.split(/\s+/).filter((w) => {
+          if (!w) return false;
+          if (w.startsWith("-")) {
+            flags.push(w.toLowerCase());
+            return false;
+          }
+          return true;
+        });
+        const unknown = flags.filter((f) => !["--default", "--defaults", "-d"].includes(f));
+        if (unknown.length) return notify(`Unknown option ${unknown[0]}. Usage: /profile new <name> [--default]`, "error");
+        const name = nameWords.join(" ").trim();
+        if (!name) return notify("Usage: /profile new <name> [--default]", "error");
+        if (flags.length) {
+          const meta = createDefaultProfile(name);
+          notify(
+            `Profile "${meta.name}" created from the factory defaults (${meta.sections.join(", ")}) — not activated, so the live settings are untouched.\n` +
+              `Switch to it any time with /profile use ${meta.slug} to reset effort, persona, style, brief and toggles.`
+          );
+          return;
+        }
+        const meta = createProfile(name);
         refreshStatus(ctx);
         notify(
           `Profile "${meta.name}" saved from the current settings and activated (${meta.sections.join(", ")}).\n` +
@@ -3346,11 +3369,11 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
 
   // 10c. Profiles (/profile — named snapshots of effort/toggles/persona/style/brief)
   pi.registerCommand("profile", {
-    description: "Profiles: /profile [list | new <name> | use <name> | save [name] | delete <name> | rename <old> <new>]",
+    description: "Profiles: /profile [list | new <name> [--default] | use <name> | save [name] | delete <name> | rename <old> <new>]",
     getArgumentCompletions: (argumentText: string) => {
       const verbs = [
         { value: "list", label: "list", description: "Show saved profiles and the active one" },
-        { value: "new", label: "new", description: "Snapshot the current settings as a new profile" },
+        { value: "new", label: "new", description: "Snapshot the current settings as a new profile (add --default to seed the factory defaults instead)" },
         { value: "use", label: "use", description: "Switch to a saved profile" },
         { value: "save", label: "save", description: "Save the current settings into the active profile" },
         { value: "delete", label: "delete", description: "Delete a saved profile" },
@@ -4582,7 +4605,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       if (subLower === "profile") {
         const help: Record<string, string> = {
           list: "Show saved profiles and the active one",
-          new: "Snapshot the current settings as a new profile",
+          new: "Snapshot the current settings as a new profile (new <name> --default = factory defaults)",
           use: "Switch to a saved profile",
           save: "Save the current settings into the active profile",
           delete: "Delete a saved profile",
@@ -4746,7 +4769,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
                     theme.fg("muted", `Profile: ${profileBadge()}  ·  Effort: ${isFeatureEnabled("effort") ? getEffort() : "off"}${isFeatureEnabled("effort") ? "" : " (opt-in)"}`),
                     `${theme.fg("success", `${onCount} on`)} ${theme.fg("dim", "·")} ${theme.fg("error", `${offCount} off`)} ${theme.fg("dim", "·")} ${theme.fg("muted", "Enter to flip")}`,
                     theme.fg("muted", "↑↓ move • Enter/Space toggles • Esc closes"),
-                    theme.fg("muted", "/profile new <name> | use <name> | save — or /mykyagent profile"),
+                    theme.fg("muted", "/profile new <name> [--default] | use <name> | save — or /mykyagent profile"),
                     "",
                   ];
                 }

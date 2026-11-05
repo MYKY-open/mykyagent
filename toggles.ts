@@ -123,6 +123,22 @@ export function isToolRunnableHere(name: string): boolean {
 /** Features that default OFF (opt-in). Everything else defaults ON. */
 export const OPT_IN_FEATURES: Set<string> = new Set(["tool_recovery", "effort"]);
 
+/**
+ * Tools whose whole lifecycle belongs to one feature master switch. The feature
+ * row already flips them (web/mcp killswitches, memory gate), so a second row
+ * reads as if the same thing were configurable twice — and the memory tool row
+ * is indistinguishable from the memory feature row. `skill_read` is covered the
+ * same way by the Skills master row and is skipped separately.
+ * Discovered MCP server tools (mcp_<server>_<tool>) are NOT listed here: each
+ * one is a real, separately togglable tool.
+ */
+export const FEATURE_OWNED_TOOLS: Record<string, string[]> = {
+  memory: ["memory"],
+  mcp: ["mcp_connect", "mcp_disconnect", "mcp_list"],
+};
+
+const FEATURE_OWNED_TOOL_SET: ReadonlySet<string> = new Set(Object.values(FEATURE_OWNED_TOOLS).flat());
+
 export function isFeatureEnabled(name: string): boolean {
   const cfg = loadToggles();
   // Opt-in features: off unless explicitly enabled. Recovery executes
@@ -344,6 +360,7 @@ export function getAllToggleableItems(
   for (const t of allToolNames) {
     if (!isToolRunnableHere(t)) continue;
     if (t === "skill_read") continue; // covered by the Skills master row
+    if (FEATURE_OWNED_TOOL_SET.has(t)) continue; // covered by its feature row (mcp, memory)
     if (opts.isAllowed && !opts.isAllowed(t)) continue;
     const desc = BUILTIN_TOOL_DEFS[t] || (t.startsWith("mcp_") ? "Discovered MCP tool" : "Registered tool");
     items.push({
@@ -368,7 +385,7 @@ export function modeHiddenTools(
   const cfg = loadToggles();
   const all = new Set([...Object.keys(BUILTIN_TOOL_DEFS), ...registeredTools, ...Object.keys(cfg.tools || {})]);
   return Array.from(all)
-    .filter((t) => isToolRunnableHere(t) && !isAllowed(t))
+    .filter((t) => isToolRunnableHere(t) && !FEATURE_OWNED_TOOL_SET.has(t) && !isAllowed(t))
     .sort();
 }
 
@@ -515,7 +532,7 @@ export function formatTogglesSummary(
   if (hidden.length && opts.mode) {
     lines.push("", `(${hidden.length} tools hidden — unavailable in ${opts.mode} mode: ${hidden.slice(0, 8).join(", ")}${hidden.length > 8 ? ", …" : ""})`);
   }
-  lines.push("", "Usage: /mykyagent [toggle <name> | on <name> | off <name> | profile ... | reset | status]", "Profiles: /profile [list | new <name> | use <name> | save | delete <name>]");
+  lines.push("", "Usage: /mykyagent [toggle <name> | on <name> | off <name> | profile ... | reset | status]", "Profiles: /profile [list | new <name> [--default] | use <name> | save | delete <name>]");
 
   return lines.join("\n");
 }

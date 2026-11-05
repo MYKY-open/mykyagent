@@ -11,6 +11,7 @@ import {
   isToolRunnableHere,
   loadToggles,
   migrateLegacyMemoryToggles,
+  modeHiddenTools,
   resetAllToggles,
   setFeatureEnabled,
   setSkillEnabled,
@@ -175,6 +176,27 @@ t("unfiltered listing unchanged", getAllToggleableItems(["web-scraping"], ["cust
   t("board hides the skill_read tool row", !boardOff.some((i) => i.name === "skill_read" && i.category === "tool"));
   const flipped = toggleByName("skill_read", true, ["commit"]);
   t("bare skill_read flips the master", flipped.category === "skill" && isSkillsMasterEnabled() === true && isToolEnabled("skill_read") === true);
+}
+
+// 10c. feature-owned tools are not listed twice
+// `memory` and the mcp trio are gated by their feature rows, so a second row
+// would read as two switches for one thing. Server tools discovered from MCP
+// stay individually togglable.
+{
+  resetAllToggles();
+  const board = getAllToggleableItems([], ["memory", "mcp_connect", "mcp_disconnect", "mcp_list", "mcp_fetch_issue", "web_search", "web_fetch"]);
+  const memoryRows = board.filter((i) => i.name === "memory");
+  t("board lists memory once, as the feature", memoryRows.length === 1 && memoryRows[0].category === "feature", memoryRows.map((i) => i.category).join(","));
+  t("board lists mcp once, as the feature", board.filter((i) => i.name === "mcp").length === 1 && board.find((i) => i.name === "mcp")!.category === "feature");
+  t("board drops the mcp connection tool rows", !board.some((i) => ["mcp_connect", "mcp_disconnect", "mcp_list"].includes(i.name)), board.filter((i) => i.category === "tool").map((i) => i.name).join(","));
+  t("discovered mcp server tools keep their row", board.some((i) => i.name === "mcp_fetch_issue" && i.category === "tool"));
+  t("web tools keep their own rows", board.some((i) => i.name === "web_search" && i.category === "tool") && board.some((i) => i.name === "web_fetch" && i.category === "tool"));
+  t("status summary agrees with the board", !formatTogglesSummary([], ["mcp_connect", "memory"]).includes(" mcp_connect "));
+  t("feature-owned tools skip the mode-hidden note", !modeHiddenTools(["mcp_connect", "memory"], () => false).includes("mcp_connect"));
+  t("mode-hidden note still counts real tools", modeHiddenTools(["bash"], (x) => x !== "bash").includes("bash"));
+  t("tool: prefix still reaches an owned tool", toggleByName("tool:mcp_connect", false, []).category === "tool" && isToolEnabled("mcp_connect") === false);
+  setToolEnabled("mcp_connect", true);
+  resetAllToggles();
 }
 
 // 11. legacy memory tool keys fold into the merged memory tool

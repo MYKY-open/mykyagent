@@ -19,6 +19,9 @@
  * - A snapshot always stores all five sections. A store that does not exist
  *   yet is captured as empty, so switching restores the saved state instead of
  *   blending it with whatever was live.
+ * - A profile can also be seeded from the factory defaults instead of the live
+ *   stores (createDefaultProfile). That one is not activated: an active profile
+ *   is re-snapshotted on the next switch, which would overwrite the clean copy.
  * - mode, active character and user name are session state in mode.json, not
  *   profile state. A profile never switches who you are playing.
  *
@@ -27,7 +30,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { EFFORT_LEVELS, getEffortFile } from "./effort.ts";
+import { DEFAULT_EFFORT, EFFORT_LEVELS, getEffortFile } from "./effort.ts";
 import { getStyleFile } from "./style.ts";
 import { briefFile } from "./brief.ts";
 import { getTogglesFile } from "./toggles.ts";
@@ -314,17 +317,54 @@ export interface CreateOptions {
   activate?: boolean;
 }
 
-/** Save the current live settings as a new profile. */
-export function createProfile(name: string, opts: CreateOptions = {}): ProfileMeta {
+/**
+ * What a fresh install renders — the profile half of "reset everything".
+ * Effort is stored explicitly (a card without a level tells the user nothing),
+ * persona is the built-in default (PERSONAS.caveman), style/brief are the
+ * empty state, and toggles are byte-for-byte what resetAllToggles() writes.
+ */
+export function defaultProfileSettings(): Record<string, unknown> {
+  return {
+    effort: { level: DEFAULT_EFFORT },
+    persona: { current: "caveman" },
+    style: {},
+    brief: { text: "" },
+    toggles: { tools: {}, skills: { enabled: true, disabled: [] }, features: {} },
+  };
+}
+
+function createProfileFrom(name: string, settings: Record<string, unknown>, opts: CreateOptions): ProfileMeta {
   const clean = cleanName(name);
   const slug = slugifyProfileName(clean);
   if (existsSync(profileFile(slug))) {
     throw new Error(`Profile "${clean}" already exists — /profile save ${clean} updates it.`);
   }
   if (listProfiles().length >= PROFILE_MAX) throw new Error(`Profile limit (${PROFILE_MAX}) reached — /profile delete one first.`);
-  const meta = writeProfileFile(slug, clean, snapshotSettings());
+  const meta = writeProfileFile(slug, clean, settings);
   if (opts.activate !== false) setActive(slug);
   return meta;
+}
+
+/** Save the current live settings as a new profile. */
+export function createProfile(name: string, opts: CreateOptions = {}): ProfileMeta {
+  return createProfileFrom(name, snapshotSettings(), opts);
+}
+
+/**
+ * Seed a profile with the factory defaults instead of the live settings.
+ * Not activated by default: an active profile is re-snapshotted from the live
+ * stores on the next switch, so activating a clean copy the user just made
+ * would let the next switch overwrite it. `/profile use <name>` applies it.
+ * `activate: true` is the "reset everything now" flow: then the defaults are
+ * written into the live stores too, so active really means live == profile.
+ */
+export function createDefaultProfile(name: string, opts: CreateOptions = {}): ProfileMeta {
+  const activate = opts.activate ?? false;
+  // Never mark it active directly: the outgoing profile has to be saved from
+  // the live stores *before* the switch, which is exactly what applyProfile
+  // does. Setting active first would silently drop those tweaks.
+  const meta = createProfileFrom(name, defaultProfileSettings(), { activate: false });
+  return activate ? applyProfile(meta.slug).applied : meta;
 }
 
 /** Overwrite a profile (default: the active one) with the current live settings. */
@@ -460,6 +500,7 @@ export function describeProfiles(): string {
       "Profiles: none yet.",
       "A profile saves the settings you keep flipping — persona, effort, style, tags, toggles — under one name.",
       "/profile new <name> snapshots the current settings and switches to it.",
+      `/profile new <name> --default seeds one with the factory defaults instead (effort ${DEFAULT_EFFORT}, caveman persona, no dials, default toggles).`,
     ].join("\n");
   }
   const lines = profiles.map((p) => {

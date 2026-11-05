@@ -93,6 +93,7 @@ A profile is a named snapshot of the settings you keep flipping — **effort, to
 
 * `/profile` — card: saved profiles, the active one, what each holds
 * `/profile new <name>` — snapshot the current settings as a new profile and switch to it
+* `/profile new <name> --default` — seed one from the **factory defaults** instead of the live settings (effort high, caveman persona, no style dials, empty brief, toggles at defaults). It is *not* activated: an active profile is re-snapshotted from the live stores on the next switch, which would overwrite the clean copy. `/profile use <name>` applies it.
 * `/profile use <name>` — switch (the outgoing profile is saved first, so tweaks are not lost)
 * `/profile save [name]` — write the current settings into the active (or named) profile
 * `/profile delete <name>` / `/profile rename <old> <new>`
@@ -147,10 +148,10 @@ Toggle any tool, skill, or agent feature on/off individually. The picker is **mo
 * `/mykyagent toggle <name>` — Flip a tool, skill, or feature on/off (e.g. `/mykyagent toggle bash`)
 * `/mykyagent on <name>` / `/mykyagent off <name>` — Enable or disable explicitly (e.g. `/mykyagent off memory`, `/mykyagent off web-scraping`)
 * `/mykyagent reset` — Re-enable all tools, skills, and features back to default (profiles are untouched)
-* `/mykyagent profile ...` — Manage profiles without leaving the board: `list`, `new <name>`, `use <name>`, `save`, `delete <name>`, `rename <old> <new>`
+* `/mykyagent profile ...` — Manage profiles without leaving the board: `list`, `new <name> [--default]`, `use <name>`, `save`, `delete <name>`, `rename <old> <new>`
 
 **Toggleable categories:**
-* **Tools**: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `memory` (read/write/edit/forget/list/search/rename/move), `mcp_connect`, `mcp_disconnect`, `mcp_list`, and any discovered MCP server tools. Bare `/mykyagent off memory` is the master feature; `/mykyagent off tool:memory` disables just the tool.
+* **Tools**: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `web_search`, `web_fetch`, `memory` (read/write/edit/forget/list/search/rename/move), `mcp_connect`, `mcp_disconnect`, `mcp_list`, and any discovered MCP server tools. Bare `/mykyagent off memory` is the master feature; `/mykyagent off tool:memory` disables just the tool. The board lists `memory` and `mcp` once — as features: their feature row already gates the tools, so the `memory` tool and the `mcp_connect` / `mcp_disconnect` / `mcp_list` trio get no second row (same rule as `skill_read` under the skills master). Discovered MCP server tools are individual rows, and `/mykyagent off tool:mcp_connect` still reaches the tool directly.
 * **Skills**: Master skills toggle (`skills`) and per-skill toggles (e.g. `web-scraping`).
 * **Features**: `memory` (persistent index & tools), `persona` (tone styling in prompt), `tool_recovery` (think-tag tool call recovery — OPT-IN, off by default: `/mykyagent on tool_recovery`), `output_sanitizer` (progress bar/ticker cleaning), `web`, `mcp`, `effort` (work standard — OPT-IN, off by default: `/effort <level>` or `/mykyagent on effort`).
 * **Platform-aware**: the board, status card and prompt gate only list tools this machine can run. pi ships a `powershell` definition on every platform, but it throws "only available on Windows" elsewhere — it is hidden off Windows and never activated, so its schema (~130 tokens/turn) stays out of context. Hidden-exposure tools are filtered too.

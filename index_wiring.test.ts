@@ -461,6 +461,30 @@ t("reset restores tool", isToolEnabled("bash") === true);
     await commands["profile"].handler("use quest-night", pctx);
     t("profile switch does not activate dormant definitions", !activeTools.includes("powershell") && !activeTools.includes("ghostpaneltool"), activeTools.join(","));
     t("profile switch keeps the active tools it had", beforeSwitch.every((n) => activeTools.includes(n)), activeTools.join(","));
+
+    // `new <name> --default`: seed a profile from the factory defaults.
+    setEffort2("max");
+    notes.length = 0;
+    await commands["profile"].handler("new Reset Point --default", pctx);
+    const seeded = listProfiles().find((p) => p.slug === "reset-point");
+    t("/profile new --default seeds the factory effort", seeded?.effort === "high" && seeded?.sections.join(",") === "effort,persona,style,brief,toggles", JSON.stringify(seeded));
+    t("/profile new --default does not steal the active slot", getActiveProfile() === "quest-night" && notes.at(-1)!.includes("not activated"), notes.at(-1));
+    t("/profile new --default leaves the live settings alone", getEffort() === "max");
+    const { isFeatureEnabled: isFeatPre } = await import("./toggles.ts");
+    t("seeded toggles carry no live overrides", isFeatPre("effort") === true);
+
+    notes.length = 0;
+    await commands["profile"].handler("use Reset Point", pctx);
+    t("/profile use applies the seeded defaults", getEffort() === "high" && getActiveProfile() === "reset-point", `${getEffort()} ${getActiveProfile()}`);
+
+    notes.length = 0;
+    await commands["profile"].handler("new Broken --bogus", pctx);
+    t("/profile new rejects an unknown option", notes.at(-1)!.includes("Unknown option") && !listProfiles().some((p) => p.slug === "broken"), notes.at(-1));
+
+    notes.length = 0;
+    await commands["profile"].handler("delete Reset Point", pctx);
+    await commands["profile"].handler("use quest-night", pctx);
+    t("/profile use still names the defaults card", commands["profile"].description.includes("--default"));
   }
 }
 
@@ -553,7 +577,8 @@ t("reset restores tool", isToolEnabled("bash") === true);
 {
   const { getAllToggleableItems } = await import("./toggles.ts");
   t("one memory tool, old names gone", !!tools.memory && !tools.memory_read && !tools.memory_write && !tools.memory_list && !tools.memory_edit);
-  t("memory tool is a single board row", getAllToggleableItems([], ["memory"]).filter((i) => i.name === "memory").length === 2);
+  t("memory tool is a single board row", getAllToggleableItems([], ["memory"]).filter((i) => i.name === "memory").length === 1);
+  t("mcp connection tools fold into the mcp feature row", !getAllToggleableItems([], ["mcp_connect", "mcp_disconnect", "mcp_list"]).some((i) => ["mcp_connect", "mcp_disconnect", "mcp_list"].includes(i.name)));
   const call = (args: any) => tools.memory.execute("x", args);
   const text = (r: any) => String(r?.content?.[0]?.text || "");
 

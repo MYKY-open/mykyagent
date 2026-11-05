@@ -203,6 +203,70 @@ write("effort.json", { level: "low" });
 const partial = P.applyProfile("Story Night");
 t("apply works when the snapshot is complete", partial.applied.name === "Story Night" && read("effort.json").level === "max");
 
+// --- factory-default profiles -----------------------------------------------
+// `new <name> --default` seeds a profile from the defaults instead of the live
+// stores, so it can act as a reset point.
+{
+  const { getEffort, DEFAULT_EFFORT } = await import("./effort.ts");
+  const { getStyles } = await import("./style.ts");
+  const { getBrief } = await import("./brief.ts");
+  const { isFeatureEnabled, isToolEnabled, isSkillsMasterEnabled } = await import("./toggles.ts");
+
+  write("effort.json", { level: "low" });
+  write("toggles.json", { tools: { bash: false }, skills: { enabled: false, disabled: ["commit"] }, features: { style: true, effort: true } });
+  write("persona.json", { current: "gremlin", customPrompt: "arr" });
+  write("style.json", { tone: "noir", mode: "roleplay" });
+  write("brief.json", { text: "harbour heist" });
+  const activeBefore = P.getActiveProfile();
+
+  const d = P.createDefaultProfile("Clean Slate");
+  t("default profile holds every section", d.sections.join(",") === "effort,persona,style,brief,toggles", d.sections.join(","));
+  t("default profile is not activated", P.getActiveProfile() === activeBefore, String(P.getActiveProfile()));
+  t("creating it leaves the live stores alone", read("effort.json").level === "low" && read("brief.json").text === "harbour heist");
+  const defaults = store("clean-slate").settings;
+  t("default effort is the built-in level", defaults.effort.level === DEFAULT_EFFORT && d.effort === DEFAULT_EFFORT, JSON.stringify(defaults.effort));
+  t("default persona is caveman", defaults.persona.current === "caveman");
+  t("default style has no dials", Object.keys(defaults.style).length === 0);
+  t("default brief is empty", defaults.brief.text === "");
+  t(
+    "default toggles carry no overrides",
+    Object.keys(defaults.toggles.tools).length === 0 &&
+      Object.keys(defaults.toggles.features).length === 0 &&
+      defaults.toggles.skills.enabled === true &&
+      defaults.toggles.skills.disabled.length === 0
+  );
+  t("default profile passes validation", P.validateProfileSettings(defaults).length === 0, P.validateProfileSettings(defaults).join(";"));
+  t("seeding defaults twice rejects like any duplicate", (() => {
+    try {
+      P.createDefaultProfile("clean slate");
+      return false;
+    } catch (err: any) {
+      return err.message.includes("already exists");
+    }
+  })());
+
+  P.applyProfile("Clean Slate");
+  t("switching to it resets effort", getEffort() === DEFAULT_EFFORT, getEffort());
+  t("switching to it resets persona", read("persona.json").current === "caveman" && !read("persona.json").customPrompt);
+  t("switching to it clears the style dials", Object.keys(getStyles()).length === 0, JSON.stringify(getStyles()));
+  t("switching to it clears the brief", getBrief() === "", getBrief());
+  t("switching to it resets the toggles", isFeatureEnabled("effort") === false && isFeatureEnabled("style") === true && isToolEnabled("bash") === true && isSkillsMasterEnabled() === true);
+
+  // activate:true is the "reset everything now" flow: the copy is active, so
+  // the live stores must match it, not the settings it replaced.
+  write("effort.json", { level: "low" });
+  const forced = P.createDefaultProfile("Force Default", { activate: true });
+  t(
+    "a default profile can be made the live state on request",
+    forced.slug === "force-default" && P.getActiveProfile() === "force-default" && getEffort() === DEFAULT_EFFORT,
+    `${P.getActiveProfile()} ${getEffort()}`
+  );
+  t("the replaced settings were saved into the outgoing profile", store("clean-slate").settings.effort.level === "low", JSON.stringify(store("clean-slate").settings.effort));
+
+  // Back to the profile the card/badge checks below expect to be active.
+  P.applyProfile("Story Night");
+}
+
 // --- badge / card ------------------------------------------------------------
 const card = P.describeProfiles();
 t("card lists profiles and the active one", card.includes("Story Night") && card.includes("active"));
