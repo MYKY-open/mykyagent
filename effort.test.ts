@@ -25,8 +25,9 @@ const t = (name: string, ok: boolean, extra = "") => {
 const effort = await import("./effort.ts");
 const toggles = await import("./toggles.ts");
 
-// The feature is opt-in: nothing is injected until the user turns it on.
-t("effort feature is OFF by default", toggles.isFeatureEnabled("effort") === false);
+// The feature is on by default: the work standard is injected unless the user turns it off.
+t("effort feature is ON by default", toggles.isFeatureEnabled("effort") === true);
+toggles.setFeatureEnabled("effort", false);
 t("feature off: stored max injects nothing", effort.effortForTurn({ prompt: "fix it", mode: "code" }) === null);
 toggles.setFeatureEnabled("effort", true);
 

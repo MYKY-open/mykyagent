@@ -282,6 +282,10 @@ t("reset restores tool", isToolEnabled("bash") === true);
   t("effort=high block injected into prompt", prompt.includes("Work standard (effort=high)"), prompt.slice(0, 120));
   t("effort=high demands evidence", prompt.includes("Never claim success without evidence"));
   t("effort header line present", /Effort: high\./.test(prompt));
+  t("effort=high: size-to-change rule present", prompt.includes("Size the ceremony to the change"));
+  t("effort=high: one planning ritual (no separate 3-5 step plan)", !prompt.includes("state a simple 3-5 step plan"));
+  t("scope rule present in code prompt", prompt.includes("Change only what was asked"));
+  t("path rule: absolute paths inside the project are allowed", prompt.includes("Absolute paths inside the working directory are fine"));
   t("persona voice untouched by effort", prompt.includes("Caveman") || prompt.includes("MykyAgent"));
 
   const notes: string[] = [];
@@ -364,6 +368,14 @@ t("reset restores tool", isToolEnabled("bash") === true);
   t("stored max does not reach rp-creator", !creatorPlain.includes("Work standard (effort="), creatorPlain.slice(0, 160));
   const creatorTyped: string = (await hooks["before_agent_start"]({ messageType: "user", prompt: "high: draft a rival" }, { cwd: DIR }))?.systemPrompt || "";
   t("rp-creator honors a typed prefix", creatorTyped.includes("Work standard (effort=high)"));
+  setMode("code");
+  // narrative dials (style.json momentum=active) stay out of coding prompts, still reach rp-creator
+  writeFileSync(process.env.MYKYAGENT_STYLE_FILE!, JSON.stringify({ momentum: "active" }), "utf-8");
+  const codeStyled = (await hooks["before_agent_start"]({}, { cwd: DIR }))?.systemPrompt || "";
+  t("style dials absent from code prompt", !codeStyled.includes("Narrative style"), codeStyled.slice(0, 120));
+  setMode("rp-creator");
+  const creatorStyled = (await hooks["before_agent_start"]({ messageType: "user", prompt: "draft a rival" }, { cwd: DIR }))?.systemPrompt || "";
+  t("style dials still reach rp-creator", creatorStyled.includes("active plot: move the scene forward"));
   setMode("code");
   setEffort("high");
 

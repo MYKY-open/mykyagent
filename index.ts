@@ -18,7 +18,7 @@ import {
 import { runSearchHops, type ResearchPayload } from "./search_hops.ts";
 import { recoverLeakedToolCalls } from "./tool_recovery.ts";
 import { listSkills, readSkill, skillsPromptLine } from "./skills.ts";
-import { addTodo, clearTodos, describeTodos, doneTodo, loadTodos, openTodos, todoBlock } from "./todo.ts";
+import { addTodo, clearTodos, describeTodos, doneTodo, loadTodos, openTodos, todoBlock, todosHere } from "./todo.ts";
 import { listCheckpoints, resolveToolPath, restoreCheckpoint, snapshotFile } from "./checkpoints.ts";
 import { buildResumeText, loadAutoState, saveAutoStub, saveSummary } from "./resume.ts";
 import { clearBrief, describeBrief, getBrief, renderBriefBlock, setBrief } from "./brief.ts";
@@ -1741,7 +1741,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       `\n` +
       (toolLines.length > 0 ? `Available Tools:\n${toolLines.join("\n")}\n\n` : "") +
       `Planning Rules (Internal):\n` +
-      `- For tasks with >1 step, state a simple 3-5 step plan at start before taking action (e.g. 1. Create folders, 2. Find version, 3. Download/configure, 4. Verify).\n` +
+      (turnEffort ? "" : `- For tasks with >1 step, state a simple 3-5 step plan at start before taking action (e.g. 1. Create folders, 2. Find version, 3. Download/configure, 4. Verify).\n`) +
       `- Follow steps sequentially. Do not wander or skip steps.\n\n` +
       `Code & Log Inspection Rules (Context Protection):\n` +
       `- NEVER cat entire large files, logs, or dependency bundles into context.\n` +
@@ -1750,17 +1750,18 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       `- Do not read more than 250 lines at a time unless strictly needed.\n` +
       `- Prevent terminal progress spam in bash: always pass quiet or no-progress flags when running downloaders, encoders, or package managers (e.g. yt-dlp --no-progress, ffmpeg -nostats -loglevel error, curl -sS, wget -q, pip install -q, git clone -q).\n\n` +
       `File Path & Output Rules (CRITICAL):\n` +
-      `- No absolute paths: tools resolve against the working directory, so /script.sh means filesystem root (denied). Always relative: ./script.sh, scripts/run.sh. Stay inside the working directory unless the task demands otherwise.\n` +
+      `- Paths: relative to the working directory (./script.sh, scripts/run.sh). Absolute paths inside the working directory are fine. Stay inside it unless the task demands otherwise. A leading slash like /script.sh means filesystem root, not the project.\n` +
       `- In bash, stay inside the working directory. Scripts from write need chmod +x before running.\n` +
       `- Prefer edit for existing files (read a few lines to anchor oldText first); write only for new files or full rewrites, batching non-overlapping edits in one call. Full rewrites must keep unchanged bytes identical.\n\n` +
       `Efficiency & Execution Rules:\n` +
       `- One thing at a time in the foreground: run one bash command, let it finish, check its output before the next step. For long commands use quiet/no-progress flags (see above).\n` +
-      `- Builds, servers, watchers: task_start (max 3 live), read with task_output, block with task_wait, stop with task_stop. Check task_list before starting a server again. Never sleep-poll.\n` +
+      `- Builds, servers, watchers: task_start (max 3 live), read with task_output, block with task_wait, stop with task_stop. Check task_list before starting a server again. Never sleep-poll: wait with task_wait. A single fixed sleep to let an app start for a smoke test is fine.\n` +
       `- Web research: delegate COMPLETE goals via web_search (never bare keywords). Never invent versions/hashes/URLs — use only returned data, verified against file contents/metadata. Never re-fetch a failed URL; never guess versions/years, search manifests/release APIs instead.\n` +
       `- Combine commands: chain related actions in one bash call (mkdir && curl && echo) instead of separate turns.\n` +
       `- If blocked or missing a required fact, say so in one sentence and ask the single most useful clarifying question - do not stall silently or invent filler.\n\n` +
       `Response Rules:\n` +
-      `- Match the user's language when they write in something other than English; keep code, commands, and technical terms unchanged.\n\n` +
+      `- Match the user's language when they write in something other than English; keep code, commands, and technical terms unchanged.\n` +
+      `- Change only what was asked. Do not edit config, settings, parameters, or unrelated files unless the user asks. If a fix seems to need one, say so and ask first.\n\n` +
       `Tool Calling Rules (CRITICAL):\n` +
       `- When calling tools, you MUST close the thinking block with </think> before emitting tool calls. NEVER output <tool_call> inside <think>.\n` +
       memBlock +
@@ -1770,13 +1771,14 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     // exist) + open todos (if any). Skipped entirely when empty.
     const skillLine = skillsPromptLine();
     if (skillLine) systemPrompt += `\n\n${skillLine}`;
-    const todos = todoBlock();
+    const todos = todoBlock(ctx?.cwd || process.cwd());
     if (todos) systemPrompt += `\n\n${todos}`;
     if (isFeatureEnabled("brief")) {
       const brief = renderBriefBlock();
       if (brief) systemPrompt += `\n\n${brief}`;
     }
-    if (isFeatureEnabled("style")) {
+    // Narrative dials are for RP / rp-creator turns only; never in coding prompts.
+    if (mode !== "code" && isFeatureEnabled("style")) {
       const sty = renderStyleBlock();
       if (sty) systemPrompt += `\n\n${sty}`;
     }
@@ -2397,7 +2399,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
           const n = clearTodos(args?.all === true);
           return { content: [{ type: "text", text: `Cleared ${n} todo(s).` }] };
         }
-        const items = loadTodos();
+        const items = todosHere();
         if (items.length === 0) return { content: [{ type: "text", text: "No todos." }] };
         return {
           content: [{ type: "text", text: items.map((t) => `${t.done ? "[x]" : "[ ]"} ${t.id}. ${t.text}`).join("\n") }],

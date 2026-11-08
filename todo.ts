@@ -15,6 +15,8 @@ export interface TodoItem {
   text: string;
   done: boolean;
   created: string;
+  /** Project the todo was made in. Missing on legacy items: shown by /todo, never injected. */
+  cwd?: string;
 }
 
 const TODO_BLOCK_ITEMS = 10;
@@ -33,6 +35,7 @@ export function loadTodos(): TodoItem[] {
       text: String(t.text),
       done: t.done === true,
       created: typeof t.created === "string" ? t.created : "",
+      ...(typeof t.cwd === "string" ? { cwd: t.cwd } : {}),
     }));
   } catch {
     return [];
@@ -50,7 +53,7 @@ export function addTodo(text: string): TodoItem {
   if (!clean) throw new Error("Todo text is empty.");
   const items = loadTodos();
   const id = items.reduce((m, t) => Math.max(m, t.id), 0) + 1;
-  const item: TodoItem = { id, text: clean, done: false, created: new Date().toISOString() };
+  const item: TodoItem = { id, text: clean, done: false, created: new Date().toISOString(), cwd: process.cwd() };
   items.push(item);
   saveTodos(items);
   return item;
@@ -85,9 +88,14 @@ export function openTodos(): TodoItem[] {
   return loadTodos().filter((t) => !t.done);
 }
 
-/** Prompt block, bounded. "" when nothing open. */
-export function todoBlock(): string {
-  const open = openTodos();
+/** Todos made in this project (cwd). Legacy items without a cwd never match. */
+export function todosHere(cwd: string = process.cwd()): TodoItem[] {
+  return loadTodos().filter((t) => t.cwd === cwd);
+}
+
+/** Prompt block, bounded, this project only. "" when nothing open. */
+export function todoBlock(cwd: string = process.cwd()): string {
+  const open = todosHere(cwd).filter((t) => !t.done);
   if (open.length === 0) return "";
   const lines = open.slice(0, TODO_BLOCK_ITEMS).map((t) => `${t.id}. ${t.text}`);
   let block = `Open todos (${open.length}):\n${lines.join("\n")}\nMark finished work via the todo tool; add new steps as they appear; wipe the list when the task is cancelled or done.`;

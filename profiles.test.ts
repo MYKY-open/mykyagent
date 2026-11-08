@@ -250,7 +250,7 @@ t("apply works when the snapshot is complete", partial.applied.name === "Story N
   t("switching to it resets persona", read("persona.json").current === "caveman" && !read("persona.json").customPrompt);
   t("switching to it clears the style dials", Object.keys(getStyles()).length === 0, JSON.stringify(getStyles()));
   t("switching to it clears the brief", getBrief() === "", getBrief());
-  t("switching to it resets the toggles", isFeatureEnabled("effort") === false && isFeatureEnabled("style") === true && isToolEnabled("bash") === true && isSkillsMasterEnabled() === true);
+  t("switching to it resets the toggles", isFeatureEnabled("effort") === true && isFeatureEnabled("style") === true && isToolEnabled("bash") === true && isSkillsMasterEnabled() === true);
 
   // activate:true is the "reset everything now" flow: the copy is active, so
   // the live stores must match it, not the settings it replaced.

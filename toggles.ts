@@ -77,7 +77,7 @@ export const FEATURE_DEFS: Record<string, string> = {
   rpg_tools: "RPG tools (dice_roll, game_state, advance_time)",
   brief: "Session brief (/brief) — the user's description of the session — in prompt",
   style: "Structured narrative dials (/style) in prompt",
-  effort: "Work standard / effort level (/effort) in prompt — OFF by default, /effort <level> turns it on",
+  effort: "Work standard / effort level (/effort) in prompt — ON by default (level high), /effort <level> changes it",
 };
 
 export function loadToggles(): TogglesConfig {
@@ -121,7 +121,7 @@ export function isToolRunnableHere(name: string): boolean {
 }
 
 /** Features that default OFF (opt-in). Everything else defaults ON. */
-export const OPT_IN_FEATURES: Set<string> = new Set(["tool_recovery", "effort"]);
+export const OPT_IN_FEATURES: Set<string> = new Set(["tool_recovery"]);
 
 /**
  * Tools whose whole lifecycle belongs to one feature master switch. The feature

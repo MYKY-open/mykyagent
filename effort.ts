@@ -51,7 +51,8 @@ const BLOCKS: Record<EffortLevel, string> = {
     `Run one command that exercises the change and paste its result line. Do not write new test files.`,
   high:
     `Work standard (effort=high):\n` +
-    `- Before code: write the done-criteria — 3-6 checks the user could run. Post them.\n` +
+    `- Size the ceremony to the change: a question or explanation -> answer it directly, with tools only if the answer needs them; a one-line fix -> make it and run one command that proves it. The bullets below are for features, bug hunts, multi-file or stateful changes.\n` +
+    `- Before such code: write the done-criteria — 3-6 checks the user could run. Post them.\n` +
     `- Bug report: reproduce the exact symptom the user described first (test, probe or command) and watch it fail. Fix it. Watch it pass. A symptom that comes back is a process failure, not bad luck.\n` +
     `- Load context before editing: grep/read the surrounding code, match existing patterns.\n` +
     `- Implement the entire done-list, not "it compiles". Skeleton with empty functions is NOT done.\n` +

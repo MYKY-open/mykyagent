@@ -61,6 +61,14 @@ T.addTodo("One");
 T.addTodo("Two");
 t("todo: clear done-only", T.clearTodos() === 2 && T.loadTodos().length === 2);
 t("todo: clear all", T.clearTodos(true) === 2 && T.loadTodos().length === 0);
+// todos belong to the project they were made in; legacy (no cwd) never injected
+T.addTodo("Scoped here");
+t("todo: block shows this project's todo", T.todoBlock().includes("Scoped here"));
+t("todo: other project sees none", !T.todoBlock("/somewhere/else").includes("Scoped here"));
+writeFileSync(process.env.MYKYAGENT_TODO_FILE!, JSON.stringify([{ id: 99, text: "Legacy stale", done: false, created: "2026-11-06T00:00:00Z" }]), "utf-8");
+t("todo: legacy item never injected", !T.todoBlock().includes("Legacy stale") && !T.todoBlock("/x").includes("Legacy stale"));
+t("todo: legacy item still listed by loadTodos", T.loadTodos().some((x: any) => x.text === "Legacy stale"));
+T.clearTodos(true);
 
 // --- checkpoints -----------------------------------------------------------
 const C = await import("./checkpoints.ts");
@@ -130,13 +138,13 @@ t("wiring: workflow commands registered", !!(commands.skill && commands.rewind &
 
 activeTools = ["bash", "read"];
 T.addTodo("Wire it up");
-await hooks["before_agent_start"]({}, { cwd: DIR });
+await hooks["before_agent_start"]({}, { cwd: process.cwd() });
 t("wiring: merge adds workflow tools", activeTools.includes("todo") && activeTools.includes("skill_read"));
-const withTodo = await hooks["before_agent_start"]({}, { cwd: DIR });
+const withTodo = await hooks["before_agent_start"]({}, { cwd: process.cwd() });
 t("wiring: open todos in prompt", (withTodo?.systemPrompt || "").includes("Wire it up"));
 t("wiring: skills line in prompt", (withTodo?.systemPrompt || "").includes("skill_read"));
 T.clearTodos(true);
-const clean = await hooks["before_agent_start"]({}, { cwd: DIR });
+const clean = await hooks["before_agent_start"]({}, { cwd: process.cwd() });
 t("wiring: zero tax when empty", !(clean?.systemPrompt || "").includes("Open todos"));
 
 // tool_call snapshots write/edit
