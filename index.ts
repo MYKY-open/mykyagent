@@ -156,7 +156,6 @@ const PERSONA_FILE = join(MEMORY_DIR, "persona.json");
 function personaFile(): string {
   return process.env.MYKYAGENT_PERSONA_FILE || PERSONA_FILE;
 }
-const WEBMODEL_FILE = join(MEMORY_DIR, "webmodel.json");
 const LLAMA_URL = process.env.MYKYAGENT_BASE_URL || "http://127.0.0.1:8080/v1";
 
 export const formatWhiteGreeting = (text: string): string =>
@@ -263,22 +262,54 @@ interface WebModelConfig {
   id: string;
 }
 
-function loadWebModel(): WebModelConfig | null {
+function webModelFile(): string {
+  return process.env.MYKYAGENT_WEBMODEL_FILE || join(MEMORY_DIR, "webmodel.json");
+}
+
+function loadWebRaw(): any {
   try {
-    if (existsSync(WEBMODEL_FILE)) {
-      const cfg = JSON.parse(readFileSync(WEBMODEL_FILE, "utf-8"));
-      if (cfg?.provider && cfg?.id) return { provider: String(cfg.provider), id: String(cfg.id) };
-    }
+    if (existsSync(webModelFile())) return JSON.parse(readFileSync(webModelFile(), "utf-8")) || {};
   } catch {}
+  return {};
+}
+
+function loadWebModel(): WebModelConfig | null {
+  const cfg = loadWebRaw();
+  if (cfg?.provider && cfg?.id) return { provider: String(cfg.provider), id: String(cfg.id) };
   return null;
+}
+
+/** /model-web think on|off: distillation uses the session thinking level. Default off (model default). */
+export function loadWebThinking(): boolean {
+  return loadWebRaw().thinking === true;
+}
+
+export function setWebThinking(on: boolean): void {
+  mkdirSync(MEMORY_DIR, { recursive: true });
+  const cfg = loadWebRaw();
+  cfg.thinking = on;
+  writeFileSync(webModelFile(), JSON.stringify(cfg, null, 2), "utf-8");
+}
+
+/** Reasoning level for a distill call: the session level when think is on, else undefined. */
+function distillReasoning(ctxOrModel: any): string | undefined {
+  if (!loadWebThinking()) return undefined;
+  try {
+    const level = ctxOrModel?.thinkingLevel;
+    return level && level !== "off" ? String(level) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function saveWebModel(cfg: WebModelConfig | null): void {
   mkdirSync(MEMORY_DIR, { recursive: true });
+  const thinking = loadWebThinking();
+  const keep = thinking ? { thinking: true } : {};
   if (cfg) {
-    writeFileSync(WEBMODEL_FILE, JSON.stringify(cfg, null, 2), "utf-8");
-  } else {
-    if (existsSync(WEBMODEL_FILE)) writeFileSync(WEBMODEL_FILE, JSON.stringify({ follow: true }, null, 2), "utf-8");
+    writeFileSync(webModelFile(), JSON.stringify({ ...cfg, ...keep }, null, 2), "utf-8");
+  } else if (existsSync(webModelFile())) {
+    writeFileSync(webModelFile(), JSON.stringify({ follow: true, ...keep }, null, 2), "utf-8");
   }
 }
 
@@ -725,7 +756,7 @@ export function resolvePiSessionId(ctxish: any): string | undefined {
   }
 }
 
-async function distillWithSubagent(
+export async function distillWithSubagent(
   query: string,
   content: string,
   ctxOrModel?: any,
@@ -778,24 +809,17 @@ async function distillWithSubagent(
   // 1. Native Pi ModelRegistry path: seamlessly supports ANY cloud model (OpenAI, Anthropic, Gemini, Groq, OpenRouter, etc.) or local models
   if (modelRegistry && model) {
     try {
-      const response = await modelRegistry.complete(
-        model,
-        {
-          systemPrompt: sysFinal,
-          messages: [
-            {
-              role: "user",
-              content: [{ type: "text", text: userContent }],
-              timestamp: Date.now(),
-            },
-          ],
-        },
-        {
-          maxTokens: 4096,
-          cacheRetention: "none",
-          ...(sessionId ? { sessionId } : {}),
-        }
-      );
+      const req = {
+        systemPrompt: sysFinal,
+        messages: [{ role: "user", content: [{ type: "text", text: userContent }], timestamp: Date.now() }],
+      };
+      const reqOpts = { maxTokens: 4096, cacheRetention: "none", ...(sessionId ? { sessionId } : {}) };
+      // /model-web think on: same reasoning path as the main agent (streamSimple). Off: unchanged complete().
+      const reasoning = distillReasoning(ctxOrModel);
+      const response =
+        reasoning && typeof modelRegistry.streamSimple === "function"
+          ? await modelRegistry.streamSimple(model, req, { ...reqOpts, reasoning } as any).result()
+          : await modelRegistry.complete(model, req, reqOpts as any);
 
       let text = response?.content
         ?.filter((c: any) => c.type === "text")
@@ -3922,7 +3946,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
   // (distillWithSubagent) to the chosen model; the main conversation model is
   // untouched and managed by pi's built-in /model command.
   pi.registerCommand("model-web", {
-    description: "Set model for web_search/web_fetch distillation (e.g. /model-web set llama-local/Qwen3.5-9B, /model-web list, /model-web clear)",
+    description: "Set model for web_search/web_fetch distillation (e.g. /model-web set llama-local/Qwen3.5-9B, /model-web list, /model-web clear, /model-web think on|off)",
     getArgumentCompletions: (argumentText: string) => {
       const trimmed = argumentText.trim();
       if (!trimmed || !argumentText.includes(" ")) {
@@ -3930,6 +3954,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
           { value: "list", label: "list", description: "show override + available models" },
           { value: "set", label: "set", description: "set distillation model" },
           { value: "clear", label: "clear", description: "follow main model" },
+          { value: "think", label: "think", description: "distill uses session thinking level: think on|off" },
         ];
         const filtered = argumentText.trim() ? fuzzyFilter(subs, trimmed, (s: any) => s.label) : subs;
         return filtered.length ? filtered : null;
@@ -3937,6 +3962,12 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       if (argumentText.startsWith("set ")) {
         const rest = argumentText.slice(4);
         return completeModelWebSet(rest);
+      }
+      if (argumentText.startsWith("think ")) {
+        return [
+          { value: "think on", label: "on", description: "distill follows session thinking level" },
+          { value: "think off", label: "off", description: "distill uses model default reasoning" },
+        ];
       }
       return null;
     },
@@ -3948,6 +3979,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
         const current = loadWebModel();
         const models = registry ? registry.getAvailable() : [];
         const lines = [`current: ${current ? `${current.provider}/${current.id}` : "follow main model (default)"}`];
+        lines.push(`thinking: ${loadWebThinking() ? "follows session thinking level" : "model default (off)"}`);
         for (const m of models) {
           const mark = current && m.provider === current.provider && m.id === current.id ? " ← web" : "";
           lines.push(`• ${m.provider}/${m.id}${mark}`);
@@ -3959,7 +3991,8 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
 
       if (trimmed?.startsWith("set ")) {
         const target = trimmed.slice(4).trim();
-        const slash = target.lastIndexOf("/");
+        // First slash: provider names have no "/", model ids often do (openrouter/z-ai/glm-5.3-flash).
+        const slash = target.indexOf("/");
         if (!registry || !target || slash <= 0) {
           ctx.ui?.notify?.("Usage: /model-web set <provider>/<model-id>", "error");
           return;
@@ -3977,6 +4010,16 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
         return;
       }
 
+      if (trimmed === "think on" || trimmed === "think off") {
+        const on = trimmed === "think on";
+        setWebThinking(on);
+        ctx.ui?.notify?.(
+          on ? "Web distillation now uses the session thinking level (/thinking)." : "Web distillation uses the model's default reasoning.",
+          "info"
+        );
+        return;
+      }
+
       if (trimmed === "clear" || trimmed === "default" || trimmed === "reset") {
         saveWebModel(null);
         ctx.ui?.notify?.("Web distillation follows the main model (default).", "info");
@@ -3984,7 +4027,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
       }
 
       if (trimmed) {
-        ctx.ui?.notify?.("Usage: /model-web [list | set <provider>/<model-id> | clear]", "error");
+        ctx.ui?.notify?.("Usage: /model-web [list | set <provider>/<model-id> | clear | think on|off]", "error");
         return;
       }
 
@@ -4026,7 +4069,7 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
             saveWebModel(null);
             ctx.ui?.notify?.("Web distillation follows the main model (default).", "info");
           } else {
-            const slash = selected.lastIndexOf("/");
+            const slash = selected.indexOf("/");
             saveWebModel({ provider: selected.slice(0, slash), id: selected.slice(slash + 1) });
             ctx.ui?.notify?.(`Web distillation model set to: ${selected}\n(main model unchanged)`, "info");
           }
