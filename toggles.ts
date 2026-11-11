@@ -45,6 +45,7 @@ export const BUILTIN_TOOL_DEFS: Record<string, string> = {
   skill_read: "Read an on-disk skill pack by name",
   todo: "Tiny task scratch: add/list/done/clear",
   summarize: "Save a session summary for later /resume",
+  context_compact: "Selective context compaction (OPT-IN, off by default): list IDs, summarize a range, read originals",
   task_start: "Start a detached long command",
   task_output: "Read new task log bytes",
   task_wait: "Block for task output or exit",
@@ -122,6 +123,13 @@ export function isToolRunnableHere(name: string): boolean {
 
 /** Features that default OFF (opt-in). Everything else defaults ON. */
 export const OPT_IN_FEATURES: Set<string> = new Set(["tool_recovery"]);
+
+/**
+ * Tools that default OFF (opt-in). Rewriting conversation history is a
+ * deliberate choice, so context_compact stays out of the default toolset and
+ * its schema costs nothing until `/mykyagent on context_compact`.
+ */
+export const OPT_IN_TOOLS: Set<string> = new Set(["context_compact"]);
 
 /**
  * Tools whose whole lifecycle belongs to one feature master switch. The feature
@@ -202,14 +210,15 @@ export function isToolEnabled(name: string, mode?: string): boolean {
   // weight in the toolset.
   if (name === "skill_read" && !isSkillsMasterEnabled()) return false;
 
+  const fallback = !OPT_IN_TOOLS.has(name);
   const v = cfg.tools?.[name];
   if (typeof v === "boolean") return v; // legacy global: applies to every mode
   if (v && typeof v === "object") {
-    if (!mode) return true;
+    if (!mode) return fallback;
     const mv = (v as Record<string, boolean>)[mode];
-    return typeof mv === "boolean" ? mv : true;
+    return typeof mv === "boolean" ? mv : fallback;
   }
-  return true;
+  return fallback;
 }
 
 /** Tool names from before the single `memory` tool. */

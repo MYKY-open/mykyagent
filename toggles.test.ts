@@ -135,6 +135,28 @@ t("tool_recovery explicit off stays off", isFeatureEnabled("tool_recovery") === 
 resetAllToggles();
 t("reset returns tool_recovery to OFF", isFeatureEnabled("tool_recovery") === false);
 
+// 10. Opt-in tools default off, stay off until explicitly enabled
+{
+  resetAllToggles();
+  t("context_compact defaults OFF", isToolEnabled("context_compact") === false);
+  t("context_compact is off in every mode by default", isToolEnabled("context_compact", "code") === false && isToolEnabled("context_compact", "rp-creator") === false);
+  t("regular tools still default ON next to it", isToolEnabled("bash") === true && isToolEnabled("todo") === true);
+  setToolEnabled("context_compact", true);
+  t("explicit on enables context_compact", isToolEnabled("context_compact") === true);
+  setToolEnabled("context_compact", false);
+  t("explicit off stays off", isToolEnabled("context_compact") === false);
+  const optIn = toggleByName("context_compact", true);
+  t("toggleByName enables it", optIn.ok && optIn.enabled === true && isToolEnabled("context_compact") === true);
+  t("board shows it as a tool row with OPT-IN description", getAllToggleableItems([], ["context_compact"]).some((i) => i.name === "context_compact" && i.category === "tool" && i.enabled === true));
+  resetAllToggles();
+  t("reset returns context_compact to OFF", isToolEnabled("context_compact") === false);
+  setToolEnabled("context_compact", false, "code");
+  t("per-mode off keeps other modes at the opt-in default", isToolEnabled("context_compact", "code") === false && isToolEnabled("context_compact", "rp-creator") === false);
+  setToolEnabled("context_compact", true, "code");
+  t("per-mode on enables only that mode", isToolEnabled("context_compact", "code") === true && isToolEnabled("context_compact", "rp-creator") === false);
+  resetAllToggles();
+}
+
 // 10. Per-mode tool settings
 setToolEnabled("memory", false, "rp");
 t("per-mode off in rp", isToolEnabled("memory", "rp") === false);

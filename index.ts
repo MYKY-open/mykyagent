@@ -21,6 +21,7 @@ import { listSkills, readSkill, skillsPromptLine } from "./skills.ts";
 import { addTodo, clearTodos, describeTodos, doneTodo, loadTodos, openTodos, todoBlock, todosHere } from "./todo.ts";
 import { listCheckpoints, resolveToolPath, restoreCheckpoint, snapshotFile } from "./checkpoints.ts";
 import { buildResumeText, loadAutoState, saveAutoStub, saveSummary } from "./resume.ts";
+import { PROBE_TYPE, compactionReviewSession, registerSelectiveCompaction } from "./selective_compaction.ts";
 import { clearBrief, describeBrief, getBrief, renderBriefBlock, setBrief } from "./brief.ts";
 import { EFFORT_HELP, EFFORT_LEVELS, describeEffort, effortForTurn, getEffort, renderEffortBlock, setEffort } from "./effort.ts";
 import {
@@ -1583,6 +1584,9 @@ export default function (pi: any) {
       if (rpgOff && RPG_TOOL_NAMES.includes(t)) return false;
       if (!isToolAllowedInMode(t, mode)) return false;
       if (!isToolRunnableHere(t)) return false;
+      // A manual /compact-context review exposes the tool for that turn even
+      // when its opt-in toggle is off; autonomous use still needs the toggle.
+      if (t === "context_compact" && compactionReviewSession() === ctx?.sessionManager?.getSessionId?.()) return true;
       return isToolEnabled(t, mode);
     };
 
@@ -1604,6 +1608,7 @@ export default function (pi: any) {
         "skill_read",
         "todo",
         "summarize",
+        "context_compact",
         "task_start",
         "task_output",
         "task_wait",
@@ -1724,6 +1729,14 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     if (!memoryOff && isToolEnabled("memory")) {
       toolLines.push(
         "- memory: persistent topics, one tool with an action — read (body), write (summary + body), edit, forget, list, search, rename, move. The index is in the prompt; read a topic before relying on it."
+      );
+    }
+
+    // Opt-in: only present when the tool is actually available, so disabled
+    // sessions pay zero prompt tokens for a capability they cannot use.
+    if (isToolEnabled("context_compact", mode)) {
+      toolLines.push(
+        "- context_compact: you may compact on your own when it is clearly worth it - a finished investigation whose findings are captured, an abandoned approach, or a repeated dead end, with the range much larger than your summary. list first (add query to target old text); keep [recent] entries, active work and user instructions. If nothing qualifies, do nothing - never force a compaction. Multiple disjoint ranges go in one call, each with its own summary."
       );
     }
 
@@ -1860,7 +1873,8 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     if (!event?.toolName) return;
     // Mode first: tool toggles are per-mode settings.
     const mode = getEffectiveMode();
-    if (!isToolEnabled(event.toolName, mode)) {
+    const reviewOverride = event.toolName === "context_compact" && compactionReviewSession() === ctx?.sessionManager?.getSessionId?.();
+    if (!isToolEnabled(event.toolName, mode) && !reviewOverride) {
       return {
         block: true,
         reason: `Tool "${event.toolName}" is disabled by /mykyagent. Re-enable with: /mykyagent enable ${event.toolName}`,
@@ -2375,7 +2389,46 @@ Continue from here. Do not reintroduce yourself, do not restate the scene, do no
     },
   });
 
-  // 8c. Workflow tools: skills-lite, todos, session summary.
+  // 8c. Workflow tools: skills-lite, todos, session summary, selective compaction.
+  const compactionController = registerSelectiveCompaction(pi);
+  // Human nudge, model decides: review the conversation for exhausted history
+  // worth compacting. Never forces an edit — a clean "nothing qualifies" is a
+  // valid answer.
+  pi.registerCommand("compact-context", {
+    description: "Ask the model to look for exhausted history worth compacting (never forced): /compact-context [focus]",
+    handler: async (args: string, ctx: any) => {
+      const focus = (args || "").trim();
+      if (typeof ctx?.isIdle === "function" && !ctx.isIdle()) {
+        ctx?.ui?.notify?.("Finish or stop the current run first, then /compact-context.", "error");
+        return;
+      }
+      // Works whether or not the opt-in toggle is on: the review turn itself
+      // exposes the tool (probe arms the gate), and everything is removed again
+      // if nothing qualifies.
+      const text =
+        `Review this conversation for selective-compaction candidates${focus ? ` in: ${focus}` : ""}.\n` +
+        `1. Call context_compact list and read its usage line.\n` +
+        `2. Identify completed, exhausted ranges: finished investigations whose findings you already have, abandoned approaches, repeated failed attempts, superseded debugging. Skip anything still active, anything marked [recent], user instructions, and code or decisions you still need.\n` +
+        `3. Compact only if a range is clearly worth it: much larger than the summary plus the listing you paid for, and you would not need the raw detail to continue. Write the summary yourself - cause, decision, rejected alternatives, exact commands with the output line that decided them, open questions.\n` +
+        `4. If nothing qualifies, do not compact. Answer in one line why (e.g. usage is low, everything is still active).\n` +
+        `Use one range, or several disjoint ranges in one call, each with its own summary; compact must be the only tool call in its turn. Never force a compaction.`;
+      // Hidden custom message: the review instructions are model context, not a
+      // chat bubble. The probe lets a fruitless review be removed afterwards.
+      if (typeof pi.sendMessage === "function") {
+        pi.sendMessage({ customType: PROBE_TYPE, content: text, display: false }, { triggerTurn: true });
+        // Arm after the queue accepts the message: a throw leaves no stale probe.
+        try {
+          if (ctx?.sessionManager) compactionController.beginProbe(ctx.sessionManager);
+        } catch {}
+      } else {
+        pi.sendUserMessage(text);
+      }
+      ctx?.ui?.notify?.(
+        `Asked the model to look for compaction candidates (not forced)${isToolEnabled("context_compact", getEffectiveMode()) ? "" : " - tool enabled for this review only"}.`,
+        "info"
+      );
+    },
+  });
   pi.registerTool({
     name: "skill_read",
     label: "Skill Read",

@@ -11,6 +11,7 @@ A lightweight, crash-proof agent overlay for small local reasoning models (like 
 - **Persistent Memory (index + on-demand)**: Topic files under `~/.config/mykyagent/memory/`. Only a clipped one-line summary per topic is injected into the system prompt — index lines are capped at ~1000 chars total and 70 chars each (`MYKYAGENT_MEMORY_INDEX_CHARS`, `MYKYAGENT_MEMORY_INDEX_SUMMARY_CHARS`), so the index costs ~250 tokens/turn instead of a full dump; bodies load on demand. **One `memory` tool, eight actions** (`read`, `write`, `edit`, `forget`, `list`, `search`, `rename`, `move`) instead of eight schemas — ~1/4 the tool-schema cost.
 - **Background Tasks**: Long commands run detached via `task_start`; follow with cursor-based `task_output` (new bytes only), blocking `task_wait`, or kill with `task_stop`. `task_list` / `/tasks` lists them; **`/tasks clear [id]`** deletes finished task dirs (running ones are refused) so the store does not grow forever. Max 3 live.
 - **Skills-lite**: On-demand capability packs in `skills/<name>.md` (or `skills/<name>/SKILL.md`). One index line per turn (zero when empty); full text loads via `skill_read` only when relevant. `/skill` lists/shows them. **One master switch** in `/mykyagent` (`skills`) owns the whole system — prompt index, the `skill_read` tool and every per-skill row. Turn the master off and `skill_read` leaves the toolset too (nothing to read from), so the board does not list it as a separate switch.
+- **Selective Context Compaction**: **OPT-IN, off by default** (`/mykyagent on context_compact`). With it on, the model may compact **on its own** when a range is clearly worth it; with it off, `/compact-context` is the only trigger and exposes the tool for that review turn only. `context_compact` lists stable message IDs (+ live usage, text `query`), replaces one or more disjoint completed assistant/tool ranges with its own summaries, and reads archived originals. User/system messages and split tool exchanges are protected. Edits apply at the completed tool-turn boundary, persist with Pi's session, and follow its branch tree; no transcript rewriting, extra model call, or filesystem rollback.
 - **Todos**: Tiny persistent scratch (`todo` add/list/done/clear) for multi-step work, injected bounded into the prompt only while open. Humans get the same broom: `/todo` lists, `/todo add <text>`, `/todo done <id|text>`, `/todo clear` (finished only), **`/todo wipe`** (everything — for cancelled runs and models that forgot to close items).
 - **Checkpoints**: Every `write`/`edit` snapshots pre-write content (ring of 20, 100KB cap). `/rewind` lists, `/rewind <n>` restores. Undo, no gates.
 - **Resume**: `summarize` tool saves a session summary; `session_shutdown` auto-saves machine state (mode, active character, todos, checkpoint count). `/restore` injects both back into a fresh session **and re-applies the saved stage** — mode plus character with greeting (or an honest note if the card is gone). Personas, tags, style, author's note, and toggles persist in their own files already. (`/resume` is pi's own session switcher).
@@ -106,6 +107,52 @@ Details: names are free text, the directory is a slug (`Story Night` → `profil
 ### Verification Pass (`/verify`)
 
 Separates judge from author: `/verify [scope]` kicks off a fresh turn that reads `skills/verification.md` and runs the protocol — collect the claims you made, one command per claim, then a per-claim verdict of `PASS` / `PARTIAL` / `FAIL` / `UNVERIFIED` with the deciding output line. Probes (boundary/state/honesty) are sized to the scope: one command for a one-file fix, the full sweep for stateful or user-facing work. "Should work" is an auto-FAIL; so is re-reading your own diff and calling it proof. Costs nothing until invoked.
+
+### Selective Context Compaction (`context_compact`)
+
+An optional model-invoked cleanup tool, **opt-in and off by default** — nothing enters the toolset (or the prompt's tool schema) until you turn it on. Use it when completed investigation or debugging history is no longer worth keeping in full. Keep code, constraints, and reasoning that upcoming work still needs.
+
+```text
+/mykyagent on context_compact    # enable it for the current mode
+/mykyagent off context_compact   # back to the default: absent
+/compact-context [focus]         # ask the model to look for candidates (never forced)
+```
+
+`/compact-context` is the human nudge: the model reads the index and usage, compacts only if a range is genuinely worth it, and otherwise answers in one line why nothing qualifies. It works whether or not the toggle is on — the review turn exposes the tool, and the normal default returns afterwards.
+
+- **Autonomy follows the toggle.** On: the prompt tells the model it may compact itself when criteria are met (finished investigation, abandoned approach, repeated dead end, range much larger than the summary). Off: no autonomy line, no tool — only `/compact-context` can start a review.
+
+- The instructions travel as a **hidden custom message**, not a pasted user chat bubble. It refuses to fire while a run is still streaming: finish or stop it first.
+- **Multiple ranges:** `compact` accepts `ranges: [{ from, through?, summary }, ...]` (up to 8, disjoint, each with its own summary, applied atomically). `from`/`through`/`summary` alone still means one range; mixing both forms is rejected.
+- **Targeted lookup:** `list` accepts `query`, a case-insensitive text filter returning matches plus two neighbours, so finding an old block does not cost a dozen pages of listing.
+- **A fruitless review is removed from context**: if the turn ends with no compaction, its prompt, `list` calls and answer are omitted (`context_edit` nulls, append-only session), and the human gets one toast with the model's reason. The turn stays in the session file, never in the model's context. A real user message during the review, or an abort, cancels that cleanup.
+
+```text
+context_compact({ action: "list" })
+// Stable IDs, short previews, protected entries, pagination,
+// live usage ("usage 78% (156k / 200k)"), and [recent] markers
+// on the trailing working set.
+
+context_compact({
+  action: "compact",
+  from: "<first-message-id>",
+  through: "<last-message-id>",
+  summary: "Cause, decision, relevant implementation facts, rejected approaches, actual test results, remaining uncertainty."
+})
+// Omit through to select one message. Endpoints are inclusive.
+
+context_compact({ action: "read", id: "<block-id-returned-by-compact-or-list>" })
+// Or read an original message by its entry ID. Large archives support offset/limit.
+```
+
+- The model writes the summary itself; no summarizer sub-call. The replacement must be smaller than the selected content, including its archive label. This is a character-size check, not a token-savings guarantee.
+- `list` is the decision surface: it reports Pi's real context usage and flags the trailing entries as `[recent]`. The tool description states the trigger (a finished investigation, an abandoned approach, or high usage) and tells the model not to compact the current task, recent entries, user instructions, or a range smaller than about twice the summary plus the listing.
+- `compact` must be the **only tool call in its assistant turn**. It stages the edit; Pi applies it after the tool result is recorded, before the next model request. Its result says so and does **not** ask for a confirmation `list`.
+- User messages, system/session context, the current tool turn, and existing selective-compaction summaries are protected. A range cannot cross these or remove only part of a tool exchange; parallel calls require all their results.
+- Originals remain in the append-only session transcript. `read` returns a bounded textual archive view (binary image bytes stay in the session). Reading an archive adds that output back into active context; it does not undo the compaction.
+- Compaction is branch-local and survives reloads. Navigating to a branch before the edit shows the original history. Ordinary Pi compaction still works and may eventually summarize the retained summaries.
+- Replacing an earlier prefix can invalidate later prompt-cache reuse. Prefer occasional meaningful reductions over constant tiny cleanups.
+- Requires Pi's native session projection and `turn_end` context-edit boundary APIs. It is **off by default** like the other opt-in feature: enable with `/mykyagent on context_compact` (or `tool:context_compact` to flip the tool of the current mode explicitly). Disabling the tool does not undo edits already recorded.
 
 ## In-Chat Web Model
 Route only the `web_search` / `web_fetch` distillation sub-calls to a dedicated

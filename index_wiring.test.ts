@@ -44,6 +44,7 @@ const commands: Record<string, any> = {};
 const hooks: Record<string, any> = {};
 let activeTools: string[] = [];
 const sentMessages: string[] = [];
+const customMessages: { message: any; options: any }[] = [];
 // pi defines a tool for every platform: powershell on Linux is a definition
 // that cannot run, plus one hidden tool that must never be listed.
 const ALL_TOOLS = [
@@ -55,6 +56,7 @@ const ALL_TOOLS = [
 const pi: any = {
   on: (n: string, f: any) => (hooks[n] = f),
   sendUserMessage: (content: string) => sentMessages.push(content),
+  sendMessage: (message: any, options: any) => customMessages.push({ message, options }),
   registerTool: (def: any) => (tools[def.name] = def),
   registerCommand: (n: string, def: any) => (commands[n] = def),
   getActiveTools: () => [...activeTools],
@@ -66,6 +68,7 @@ await ext(pi);
 
 // --- 1. registration --------------------------------------------------------
 t("builtin mcp tools registered", !!(tools.mcp_connect && tools.mcp_disconnect && tools.mcp_list));
+t("selective compaction tool and boundary hook registered", !!tools.context_compact && !!hooks.turn_end);
 t("/mcp-toggle registered as a user command", !!commands["mcp-toggle"]);
 
 // --- 2. before_agent_start merge includes mcp builtins ----------------------
@@ -73,6 +76,20 @@ activeTools = ["bash", "read"]; // pi fresh-session-ish snapshot
 await hooks["before_agent_start"]({}, { cwd: DIR });
 t("merge adds mcp builtins", activeTools.includes("mcp_connect") && activeTools.includes("mcp_list"), activeTools.join(","));
 t("merge keeps pi tools", activeTools.includes("bash") && activeTools.includes("read"));
+t("merge leaves opt-in selective compaction OFF", !activeTools.includes("context_compact"), activeTools.join(","));
+{
+  const toggles = await import("./toggles.ts");
+  t("selective compaction appears in tool toggles", !!toggles.BUILTIN_TOOL_DEFS.context_compact);
+  t("selective compaction defaults off", toggles.isToolEnabled("context_compact") === false);
+  const blockedOff = await hooks.tool_call({ toolName: "context_compact" }, { cwd: DIR });
+  t("disabled selective compaction is blocked defensively", blockedOff?.block === true);
+  toggles.setToolEnabled("context_compact", true);
+  await hooks["before_agent_start"]({}, { cwd: DIR });
+  t("explicit on activates selective compaction", activeTools.includes("context_compact"));
+  toggles.setToolEnabled("context_compact", false);
+  await hooks["before_agent_start"]({}, { cwd: DIR });
+  t("selective compaction respects its tool toggle", !activeTools.includes("context_compact"));
+}
 
 // --- 2b. skills master also drops the skill_read tool -----------------------
 {
@@ -303,6 +320,66 @@ t("reset restores tool", isToolEnabled("bash") === true);
   t("/verify demands a PASS/FAIL verdict", vmsg.includes("PASS / PARTIAL / FAIL / UNVERIFIED"));
   t("/verify carries the scope", vmsg.includes("the effort dial"));
   t("/verify bans gut-feel proof", vmsg.includes('No "should work"'));
+
+  // --- 12b. /compact-context: a nudge, never a forced compaction -----------
+  {
+    const { setToolEnabled } = await import("./toggles.ts");
+    t("/compact-context registered as a user command", !!commands["compact-context"]);
+
+    // Autonomous mode: tool on -> the model is told it may compact itself.
+    setToolEnabled("context_compact", true, "code");
+    const auto = await hooks["before_agent_start"]({}, { cwd: DIR });
+    t("enabled: prompt invites autonomous compaction", (auto?.systemPrompt || "").includes("you may compact on your own"), (auto?.systemPrompt || "").slice(-400));
+    t("enabled: prompt bans forcing", (auto?.systemPrompt || "").includes("never force a compaction"));
+
+    // Tool off: no autonomy instruction, and a manual review arms it for one turn.
+    setToolEnabled("context_compact", false);
+    const silent = await hooks["before_agent_start"]({}, { cwd: DIR });
+    t("disabled: no autonomous compaction line", !(silent?.systemPrompt || "").includes("you may compact on your own"));
+    t("disabled: tool is not in the toolset", !activeTools.includes("context_compact"));
+
+    const sessionManager = { getBranch: () => [], getSessionId: () => "review-session" };
+    const before = customMessages.length;
+    const offNotes: string[] = [];
+    await commands["compact-context"].handler("", { cwd: DIR, sessionManager, ui: { notify: (m: string) => offNotes.push(m) } });
+    t("manual review works while the toggle is off", customMessages.length === before + 1 && offNotes.join(" ").includes("enabled for this review only"), offNotes.join(" ").slice(0, 140));
+    await hooks["before_agent_start"]({}, { cwd: DIR, sessionManager });
+    t("review turn exposes the tool for that run", activeTools.includes("context_compact"));
+    t("review turn does not print the autonomy line", !((await hooks["before_agent_start"]({}, { cwd: DIR, sessionManager }))?.systemPrompt || "").includes("you may compact on your own"));
+    const allowedDuringReview = await hooks["tool_call"]({ toolName: "context_compact" }, { cwd: DIR, sessionManager });
+    t("tool_call is not blocked during a review", allowedDuringReview?.block !== true, JSON.stringify(allowedDuringReview));
+    const otherSession = { getBranch: () => [], getSessionId: () => "other-session" };
+    t("review exposure does not leak into another session", (await hooks["tool_call"]({ toolName: "context_compact" }, { cwd: DIR, sessionManager: otherSession }))?.block === true);
+    await hooks["before_agent_start"]({}, { cwd: DIR, sessionManager: otherSession });
+    t("another session does not see the review tool", !activeTools.includes("context_compact"), activeTools.join(","));
+    await hooks["before_agent_start"]({}, { cwd: DIR, sessionManager });
+    t("the reviewed session still sees it", activeTools.includes("context_compact"));
+    await hooks["agent_end"]({}, { sessionManager });
+    await hooks["before_agent_start"]({}, { cwd: DIR, sessionManager });
+    t("tool disappears again after the review", !activeTools.includes("context_compact"));
+    const blockedAfter = await hooks["tool_call"]({ toolName: "context_compact" }, { cwd: DIR, sessionManager });
+    t("tool_call blocked after the review", blockedAfter?.block === true);
+
+    const busyNotes: string[] = [];
+    const busyBefore = customMessages.length;
+    await commands["compact-context"].handler("", { cwd: DIR, isIdle: () => false, ui: { notify: (m: string) => busyNotes.push(m) } });
+    t("/compact-context waits for an idle session", customMessages.length === busyBefore && busyNotes.join(" ").includes("Finish or stop the current run"), busyNotes.join(" ").slice(0, 120));
+
+    setToolEnabled("context_compact", true, "code");
+    const notes: string[] = [];
+    await commands["compact-context"].handler("the build failures", { cwd: DIR, isIdle: () => true, sessionManager, ui: { notify: (m: string) => notes.push(m) } });
+    const probe = customMessages.at(-1);
+    const cmsg = String(probe?.message?.content || "");
+    t("/compact-context sends a hidden custom message, not a user chat bubble", probe?.message?.customType === "mykyagent-compact-probe" && probe?.message?.display === false && probe?.options?.triggerTurn === true, JSON.stringify(probe));
+    t("/compact-context does not paste the instructions as a user message", sentMessages.length > 0 && !sentMessages.includes(cmsg));
+    t("/compact-context asks the model to inspect", cmsg.includes("context_compact list") && cmsg.includes("the build failures"), cmsg.slice(0, 140));
+    t("/compact-context never forces an edit", cmsg.includes("If nothing qualifies, do not compact") && cmsg.includes("Never force a compaction"));
+    t("/compact-context names the working-set and evidence rules", cmsg.includes("[recent]") && cmsg.includes("output line that decided them"));
+    t("/compact-context offers disjoint ranges", cmsg.includes("several disjoint ranges"));
+    t("/compact-context tells the human it is not forced", notes.join(" ").includes("not forced"), notes.join(" ").slice(0, 120));
+    await hooks["agent_end"]({}, { sessionManager });
+    setToolEnabled("context_compact", false);
+  }
   t("/verify sizes the pass to the scope", vmsg.includes("size the pass to this scope"));
   // Storing a level is an explicit ask: it turns the opt-in feature on.
   setFeatureEarly("effort", false);
